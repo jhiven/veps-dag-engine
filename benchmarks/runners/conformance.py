@@ -203,8 +203,8 @@ def _run_failure_atomicity_campaign(run_id: str, profile: str) -> ConformanceRes
 
     executor = PipelineExecutor(initial_plan=init_cand.plan)
     controller = ReconfigurationController(executor=executor, compiler=compiler, registry=reg)
-
     reconfigs_requested = 0
+    reconfigs_committed = 0
     reconfigs_rejected = 0
     reconfigs_failed = 0
     plan_changed_count = 0
@@ -224,8 +224,11 @@ def _run_failure_atomicity_campaign(run_id: str, profile: str) -> ConformanceRes
     )
     v_before = controller.active_plan.version
     controller.submit(req1)
-    rec1 = controller.wait_for_terminal(req1.request_id, timeout_seconds=2.0)
-    if rec1 and rec1.status == ReconfigurationStatus.REJECTED:
+    rec1 = controller.wait_for_terminal(req1.request_id, timeout_seconds=10.0)
+    st1 = rec1.status if rec1 is not None else controller.record(req1.request_id).status
+    if st1 == ReconfigurationStatus.COMMITTED:
+        reconfigs_committed += 1
+    elif st1 == ReconfigurationStatus.REJECTED:
         reconfigs_rejected += 1
     else:
         reconfigs_failed += 1
@@ -263,8 +266,11 @@ def _run_failure_atomicity_campaign(run_id: str, profile: str) -> ConformanceRes
     )
     v_before = controller.active_plan.version
     controller.submit(req2)
-    rec2 = controller.wait_for_terminal(req2.request_id, timeout_seconds=2.0)
-    if rec2 and rec2.status == ReconfigurationStatus.REJECTED:
+    rec2 = controller.wait_for_terminal(req2.request_id, timeout_seconds=10.0)
+    st2 = rec2.status if rec2 is not None else controller.record(req2.request_id).status
+    if st2 == ReconfigurationStatus.COMMITTED:
+        reconfigs_committed += 1
+    elif st2 == ReconfigurationStatus.REJECTED:
         reconfigs_rejected += 1
     else:
         reconfigs_failed += 1
@@ -284,8 +290,13 @@ def _run_failure_atomicity_campaign(run_id: str, profile: str) -> ConformanceRes
     )
     v_before = executor.active_plan.version
     fail_controller.submit(req3)
-    rec3 = fail_controller.wait_for_terminal(req3.request_id, timeout_seconds=2.0)
-    if rec3 and rec3.status == ReconfigurationStatus.FAILED:
+    rec3 = fail_controller.wait_for_terminal(req3.request_id, timeout_seconds=10.0)
+    st3 = rec3.status if rec3 is not None else fail_controller.record(req3.request_id).status
+    if st3 == ReconfigurationStatus.COMMITTED:
+        reconfigs_committed += 1
+    elif st3 == ReconfigurationStatus.REJECTED:
+        reconfigs_rejected += 1
+    else:
         reconfigs_failed += 1
     if executor.active_plan.version != v_before:
         plan_changed_count += 1
@@ -303,7 +314,7 @@ def _run_failure_atomicity_campaign(run_id: str, profile: str) -> ConformanceRes
         frames_submitted=10,
         frames_completed=10,
         reconfigurations_requested=reconfigs_requested,
-        reconfigurations_committed=0,
+        reconfigurations_committed=reconfigs_committed,
         reconfigurations_rejected=reconfigs_rejected,
         reconfigurations_failed=reconfigs_failed,
         mixed_plan_frames=0,

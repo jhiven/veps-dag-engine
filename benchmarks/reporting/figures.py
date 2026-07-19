@@ -23,20 +23,22 @@ def generate_all_figures(data: BenchmarkArtifactData, figures_dir: str) -> tuple
     os.makedirs(figures_dir, exist_ok=True)
     generated_paths: list[str] = []
 
-    f1 = _generate_figure_1(data, figures_dir)
-    generated_paths.extend(f1)
+    if data.steady_state_samples:
+        f1 = _generate_figure_1(data, figures_dir)
+        generated_paths.extend(f1)
 
-    f2 = _generate_figure_2(data, figures_dir)
-    generated_paths.extend(f2)
+        f2 = _generate_figure_2(data, figures_dir)
+        generated_paths.extend(f2)
 
-    f3 = _generate_figure_3(data, figures_dir)
-    generated_paths.extend(f3)
+    if data.reconfiguration_samples:
+        f3 = _generate_figure_3(data, figures_dir)
+        generated_paths.extend(f3)
 
-    f4 = _generate_figure_4(data, figures_dir)
-    generated_paths.extend(f4)
+        f4 = _generate_figure_4(data, figures_dir)
+        generated_paths.extend(f4)
 
-    f5 = _generate_figure_5(data, figures_dir)
-    generated_paths.extend(f5)
+        f5 = _generate_figure_5(data, figures_dir)
+        generated_paths.extend(f5)
 
     return tuple(generated_paths)
 
@@ -57,7 +59,7 @@ def _generate_figure_1(data: BenchmarkArtifactData, figures_dir: str) -> tuple[s
         grouped[(s.topology, s.workload_id, s.implementation)].append(s.normalized_ns_per_frame)
 
     workloads = ("minimal", "approximately_1_ms", "approximately_5_ms")
-    workload_labels = ("Minimal", "1 ms", "5 ms")
+    workload_labels = ("Minimal", "0.38 ms", "5 ms")
 
     fig, axes = plt.subplots(1, 2, figsize=(10, 4), sharey=False)
 
@@ -110,7 +112,7 @@ def _generate_figure_2(data: BenchmarkArtifactData, figures_dir: str) -> tuple[s
         grouped[(s.topology, s.workload_id, s.implementation)].append(s.normalized_ns_per_frame)
 
     workloads = ("minimal", "approximately_1_ms", "approximately_5_ms")
-    workload_labels = ("Minimal", "1 ms", "5 ms")
+    workload_labels = ("Minimal", "0.38 ms", "5 ms")
 
     fig, axes = plt.subplots(1, 2, figsize=(10, 4), sharey=False)
 

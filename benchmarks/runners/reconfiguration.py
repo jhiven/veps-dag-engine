@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import gc
 import time
-from threading import Event, Thread
+from dataclasses import dataclass, replace
+from queue import Full, Queue
+from threading import Event, Lock, Thread
 
 from benchmarks.model import ReconfigurationSampleRow
 from benchmarks.scenarios import (
@@ -22,8 +24,18 @@ from nedo_vision_dag_engine.reconfiguration import (
     ReconfigurationStatus,
 )
 from nedo_vision_dag_engine.specification import WorkflowSpecification
+from nedo_vision_dag_engine.validation import validate_workflow
 
 __all__ = ["run_reconfiguration_suite"]
+
+
+@dataclass(frozen=True, slots=True)
+class FrameLogEntry:
+    frame_id: int
+    plan_version: int
+    arrival_ns: int
+    admission_ns: int
+    completion_ns: int
 
 
 def run_reconfiguration_suite(
@@ -49,16 +61,18 @@ def run_reconfiguration_suite(
 
     all_rows: list[ReconfigurationSampleRow] = []
 
-    # 1. Main 10-node edit scenarios across 3 baselines
-    base_spec = make_reconfiguration_base_spec()
-    graph_size = len(base_spec.nodes)
-
     for edit_type in edit_types:
+        base_spec = make_reconfiguration_base_spec(with_tracker=(edit_type == "compatible_edit_preserving_tracker"))
+        graph_size = len(base_spec.nodes)
         target_spec = apply_reconfiguration_edit(base_spec, edit_type)
         scenario_id = f"reconfig_{edit_type}_size{graph_size}"
 
         for rep in range(1, repetition_count + 1):
-            for baseline in baselines:
+            # Counterbalanced baseline ordering per repetition
+            rot_idx = (rep - 1) % len(baselines)
+            rep_baselines = baselines[rot_idx:] + baselines[:rot_idx]
+
+            for baseline in rep_baselines:
                 gc.collect()
                 row = _run_reconfig_repetition(
                     run_id=run_id,
@@ -120,38 +134,150 @@ def _run_reconfig_repetition(
         raise RuntimeError("Initial compilation failed.")
 
     initial_plan = init_cand.plan
-    executor = PipelineExecutor(initial_plan=initial_plan)
-
     state_directive = StateDirective()
 
+    # Shared harness components
+    inter_arrival_s = 0.0005
+    queue_capacity = 100
+    frame_queue: Queue[tuple[int, int]] = Queue(maxsize=queue_capacity)
+    frame_log: list[FrameLogEntry] = []
+    log_lock = Lock()
+
+    stop_producer = Event()
+    stop_worker = Event()
+    worker_paused = Event()
+
+    dropped_frame_count = 0
+    drop_lock = Lock()
+
+    def producer_loop() -> None:
+        nonlocal dropped_frame_count
+        fid = 0
+        while not stop_producer.is_set():
+            arr_ns = time.perf_counter_ns()
+            try:
+                frame_queue.put_nowait((fid, arr_ns))
+                fid += 1
+            except Full:
+                with drop_lock:
+                    dropped_frame_count += 1
+            time.sleep(inter_arrival_s)
+
+    t_producer = Thread(target=producer_loop, daemon=True)
+    t_producer.start()
+
     if baseline == "stop_rebuild_restart":
-        executor.admit_frame(admitted_at_ns=0, frame_id=0)
-        t_last_old = time.perf_counter_ns()
+        current_executor = PipelineExecutor(initial_plan=initial_plan)
+
+        def worker_loop_restart() -> None:
+            nonlocal current_executor
+            while not stop_worker.is_set():
+                if worker_paused.is_set():
+                    time.sleep(0.0001)
+                    continue
+                try:
+                    fid, arr_ns = frame_queue.get(timeout=0.005)
+                except Exception:
+                    continue
+                t_adm = time.perf_counter_ns()
+                res = current_executor.admit_frame(admitted_at_ns=arr_ns, frame_id=fid)
+                t_comp = time.perf_counter_ns()
+                with log_lock:
+                    frame_log.append(
+                        FrameLogEntry(
+                            frame_id=fid,
+                            plan_version=res.plan_version,
+                            arrival_ns=arr_ns,
+                            admission_ns=t_adm,
+                            completion_ns=t_comp,
+                        )
+                    )
+
+        t_worker = Thread(target=worker_loop_restart, daemon=True)
+        t_worker.start()
+
+        # Warmup: wait for 5 frames
+        while True:
+            with log_lock:
+                if len(frame_log) >= 5:
+                    break
+            time.sleep(0.0001)
 
         t_request = time.perf_counter_ns()
 
+        # Pause worker during synchronous rebuild
+        worker_paused.set()
+
         t_val_start = time.perf_counter_ns()
-        compiler = WorkflowCompiler("0.1.0")
+        val_res, _ = validate_workflow(target_spec, registry)
+        t_val_end = time.perf_counter_ns()
+        if not val_res.is_valid:
+            raise RuntimeError("Validation failed.")
+
         t_prep_start = time.perf_counter_ns()
+        compiler = WorkflowCompiler("0.1.0")
         cand = compiler.compile(target_spec, registry, previous_plan=None, state_directive=state_directive)
         t_prep_end = time.perf_counter_ns()
 
         if not isinstance(cand, CompiledCandidate):
             raise RuntimeError("Candidate compilation failed.")
 
+        new_version = initial_plan.version + 1
+        new_plan = replace(cand.plan, version=new_version)
+        cand = replace(cand, plan=new_plan)
+
         t_commit_start = time.perf_counter_ns()
         new_executor = PipelineExecutor(initial_plan=cand.plan)
+        current_executor = new_executor
         t_commit_end = time.perf_counter_ns()
 
-        _res = new_executor.admit_frame(admitted_at_ns=0, frame_id=1)
-        t_first_new = time.perf_counter_ns()
+        # Unpause worker
+        worker_paused.clear()
 
-        val_ns = t_prep_start - t_val_start
+        # Wait for first new frame under new plan to complete
+        old_plan_version = initial_plan.version
+        new_plan_version = initial_plan.version + 1
+
+        while True:
+            with log_lock:
+                if any(e.plan_version == cand.plan.version for e in frame_log):
+                    break
+            time.sleep(0.0001)
+
+        # Allow 5 more frames under new plan
+        target_total = len(frame_log) + 5
+        while True:
+            with log_lock:
+                if len(frame_log) >= target_total:
+                    break
+            time.sleep(0.0001)
+
+        stop_producer.set()
+        stop_worker.set()
+        t_producer.join()
+        t_worker.join()
+
+        val_ns = t_val_end - t_val_start
         prep_ns = t_prep_end - t_prep_start
         req_ready_ns = t_prep_end - t_request
         commit_ns = t_commit_end - t_commit_start
-        req_effect_ns = t_first_new - t_request
-        max_output_gap_ns = t_first_new - t_last_old
+
+        first_new_frame = next(e for e in frame_log if e.plan_version == cand.plan.version)
+        req_effect_ns = first_new_frame.completion_ns - t_request
+
+        last_old_frame = max(
+            (e for e in frame_log if e.plan_version == old_plan_version and e.completion_ns <= first_new_frame.completion_ns),
+            key=lambda e: e.completion_ns,
+            default=None,
+        )
+        max_output_gap_ns = (
+            first_new_frame.completion_ns - last_old_frame.completion_ns
+            if last_old_frame is not None
+            else 0
+        )
+        frames_during_request = sum(
+            1 for e in frame_log if t_request <= e.completion_ns <= first_new_frame.completion_ns
+        )
 
         return ReconfigurationSampleRow(
             run_id=run_id,
@@ -160,8 +286,8 @@ def _run_reconfig_repetition(
             edit_type=edit_type,
             graph_size=graph_size,
             repetition=repetition,
-            old_plan_version=initial_plan.version,
-            new_plan_version=cand.plan.version,
+            old_plan_version=old_plan_version,
+            new_plan_version=new_plan_version,
             terminal_status=ReconfigurationStatus.COMMITTED.value,
             validation_ns=val_ns,
             preparation_ns=prep_ns,
@@ -171,8 +297,8 @@ def _run_reconfig_repetition(
             request_to_effect_ns=req_effect_ns,
             retirement_ns=0,
             maximum_output_gap_ns=max_output_gap_ns,
-            frames_completed_during_request=0,
-            frames_dropped=0,
+            frames_completed_during_request=frames_during_request,
+            frames_dropped=dropped_frame_count,
             frames_duplicated=0,
             reused_processor_count=len(cand.reused_node_ids),
             staged_processor_count=len(cand.staged_node_ids),
@@ -181,12 +307,52 @@ def _run_reconfig_repetition(
         )
 
     elif baseline == "pause_compile_resume":
-        executor.admit_frame(admitted_at_ns=0, frame_id=0)
-        t_last_old = time.perf_counter_ns()
+        current_executor = PipelineExecutor(initial_plan=initial_plan)
+
+        def worker_loop_pause() -> None:
+            while not stop_worker.is_set():
+                if worker_paused.is_set():
+                    time.sleep(0.0001)
+                    continue
+                try:
+                    fid, arr_ns = frame_queue.get(timeout=0.005)
+                except Exception:
+                    continue
+                t_adm = time.perf_counter_ns()
+                res = current_executor.admit_frame(admitted_at_ns=arr_ns, frame_id=fid)
+                t_comp = time.perf_counter_ns()
+                with log_lock:
+                    frame_log.append(
+                        FrameLogEntry(
+                            frame_id=fid,
+                            plan_version=res.plan_version,
+                            arrival_ns=arr_ns,
+                            admission_ns=t_adm,
+                            completion_ns=t_comp,
+                        )
+                    )
+
+        t_worker = Thread(target=worker_loop_pause, daemon=True)
+        t_worker.start()
+
+        # Warmup: wait for 5 frames
+        while True:
+            with log_lock:
+                if len(frame_log) >= 5:
+                    break
+            time.sleep(0.0001)
 
         t_request = time.perf_counter_ns()
 
+        # Pause worker during synchronous compilation
+        worker_paused.set()
+
         t_val_start = time.perf_counter_ns()
+        val_res, _ = validate_workflow(target_spec, registry)
+        t_val_end = time.perf_counter_ns()
+        if not val_res.is_valid:
+            raise RuntimeError("Validation failed.")
+
         t_prep_start = time.perf_counter_ns()
         cand = init_compiler.compile(target_spec, registry, previous_plan=initial_plan, state_directive=state_directive)
         t_prep_end = time.perf_counter_ns()
@@ -195,18 +361,56 @@ def _run_reconfig_repetition(
             raise RuntimeError("Candidate compilation failed.")
 
         t_commit_start = time.perf_counter_ns()
-        executor.commit(cand.plan)
+        current_executor.commit(cand.plan)
         t_commit_end = time.perf_counter_ns()
 
-        _res = executor.admit_frame(admitted_at_ns=0, frame_id=1)
-        t_first_new = time.perf_counter_ns()
+        # Unpause worker
+        worker_paused.clear()
 
-        val_ns = t_prep_start - t_val_start
+        # Wait for first new frame under new plan to complete
+        old_plan_version = initial_plan.version
+        new_plan_version = cand.plan.version
+
+        while True:
+            with log_lock:
+                if any(e.plan_version == cand.plan.version for e in frame_log):
+                    break
+            time.sleep(0.0001)
+
+        # Allow 5 more frames under new plan
+        target_total = len(frame_log) + 5
+        while True:
+            with log_lock:
+                if len(frame_log) >= target_total:
+                    break
+            time.sleep(0.0001)
+
+        stop_producer.set()
+        stop_worker.set()
+        t_producer.join()
+        t_worker.join()
+
+        val_ns = t_val_end - t_val_start
         prep_ns = t_prep_end - t_prep_start
         req_ready_ns = t_prep_end - t_request
         commit_ns = t_commit_end - t_commit_start
-        req_effect_ns = t_first_new - t_request
-        max_output_gap_ns = t_first_new - t_last_old
+
+        first_new_frame = next(e for e in frame_log if e.plan_version == cand.plan.version)
+        req_effect_ns = first_new_frame.completion_ns - t_request
+
+        last_old_frame = max(
+            (e for e in frame_log if e.plan_version == old_plan_version and e.completion_ns <= first_new_frame.completion_ns),
+            key=lambda e: e.completion_ns,
+            default=None,
+        )
+        max_output_gap_ns = (
+            first_new_frame.completion_ns - last_old_frame.completion_ns
+            if last_old_frame is not None
+            else 0
+        )
+        frames_during_request = sum(
+            1 for e in frame_log if t_request <= e.completion_ns <= first_new_frame.completion_ns
+        )
 
         return ReconfigurationSampleRow(
             run_id=run_id,
@@ -215,8 +419,8 @@ def _run_reconfig_repetition(
             edit_type=edit_type,
             graph_size=graph_size,
             repetition=repetition,
-            old_plan_version=initial_plan.version,
-            new_plan_version=cand.plan.version,
+            old_plan_version=old_plan_version,
+            new_plan_version=new_plan_version,
             terminal_status=ReconfigurationStatus.COMMITTED.value,
             validation_ns=val_ns,
             preparation_ns=prep_ns,
@@ -226,8 +430,8 @@ def _run_reconfig_repetition(
             request_to_effect_ns=req_effect_ns,
             retirement_ns=0,
             maximum_output_gap_ns=max_output_gap_ns,
-            frames_completed_during_request=0,
-            frames_dropped=0,
+            frames_completed_during_request=frames_during_request,
+            frames_dropped=dropped_frame_count,
             frames_duplicated=0,
             reused_processor_count=len(cand.reused_node_ids),
             staged_processor_count=len(cand.staged_node_ids),
@@ -236,27 +440,38 @@ def _run_reconfig_repetition(
         )
 
     elif baseline == "prepare_and_commit":
-        controller = ReconfigurationController(executor=executor, compiler=init_compiler, registry=registry)
+        current_executor = PipelineExecutor(initial_plan=initial_plan)
+        controller = ReconfigurationController(executor=current_executor, compiler=init_compiler, registry=registry)
 
-        stop_bg = Event()
-        completed_timestamps: list[int] = []
-        committed_version: list[int] = []
+        def worker_loop_prepare() -> None:
+            while not stop_worker.is_set():
+                try:
+                    fid, arr_ns = frame_queue.get(timeout=0.005)
+                except Exception:
+                    continue
+                t_adm = time.perf_counter_ns()
+                res = controller.admit_frame(admitted_at_ns=arr_ns, frame_id=fid)
+                t_comp = time.perf_counter_ns()
+                with log_lock:
+                    frame_log.append(
+                        FrameLogEntry(
+                            frame_id=fid,
+                            plan_version=res.plan_version,
+                            arrival_ns=arr_ns,
+                            admission_ns=t_adm,
+                            completion_ns=t_comp,
+                        )
+                    )
 
-        def bg_admit() -> None:
-            fid = 0
-            while not stop_bg.is_set():
-                res = controller.admit_frame(admitted_at_ns=0, frame_id=fid)
-                now_ns = time.perf_counter_ns()
-                completed_timestamps.append(now_ns)
-                if res.plan_version > initial_plan.version and not committed_version:
-                    committed_version.append(res.plan_version)
-                fid += 1
-                time.sleep(0.0005)
-
-        t_worker = Thread(target=bg_admit, daemon=True)
+        t_worker = Thread(target=worker_loop_prepare, daemon=True)
         t_worker.start()
 
-        time.sleep(0.002)
+        # Warmup: wait for 5 frames
+        while True:
+            with log_lock:
+                if len(frame_log) >= 5:
+                    break
+            time.sleep(0.0001)
 
         t_request = time.perf_counter_ns()
 
@@ -269,16 +484,28 @@ def _run_reconfig_repetition(
         )
 
         controller.submit(req)
-        record = controller.wait_for_terminal(req.request_id, timeout_seconds=10.0)
-
-        time.sleep(0.005)
-        stop_bg.set()
-        t_worker.join()
-        controller.close()
+        record = controller.wait_for_effect(req.request_id, timeout_seconds=10.0)
 
         if record is None or record.status != ReconfigurationStatus.COMMITTED:
             status_val = record.status.value if record else "TIMEOUT"
             raise RuntimeError(f"Reconfiguration failed in benchmark: {status_val}")
+
+        old_plan_version = initial_plan.version
+        new_plan_version = record.candidate_version or (initial_plan.version + 1)
+
+        # Wait for 5 more frames after effect
+        target_total = len(frame_log) + 5
+        while True:
+            with log_lock:
+                if len(frame_log) >= target_total:
+                    break
+            time.sleep(0.0001)
+
+        stop_producer.set()
+        stop_worker.set()
+        t_producer.join()
+        t_worker.join()
+        controller.close()
 
         val_ns = (
             record.validation_completed_ns - record.validation_started_ns
@@ -312,15 +539,20 @@ def _run_reconfig_repetition(
             else 0
         )
 
-        max_gap = 0
-        if len(completed_timestamps) > 1:
-            gaps = [
-                completed_timestamps[i] - completed_timestamps[i - 1]
-                for i in range(1, len(completed_timestamps))
-            ]
-            max_gap = max(gaps)
-
-        cand_ver = record.candidate_version if record.candidate_version else 2
+        first_new_frame = next(e for e in frame_log if e.plan_version == new_plan_version)
+        last_old_frame = max(
+            (e for e in frame_log if e.plan_version == old_plan_version and e.completion_ns <= first_new_frame.completion_ns),
+            key=lambda e: e.completion_ns,
+            default=None,
+        )
+        max_output_gap_ns = (
+            first_new_frame.completion_ns - last_old_frame.completion_ns
+            if last_old_frame is not None
+            else 0
+        )
+        frames_during_request = sum(
+            1 for e in frame_log if t_request <= e.completion_ns <= first_new_frame.completion_ns
+        )
 
         return ReconfigurationSampleRow(
             run_id=run_id,
@@ -329,8 +561,8 @@ def _run_reconfig_repetition(
             edit_type=edit_type,
             graph_size=graph_size,
             repetition=repetition,
-            old_plan_version=initial_plan.version,
-            new_plan_version=cand_ver,
+            old_plan_version=old_plan_version,
+            new_plan_version=new_plan_version,
             terminal_status=record.status.value,
             validation_ns=val_ns,
             preparation_ns=prep_ns,
@@ -339,13 +571,13 @@ def _run_reconfig_repetition(
             commit_ns=commit_ns,
             request_to_effect_ns=req_effect_ns,
             retirement_ns=retire_ns,
-            maximum_output_gap_ns=max_gap,
-            frames_completed_during_request=len(completed_timestamps),
-            frames_dropped=0,
+            maximum_output_gap_ns=max_output_gap_ns,
+            frames_completed_during_request=frames_during_request,
+            frames_dropped=dropped_frame_count,
             frames_duplicated=0,
-            reused_processor_count=0,
-            staged_processor_count=0,
-            retired_processor_count=0,
+            reused_processor_count=record.reused_processor_count,
+            staged_processor_count=record.staged_processor_count,
+            retired_processor_count=record.retired_processor_count,
             state_transition_policy="PRESERVE" if edit_type == "compatible_edit_preserving_tracker" else "AUTO",
         )
 

@@ -132,6 +132,9 @@ class ReconfigurationRecord:
     failure_reason: str | None
     candidate_cleanup_report: CleanupReport | None
     retirement_report: CleanupReport | None
+    reused_processor_count: int = 0
+    staged_processor_count: int = 0
+    retired_processor_count: int = 0
 
     @property
     def is_terminal(self) -> bool:
@@ -446,6 +449,30 @@ class ReconfigurationController:
             timeout_seconds=timeout_seconds,
         )
 
+    def wait_for_effect(
+        self,
+        request_id: str,
+        timeout_seconds: float | None = None,
+    ) -> ReconfigurationRecord | None:
+        if timeout_seconds is not None and timeout_seconds < 0:
+            raise ValueError("timeout_seconds must be non-negative.")
+
+        with self._condition:
+            self._record_or_raise_locked(request_id)
+            reached = self._condition.wait_for(
+                lambda: (
+                    self._records[request_id].is_terminal
+                    and (
+                        self._records[request_id].status is not ReconfigurationStatus.COMMITTED
+                        or self._records[request_id].first_new_frame_completed_ns is not None
+                    )
+                ),
+                timeout=timeout_seconds,
+            )
+            if not reached:
+                return None
+            return self._records[request_id]
+
     def close(self) -> None:
         if current_thread() is self._worker:
             raise RuntimeError("the reconfiguration worker cannot close its own controller.")
@@ -677,6 +704,9 @@ class ReconfigurationController:
                 preparation_completed_ns=preparation_completed_at_ns,
                 ready_ns=ready_at_ns,
                 status=ReconfigurationStatus.READY,
+                reused_processor_count=len(compilation_result.reused_node_ids),
+                staged_processor_count=len(compilation_result.staged_node_ids),
+                retired_processor_count=len(job.previous_plan.steps) - len(compilation_result.reused_node_ids),
             )
             self._publish_transition_locked(ready_record, ready_at_ns, None)
             self._ready_queue.put(request.request_id)
@@ -813,6 +843,9 @@ class ReconfigurationController:
                 retirement_completed_ns=retirement_completed_at_ns,
                 failure_reason=retirement_reason,
                 retirement_report=retirement_report,
+                reused_processor_count=len(candidate.reused_node_ids),
+                staged_processor_count=len(candidate.staged_node_ids),
+                retired_processor_count=len(retirement_report.cleaned_node_ids),
             )
             for transition_event in transition_events:
                 self._instrumentation.record_state_transition(transition_event)

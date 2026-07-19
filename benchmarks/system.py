@@ -142,24 +142,25 @@ def _get_smt_siblings(cpu_id: int) -> tuple[int, ...]:
     return (cpu_id,)
 
 
-def collect_system_environment(pin_cpu: int | None = None) -> SystemEnvironment:
+def collect_system_environment(pin_cpus: tuple[int, ...] | None = None) -> SystemEnvironment:
     timer_info = time.get_clock_info("perf_counter")
     available_affinity = _get_cpu_affinity()
 
-    if pin_cpu is not None and hasattr(os, "sched_setaffinity"):
+    if pin_cpus is not None and hasattr(os, "sched_setaffinity"):
         try:
-            os.sched_setaffinity(0, {pin_cpu})
-            applied_affinity = (pin_cpu,)
+            os.sched_setaffinity(0, set(pin_cpus))
+            applied_affinity = tuple(sorted(pin_cpus))
         except Exception:
             applied_affinity = available_affinity
     else:
         applied_affinity = available_affinity
 
     primary_cpu = applied_affinity[0] if applied_affinity else 0
+    secondary_cpu = applied_affinity[1] if len(applied_affinity) > 1 else primary_cpu
+
     physical_core_id = _get_physical_core_id(primary_cpu)
     smt_siblings = _get_smt_siblings(primary_cpu)
 
-    # Estimate physical CPU count from sysfs or os.cpu_count()
     physical_cores: set[int] = set()
     for cpu in available_affinity:
         cid = _get_physical_core_id(cpu)
@@ -182,7 +183,7 @@ def collect_system_environment(pin_cpu: int | None = None) -> SystemEnvironment:
         available_cpu_affinity=available_affinity,
         applied_cpu_affinity=applied_affinity,
         executor_cpu=primary_cpu,
-        compiler_cpu=primary_cpu,
+        compiler_cpu=secondary_cpu,
         physical_core_id=physical_core_id,
         smt_sibling_ids=smt_siblings,
         timer_implementation=f"time.perf_counter_ns ({timer_info.implementation})",

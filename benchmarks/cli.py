@@ -1,4 +1,4 @@
-"""Typed Command Line Interface for running, reporting, and verifying benchmark artifacts."""
+"""Command line interface for benchmark suite execution, report generation, and artifact verification."""
 
 from __future__ import annotations
 
@@ -37,14 +37,17 @@ from benchmarks.scenarios import (
     generate_layered_dag,
     make_reconfiguration_base_spec,
 )
-from benchmarks.storage import (
-    read_reconfiguration_rows,
-)
+from benchmarks.storage import read_reconfiguration_rows
 from benchmarks.system import collect_system_environment
 from nedo_vision_dag_engine.specification import specification_hash
 from tests.support.workflows import linear, tracker_only
 
-__all__ = ["main"]
+__all__ = [
+    "run_benchmarks",
+    "report_cmd",
+    "verify_cmd",
+    "main",
+]
 
 
 def _calculate_file_sha256(path: str) -> str:
@@ -63,7 +66,6 @@ def run_benchmarks(
     profile: str,
     base_output_dir: str = "benchmark-results",
     seed: int = 42,
-    pin_cpu: int | None = 0,
 ) -> str:
     run_id = f"run_{datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
     run_dir = os.path.join(base_output_dir, run_id)
@@ -72,9 +74,20 @@ def run_benchmarks(
     utc_start = datetime.datetime.now(datetime.timezone.utc).isoformat()
     start_time_ns = time.monotonic_ns()
 
-    env = collect_system_environment(pin_cpu=pin_cpu)
+    valid_suite_names = {"steady-state", "reconfiguration", "conformance"}
+    if suite == "all":
+        selected_suites = ("steady-state", "reconfiguration", "conformance")
+    else:
+        parts = [s.strip() for s in suite.split(",") if s.strip()]
+        for p in parts:
+            if p not in valid_suite_names:
+                raise ValueError(
+                    f"Unknown benchmark suite {p!r}. Valid options: 'all', 'steady-state', 'reconfiguration', 'conformance' (or comma-separated combination)."
+                )
+        selected_suites = tuple(parts)
 
-    selected_suites = ("steady-state", "reconfiguration", "conformance") if suite == "all" else (suite,)
+    pin_cpus = (0,) if selected_suites == ("steady-state",) else (0, 2)
+    env = collect_system_environment(pin_cpus=pin_cpus)
 
     selected_scenarios: list[str] = []
     if "steady-state" in selected_suites:
@@ -145,12 +158,12 @@ def run_benchmarks(
     run_json_path = os.path.join(run_dir, "run.json")
     write_run_json(run_json_path, run_meta)
 
-    steady_csv = os.path.join(run_dir, "steady-state-samples.csv")
-    reconfig_csv = os.path.join(run_dir, "reconfiguration-samples.csv")
-    conformance_csv = os.path.join(run_dir, "conformance-results.csv")
+    row_counts: dict[str, int] = {}
+    sha256_dict: dict[str, str] = {}
 
     try:
         if "steady-state" in selected_suites:
+            steady_csv = os.path.join(run_dir, "steady-state-samples.csv")
             run_steady_state_suite(
                 run_id=run_id,
                 output_csv_path=steady_csv,
@@ -159,11 +172,11 @@ def run_benchmarks(
                 calibrated_iterations=calibrated_iters,
                 seed=seed,
             )
-        else:
-            from benchmarks.storage import write_steady_state_header
-            write_steady_state_header(steady_csv)
+            row_counts["steady-state-samples.csv"] = _count_csv_data_rows(steady_csv)
+            sha256_dict["steady-state-samples.csv"] = _calculate_file_sha256(steady_csv)
 
         if "reconfiguration" in selected_suites:
+            reconfig_csv = os.path.join(run_dir, "reconfiguration-samples.csv")
             run_reconfiguration_suite(
                 run_id=run_id,
                 output_csv_path=reconfig_csv,
@@ -171,22 +184,21 @@ def run_benchmarks(
                 repetition_count=repetition_count,
                 seed=seed,
             )
-        else:
-            from benchmarks.storage import write_reconfiguration_header
-            write_reconfiguration_header(reconfig_csv)
+            row_counts["reconfiguration-samples.csv"] = _count_csv_data_rows(reconfig_csv)
+            sha256_dict["reconfiguration-samples.csv"] = _calculate_file_sha256(reconfig_csv)
 
         if "conformance" in selected_suites:
+            conformance_csv = os.path.join(run_dir, "conformance-results.csv")
             run_conformance_suite(
                 run_id=run_id,
                 output_csv_path=conformance_csv,
                 profile=profile,
                 seed=seed,
             )
-        else:
-            from benchmarks.storage import write_conformance_header
-            write_conformance_header(conformance_csv)
+            row_counts["conformance-results.csv"] = _count_csv_data_rows(conformance_csv)
+            sha256_dict["conformance-results.csv"] = _calculate_file_sha256(conformance_csv)
 
-        # Generate summary, tables, and figures
+        # Generate summary, tables, and figures for selected suite data
         summary_csv = os.path.join(run_dir, "summary.csv")
         tables_dir = os.path.join(run_dir, "tables")
         figures_dir = os.path.join(run_dir, "figures")
@@ -195,18 +207,6 @@ def run_benchmarks(
         generate_summary_csv(artifact_data, summary_csv)
         table_paths = generate_all_tables(artifact_data, tables_dir)
         figure_paths = generate_all_figures(artifact_data, figures_dir)
-
-        row_counts = {
-            "steady-state-samples.csv": _count_csv_data_rows(steady_csv),
-            "reconfiguration-samples.csv": _count_csv_data_rows(reconfig_csv),
-            "conformance-results.csv": _count_csv_data_rows(conformance_csv),
-        }
-
-        sha256_dict = {
-            "steady-state-samples.csv": _calculate_file_sha256(steady_csv),
-            "reconfiguration-samples.csv": _calculate_file_sha256(reconfig_csv),
-            "conformance-results.csv": _calculate_file_sha256(conformance_csv),
-        }
 
         duration_sec = (time.monotonic_ns() - start_time_ns) / 1e9
         utc_comp = datetime.datetime.now(datetime.timezone.utc).isoformat()
@@ -274,8 +274,7 @@ def verify_cmd(run_directory: str) -> None:
     if run_meta.run_id != comp_meta.run_id:
         raise ValueError(f"Run ID mismatch: run.json has {run_meta.run_id}, completion.json has {comp_meta.run_id}")
 
-    raw_files = ("steady-state-samples.csv", "reconfiguration-samples.csv", "conformance-results.csv")
-    for fname in raw_files:
+    for fname in comp_meta.raw_file_row_counts.keys():
         fpath = os.path.join(run_directory, fname)
         if not os.path.exists(fpath):
             raise ValueError(f"Missing expected raw CSV file: {fname}")
@@ -291,19 +290,21 @@ def verify_cmd(run_directory: str) -> None:
             raise ValueError(f"SHA-256 mismatch for {fname}: expected {expected_sha}, got {actual_sha}")
 
     # Check non-negative intervals and interval relationships in reconfiguration samples
-    reconfig_samples = read_reconfiguration_rows(os.path.join(run_directory, "reconfiguration-samples.csv"))
-    for s in reconfig_samples:
-        for val in (s.validation_ns, s.preparation_ns, s.request_to_ready_ns, s.boundary_wait_ns, s.commit_ns, s.request_to_effect_ns, s.retirement_ns, s.maximum_output_gap_ns):
-            if val is not None and val < 0:
-                raise ValueError(f"Negative timing interval found in reconfiguration record: {s}")
+    reconfig_csv = os.path.join(run_directory, "reconfiguration-samples.csv")
+    if os.path.exists(reconfig_csv):
+        reconfig_samples = read_reconfiguration_rows(reconfig_csv)
+        for s in reconfig_samples:
+            for val in (s.validation_ns, s.preparation_ns, s.request_to_ready_ns, s.boundary_wait_ns, s.commit_ns, s.request_to_effect_ns, s.retirement_ns, s.maximum_output_gap_ns):
+                if val is not None and val < 0:
+                    raise ValueError(f"Negative timing interval found in reconfiguration record: {s}")
 
-        if s.request_to_ready_ns is not None and s.validation_ns is not None:
-            if s.request_to_ready_ns < s.validation_ns:
-                raise ValueError(f"Invalid interval relationship: request_to_ready_ns ({s.request_to_ready_ns}) < validation_ns ({s.validation_ns})")
+            if s.request_to_ready_ns is not None and s.validation_ns is not None:
+                if s.request_to_ready_ns < s.validation_ns:
+                    raise ValueError(f"Invalid interval relationship: request_to_ready_ns ({s.request_to_ready_ns}) < validation_ns ({s.validation_ns})")
 
-        if s.request_to_effect_ns is not None and s.request_to_ready_ns is not None:
-            if s.request_to_effect_ns < s.request_to_ready_ns:
-                raise ValueError(f"Invalid interval relationship: request_to_effect_ns ({s.request_to_effect_ns}) < request_to_ready_ns ({s.request_to_ready_ns})")
+            if s.request_to_effect_ns is not None and s.request_to_ready_ns is not None:
+                if s.request_to_effect_ns < s.request_to_ready_ns:
+                    raise ValueError(f"Invalid interval relationship: request_to_effect_ns ({s.request_to_effect_ns}) < request_to_ready_ns ({s.request_to_ready_ns})")
 
     # Check generated tables and figures exist
     for t_path in comp_meta.generated_table_paths:
@@ -322,7 +323,11 @@ def main() -> None:
 
     # run subcommand
     run_parser = subparsers.add_parser("run")
-    run_parser.add_argument("suite", choices=["steady-state", "reconfiguration", "conformance", "all"])
+    run_parser.add_argument(
+        "suite",
+        type=str,
+        help="Benchmark suite(s) to run ('all', 'steady-state', 'reconfiguration', 'conformance', or comma-separated list e.g. 'reconfiguration,conformance')",
+    )
     profile_group = run_parser.add_mutually_exclusive_group(required=True)
     profile_group.add_argument("--smoke", action="store_true", help="Run smoke profile for CI/validation")
     profile_group.add_argument("--publication", action="store_true", help="Run publication profile")

@@ -336,10 +336,35 @@ def create_reconfiguration_registry(extra_tracker: bool = True) -> RegistrySnaps
     return builder.snapshot()
 
 
-def make_reconfiguration_base_spec() -> WorkflowSpecification:
+def make_reconfiguration_base_spec(with_tracker: bool = False) -> WorkflowSpecification:
+    n1_node = (
+        Node(
+            node_id="tracker",
+            type_name=SYNTHETIC_TRACKER_DESCRIPTOR.type_name,
+            configuration=to_processor_configuration({}),
+            inputs=(
+                Pin(
+                    name="value",
+                    payload_type=ConcreteType(object),
+                    cardinality=PinCardinality.SINGLE,
+                    requirement=PinRequirement.REQUIRED,
+                ),
+            ),
+            outputs=(
+                Pin(
+                    name="value",
+                    payload_type=ConcreteType(object),
+                    cardinality=PinCardinality.SINGLE,
+                    requirement=PinRequirement.REQUIRED,
+                ),
+            ),
+        )
+        if with_tracker
+        else _make_workload_node("n1", 1, ("value",))
+    )
     nodes = (
         _make_workload_node("n0", 0, ()),
-        _make_workload_node("n1", 1, ("value",)),
+        n1_node,
         _make_workload_node("n2", 2, ("value",)),
         _make_workload_node("n3", 3, ("value",)),
         _make_workload_node("n4", 4, ("value",)),
@@ -350,8 +375,8 @@ def make_reconfiguration_base_spec() -> WorkflowSpecification:
         _make_workload_node("n9", 9, ("value",)),
     )
     edges = (
-        Edge("n0", "value", "n1", "value"),
-        Edge("n1", "value", "n2", "value"),
+        Edge("n0", "value", "tracker" if with_tracker else "n1", "value"),
+        Edge("tracker" if with_tracker else "n1", "value", "n2", "value"),
         Edge("n2", "value", "n3", "value"),
         Edge("n3", "value", "n4", "value"),
         Edge("n4", "value", "n5", "value"),
@@ -400,6 +425,19 @@ def apply_reconfiguration_edit(
         return WorkflowSpecification(nodes=base_spec.nodes, edges=new_edges)
 
     elif edit_type == "compatible_edit_preserving_tracker":
+        extra_node = _make_workload_node("n_extra", 99, ("value",))
+        has_tracker = any(n.node_id == "tracker" for n in base_spec.nodes)
+        if has_tracker:
+            nodes = base_spec.nodes + (extra_node,)
+            edges_list: list[Edge] = []
+            for e in base_spec.edges:
+                if e.source_node_id == "n5" and e.destination_node_id == "n8":
+                    edges_list.append(Edge("n5", "value", "n_extra", "value"))
+                    edges_list.append(Edge("n_extra", "value", "n8", "in_branch1"))
+                else:
+                    edges_list.append(e)
+            return WorkflowSpecification(nodes=nodes, edges=tuple(edges_list))
+
         tracker_node = Node(
             node_id="tracker",
             type_name=SYNTHETIC_TRACKER_DESCRIPTOR.type_name,
@@ -414,10 +452,9 @@ def apply_reconfiguration_edit(
                 ),
             ),
         )
-        extra_node = _make_workload_node("n_extra", 99, ("value",))
         nodes = tuple(n for n in base_spec.nodes if n.node_id != "n1") + (tracker_node, extra_node)
 
-        edges_list: list[Edge] = []
+        edges_list = []
         for e in base_spec.edges:
             if e.source_node_id == "n1":
                 edges_list.append(Edge("tracker", "value", e.destination_node_id, e.destination_pin))

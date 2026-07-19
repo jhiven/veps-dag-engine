@@ -20,20 +20,23 @@ def generate_all_tables(data: BenchmarkArtifactData, tables_dir: str) -> tuple[s
     os.makedirs(tables_dir, exist_ok=True)
     generated_paths: list[str] = []
 
-    p1_csv = os.path.join(tables_dir, "table1_steady_state.csv")
-    p1_md = os.path.join(tables_dir, "table1_steady_state.md")
-    _generate_table_1(data, p1_csv, p1_md)
-    generated_paths.extend([p1_csv, p1_md])
+    if data.steady_state_samples:
+        p1_csv = os.path.join(tables_dir, "table1_steady_state.csv")
+        p1_md = os.path.join(tables_dir, "table1_steady_state.md")
+        _generate_table_1(data, p1_csv, p1_md)
+        generated_paths.extend([p1_csv, p1_md])
 
-    p2_csv = os.path.join(tables_dir, "table2_reconfiguration.csv")
-    p2_md = os.path.join(tables_dir, "table2_reconfiguration.md")
-    _generate_table_2(data, p2_csv, p2_md)
-    generated_paths.extend([p2_csv, p2_md])
+    if data.reconfiguration_samples:
+        p2_csv = os.path.join(tables_dir, "table2_reconfiguration.csv")
+        p2_md = os.path.join(tables_dir, "table2_reconfiguration.md")
+        _generate_table_2(data, p2_csv, p2_md)
+        generated_paths.extend([p2_csv, p2_md])
 
-    p3_csv = os.path.join(tables_dir, "table3_conformance.csv")
-    p3_md = os.path.join(tables_dir, "table3_conformance.md")
-    _generate_table_3(data, p3_csv, p3_md)
-    generated_paths.extend([p3_csv, p3_md])
+    if data.conformance_results:
+        p3_csv = os.path.join(tables_dir, "table3_conformance.csv")
+        p3_md = os.path.join(tables_dir, "table3_conformance.md")
+        _generate_table_3(data, p3_csv, p3_md)
+        generated_paths.extend([p3_csv, p3_md])
 
     return tuple(generated_paths)
 
@@ -86,7 +89,7 @@ def _generate_table_1(data: BenchmarkArtifactData, csv_path: str, md_path: str) 
 
                 rows.append([
                     top,
-                    work,
+                    "approximately_0_38_ms" if work == "approximately_1_ms" else work,
                     impl,
                     f"{stats.median:.1f}",
                     f"{stats.p95:.1f}",
