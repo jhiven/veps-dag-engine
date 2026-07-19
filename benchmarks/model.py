@@ -52,7 +52,7 @@ class ReconfigurationSampleRow:
     commit_to_retirement_complete_ns: int | None
     maximum_output_gap_ns: int | None
     frames_completed_during_request: int
-    old_plan_frames_completed_during_preparation: int
+    old_plan_frames_admitted_after_request_before_commit: int
     frames_dropped: int
     frames_duplicated: int
     reused_processor_count: int
@@ -122,7 +122,7 @@ RECONFIGURATION_HEADERS: tuple[str, ...] = (
     "commit_to_retirement_complete_ns",
     "maximum_output_gap_ns",
     "frames_completed_during_request",
-    "old_plan_frames_completed_during_preparation",
+    "old_plan_frames_admitted_after_request_before_commit",
     "frames_dropped",
     "frames_duplicated",
     "reused_processor_count",

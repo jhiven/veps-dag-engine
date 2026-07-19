@@ -124,8 +124,20 @@ __all__ = [
     "CompilationFailureKind",
     "CompilationFailure",
     "CandidatePlan",
+    "ValidatedWorkflow",
     "WorkflowCompiler",
 ]
+
+
+@dataclass(frozen=True, slots=True)
+class ValidatedWorkflow:
+    """A workflow specification that has passed structural and type validation,
+    along with its pre-computed topological execution order.
+    """
+
+    specification: WorkflowSpecification
+    topological_order: tuple[str, ...]
+    registry: RegistrySnapshot
 
 
 class CycleDetected(Exception):
@@ -700,15 +712,11 @@ class WorkflowCompiler:
     def forget_version(self, version: int) -> None:
         self._specifications_by_version.pop(version, None)
 
-    def compile(
+    def validate(
         self,
         specification: WorkflowSpecification,
         registry: RegistrySnapshot,
-        previous_plan: ExecutionPlan | None = None,
-        state_directive: StateDirective | None = None,
-    ) -> CandidatePlan:
-        directive = state_directive if state_directive is not None else StateDirective()
-
+    ) -> ValidatedWorkflow | CompilationFailure:
         combined_validation, _resolver = validate_workflow(specification, registry)
         if not combined_validation.is_valid:
             return CompilationFailure(
@@ -719,6 +727,23 @@ class WorkflowCompiler:
             order = topological_order(specification.nodes, specification.edges)
         except CycleDetected as error:
             return CompilationFailure(errors=(), reason=str(error))
+
+        return ValidatedWorkflow(
+            specification=specification,
+            topological_order=order,
+            registry=registry,
+        )
+
+    def compile_validated(
+        self,
+        validated: ValidatedWorkflow,
+        previous_plan: ExecutionPlan | None = None,
+        state_directive: StateDirective | None = None,
+    ) -> CandidatePlan:
+        directive = state_directive if state_directive is not None else StateDirective()
+        specification = validated.specification
+        registry = validated.registry
+        order = validated.topological_order
 
         previous_specification: WorkflowSpecification | None = None
         if previous_plan is not None:
@@ -761,4 +786,21 @@ class WorkflowCompiler:
             reused_node_ids=reused_node_ids,
             staged_node_ids=staged_node_ids,
             retired_node_ids=retired_node_ids,
+        )
+
+    def compile(
+        self,
+        specification: WorkflowSpecification,
+        registry: RegistrySnapshot,
+        previous_plan: ExecutionPlan | None = None,
+        state_directive: StateDirective | None = None,
+    ) -> CandidatePlan:
+        validated_result = self.validate(specification, registry)
+        if isinstance(validated_result, CompilationFailure):
+            return validated_result
+
+        return self.compile_validated(
+            validated=validated_result,
+            previous_plan=previous_plan,
+            state_directive=state_directive,
         )

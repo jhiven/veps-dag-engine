@@ -80,7 +80,7 @@ def test_reporting_from_fixture_csvs() -> None:
                     commit_to_retirement_complete_ns=30,
                     maximum_output_gap_ns=200,
                     frames_completed_during_request=2,
-                    old_plan_frames_completed_during_preparation=2,
+                    old_plan_frames_admitted_after_request_before_commit=2,
                     frames_dropped=0,
                     frames_duplicated=0,
                     reused_processor_count=9,

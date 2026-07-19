@@ -12,10 +12,8 @@ from nedo_vision_dag_engine.compiler import (
     CompiledCandidate,
     CompilationFailure,
     CompilationFailureKind,
-    CycleDetected,
     StateDirective,
     WorkflowCompiler,
-    topological_order,
 )
 from nedo_vision_dag_engine.executor import FrameResult, PipelineExecutor
 from nedo_vision_dag_engine.instrumentation import (
@@ -39,7 +37,6 @@ from nedo_vision_dag_engine.processor import StateTransitionEvent
 from nedo_vision_dag_engine.registry import RegistrySnapshot
 from nedo_vision_dag_engine.specification import WorkflowSpecification, specification_hash
 from nedo_vision_dag_engine.type_system import StatePolicy
-from nedo_vision_dag_engine.validation import ValidationError, validate_workflow
 
 __all__ = [
     "NanosecondClock",
@@ -139,7 +136,7 @@ class ReconfigurationRecord:
     reused_processor_count: int = 0
     staged_processor_count: int = 0
     retired_processor_count: int = 0
-    old_plan_frames_completed_during_preparation: int = 0
+    old_plan_frames_admitted_after_request_before_commit: int = 0
     retirement_status: RetirementStatus = RetirementStatus.NOT_REQUIRED
     retirement_failure_reason: str | None = None
 
@@ -228,6 +225,9 @@ def _retirement_finished(record: ReconfigurationRecord) -> bool:
         ReconfigurationStatus.ABORTED,
     }:
         return True
+
+    if record.status is not ReconfigurationStatus.COMMITTED:
+        return False
 
     return record.retirement_status in {
         RetirementStatus.NOT_REQUIRED,
@@ -660,10 +660,11 @@ class ReconfigurationController:
             self._publish_transition_locked(validating_record, validating_at_ns, None)
 
         try:
-            validation_result, _resolver = validate_workflow(
-                request.target_specification,
-                self._registry,
-            )
+            with self._compiler_lock:
+                validated_result = self._compiler.validate(
+                    specification=request.target_specification,
+                    registry=self._registry,
+                )
         except Exception as error:
             self._finish_preparation_failure(
                 request_id=request.request_id,
@@ -675,35 +676,17 @@ class ReconfigurationController:
             return
 
         validation_completed_at_ns = self._clock()
-        if not validation_result.is_valid:
+        if isinstance(validated_result, CompilationFailure):
+            failure_status = (
+                ReconfigurationStatus.REJECTED
+                if validated_result.kind is CompilationFailureKind.REJECTED
+                else ReconfigurationStatus.FAILED
+            )
+            reason = _format_failure_reason(validated_result)
             self._finish_preparation_failure(
                 request_id=request.request_id,
-                status=ReconfigurationStatus.REJECTED,
-                reason=_format_validation_errors(validation_result.errors),
-                validation_completed_at_ns=validation_completed_at_ns,
-                preparation_completed_at_ns=None,
-            )
-            return
-
-        try:
-            topological_order(
-                request.target_specification.nodes,
-                request.target_specification.edges,
-            )
-        except CycleDetected as error:
-            self._finish_preparation_failure(
-                request_id=request.request_id,
-                status=ReconfigurationStatus.REJECTED,
-                reason=str(error),
-                validation_completed_at_ns=validation_completed_at_ns,
-                preparation_completed_at_ns=None,
-            )
-            return
-        except Exception as error:
-            self._finish_preparation_failure(
-                request_id=request.request_id,
-                status=ReconfigurationStatus.FAILED,
-                reason=f"cycle detection raised unexpectedly: {error!r}",
+                status=failure_status,
+                reason=reason,
                 validation_completed_at_ns=validation_completed_at_ns,
                 preparation_completed_at_ns=None,
             )
@@ -736,9 +719,8 @@ class ReconfigurationController:
 
         try:
             with self._compiler_lock:
-                compilation_result = self._compiler.compile(
-                    specification=request.target_specification,
-                    registry=self._registry,
+                compilation_result = self._compiler.compile_validated(
+                    validated=validated_result,
                     previous_plan=job.previous_plan,
                     state_directive=request.state_directive,
                 )
@@ -1005,11 +987,11 @@ class ReconfigurationController:
                     record is not None
                     and record.commit_started_ns is None
                     and result.plan_version == record.base_version
-                    and completed_at_ns >= record.request_received_ns
+                    and admitted_at_ns >= record.request_received_ns
                 ):
                     updated_record = replace(
                         record,
-                        old_plan_frames_completed_during_preparation=record.old_plan_frames_completed_during_preparation + 1,
+                        old_plan_frames_admitted_after_request_before_commit=record.old_plan_frames_admitted_after_request_before_commit + 1,
                     )
                     self._records[active_id] = updated_record
 
@@ -1188,7 +1170,7 @@ class ReconfigurationController:
                 failure_reason=record.failure_reason,
                 candidate_cleanup_failure_count=candidate_cleanup_failure_count,
                 retirement_failure_count=retirement_failure_count,
-                old_plan_frames_completed_during_preparation=record.old_plan_frames_completed_during_preparation,
+                old_plan_frames_admitted_after_request_before_commit=record.old_plan_frames_admitted_after_request_before_commit,
                 retirement_status=record.retirement_status,
                 retirement_failure_reason=record.retirement_failure_reason,
             )
@@ -1247,8 +1229,14 @@ class ReconfigurationController:
             raise ReconfigurationControllerClosed("reconfiguration controller is closed.")
 
 
-def _format_validation_errors(errors: tuple[ValidationError, ...]) -> str:
-    return "; ".join(f"{error.code.value}: {error.message}" for error in errors)
+def _format_failure_reason(failure: CompilationFailure) -> str:
+    """Combine the top-level reason with every individual validation error."""
+    if not failure.errors:
+        return failure.reason
+    details = "; ".join(
+        f"{error.code.value}: {error.message}" for error in failure.errors
+    )
+    return f"{failure.reason}: {details}"
 
 
 def _cleanup_failure_reason(operation: str, report: CleanupReport) -> str | None:

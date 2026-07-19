@@ -16,7 +16,7 @@ from benchmarks.scenarios import (
     make_reconfiguration_base_spec,
 )
 from benchmarks.storage import append_reconfiguration_rows, write_reconfiguration_header
-from nedo_vision_dag_engine.compiler import CompiledCandidate, StateDirective, WorkflowCompiler
+from nedo_vision_dag_engine.compiler import CompiledCandidate, CompilationFailure, StateDirective, WorkflowCompiler
 from nedo_vision_dag_engine.executor import PipelineExecutor
 from nedo_vision_dag_engine.instrumentation import RetirementStatus
 from nedo_vision_dag_engine.lifecycle import retire_superseded_processors
@@ -26,7 +26,6 @@ from nedo_vision_dag_engine.reconfiguration import (
     ReconfigurationStatus,
 )
 from nedo_vision_dag_engine.specification import WorkflowSpecification
-from nedo_vision_dag_engine.validation import validate_workflow
 
 __all__ = ["run_reconfiguration_suite"]
 
@@ -210,15 +209,16 @@ def _run_reconfig_repetition(
         # Pause worker during synchronous rebuild
         worker_paused.set()
 
+        compiler = WorkflowCompiler("0.1.0")
+
         t_val_start = time.perf_counter_ns()
-        val_res, _ = validate_workflow(target_spec, registry)
+        validated = compiler.validate(target_spec, registry)
         t_val_end = time.perf_counter_ns()
-        if not val_res.is_valid:
-            raise RuntimeError("Validation failed.")
+        if isinstance(validated, CompilationFailure):
+            raise RuntimeError(f"Validation failed: {validated.reason}")
 
         t_prep_start = time.perf_counter_ns()
-        compiler = WorkflowCompiler("0.1.0")
-        cand = compiler.compile(target_spec, registry, previous_plan=None, state_directive=state_directive)
+        cand = compiler.compile_validated(validated, previous_plan=None, state_directive=state_directive)
         t_prep_end = time.perf_counter_ns()
 
         if not isinstance(cand, CompiledCandidate):
@@ -228,12 +228,13 @@ def _run_reconfig_repetition(
         new_plan = replace(cand.plan, version=new_version)
         cand = replace(cand, plan=new_plan)
 
-        t_commit_start = time.perf_counter_ns()
         t_ret_start = time.perf_counter_ns()
         retire_report = retire_superseded_processors(previous_plan=initial_plan, active_plan=cand.plan)
         t_ret_end = time.perf_counter_ns()
         if not retire_report.succeeded:
             raise RuntimeError(f"stop_rebuild_restart processor retirement failed: {retire_report.failures}")
+
+        t_commit_start = time.perf_counter_ns()
         new_executor = PipelineExecutor(initial_plan=cand.plan)
         current_executor = new_executor
         t_commit_end = time.perf_counter_ns()
@@ -287,6 +288,18 @@ def _run_reconfig_repetition(
             1 for e in frame_log if t_request <= e.completion_ns <= first_new_frame.completion_ns
         )
 
+        old_frames_before_commit = sum(
+            1
+            for event in frame_log
+            if event.plan_version == old_plan_version
+            and event.admission_ns >= t_request
+            and event.completion_ns < t_commit_start
+        )
+        if old_frames_before_commit != 0:
+            raise RuntimeError(
+                f"stop_rebuild_restart admitted {old_frames_before_commit} old-plan frames while the pipeline was expected to be paused."
+            )
+
         return ReconfigurationSampleRow(
             run_id=run_id,
             scenario_id=scenario_id,
@@ -305,10 +318,10 @@ def _run_reconfig_repetition(
             request_to_effect_ns=req_effect_ns,
             retirement_queue_delay_ns=0,
             retirement_duration_ns=retire_duration_ns,
-            commit_to_retirement_complete_ns=retire_duration_ns,
+            commit_to_retirement_complete_ns=None,
             maximum_output_gap_ns=max_output_gap_ns,
             frames_completed_during_request=frames_during_request,
-            old_plan_frames_completed_during_preparation=0,
+            old_plan_frames_admitted_after_request_before_commit=old_frames_before_commit,
             frames_dropped=dropped_frame_count,
             frames_duplicated=0,
             reused_processor_count=len(cand.reused_node_ids),
@@ -359,13 +372,13 @@ def _run_reconfig_repetition(
         worker_paused.set()
 
         t_val_start = time.perf_counter_ns()
-        val_res, _ = validate_workflow(target_spec, registry)
+        validated = init_compiler.validate(target_spec, registry)
         t_val_end = time.perf_counter_ns()
-        if not val_res.is_valid:
-            raise RuntimeError("Validation failed.")
+        if isinstance(validated, CompilationFailure):
+            raise RuntimeError(f"Validation failed: {validated.reason}")
 
         t_prep_start = time.perf_counter_ns()
-        cand = init_compiler.compile(target_spec, registry, previous_plan=initial_plan, state_directive=state_directive)
+        cand = init_compiler.compile_validated(validated, previous_plan=initial_plan, state_directive=state_directive)
         t_prep_end = time.perf_counter_ns()
 
         if not isinstance(cand, CompiledCandidate):
@@ -373,12 +386,13 @@ def _run_reconfig_repetition(
 
         t_commit_start = time.perf_counter_ns()
         current_executor.commit(cand.plan)
+        t_commit_end = time.perf_counter_ns()
+
         t_ret_start = time.perf_counter_ns()
         retire_report = retire_superseded_processors(previous_plan=initial_plan, active_plan=cand.plan)
         t_ret_end = time.perf_counter_ns()
         if not retire_report.succeeded:
             raise RuntimeError(f"pause_compile_resume processor retirement failed: {retire_report.failures}")
-        t_commit_end = time.perf_counter_ns()
 
         # Unpause worker
         worker_paused.clear()
@@ -429,6 +443,18 @@ def _run_reconfig_repetition(
             1 for e in frame_log if t_request <= e.completion_ns <= first_new_frame.completion_ns
         )
 
+        old_frames_before_commit = sum(
+            1
+            for event in frame_log
+            if event.plan_version == old_plan_version
+            and event.admission_ns >= t_request
+            and event.completion_ns < t_commit_start
+        )
+        if old_frames_before_commit != 0:
+            raise RuntimeError(
+                f"pause_compile_resume admitted {old_frames_before_commit} old-plan frames while the pipeline was expected to be paused."
+            )
+
         return ReconfigurationSampleRow(
             run_id=run_id,
             scenario_id=scenario_id,
@@ -447,10 +473,10 @@ def _run_reconfig_repetition(
             request_to_effect_ns=req_effect_ns,
             retirement_queue_delay_ns=0,
             retirement_duration_ns=retire_duration_ns,
-            commit_to_retirement_complete_ns=retire_duration_ns,
+            commit_to_retirement_complete_ns=None,
             maximum_output_gap_ns=max_output_gap_ns,
             frames_completed_during_request=frames_during_request,
-            old_plan_frames_completed_during_preparation=0,
+            old_plan_frames_admitted_after_request_before_commit=old_frames_before_commit,
             frames_dropped=dropped_frame_count,
             frames_duplicated=0,
             reused_processor_count=len(cand.reused_node_ids),
@@ -470,7 +496,7 @@ def _run_reconfig_repetition(
                 except Exception:
                     continue
                 t_adm = time.perf_counter_ns()
-                res = controller.admit_frame(admitted_at_ns=arr_ns, frame_id=fid)
+                res = controller.admit_frame(admitted_at_ns=t_adm, frame_id=fid)
                 t_comp = time.perf_counter_ns()
                 with log_lock:
                     frame_log.append(
@@ -614,7 +640,7 @@ def _run_reconfig_repetition(
             commit_to_retirement_complete_ns=commit_to_retire_complete_ns,
             maximum_output_gap_ns=max_output_gap_ns,
             frames_completed_during_request=frames_during_request,
-            old_plan_frames_completed_during_preparation=record.old_plan_frames_completed_during_preparation,
+            old_plan_frames_admitted_after_request_before_commit=record.old_plan_frames_admitted_after_request_before_commit,
             frames_dropped=dropped_frame_count,
             frames_duplicated=0,
             reused_processor_count=record.reused_processor_count,

@@ -92,7 +92,7 @@ def test_reconfiguration_storage_roundtrip() -> None:
         commit_to_retirement_complete_ns=300,
         maximum_output_gap_ns=1200,
         frames_completed_during_request=5,
-        old_plan_frames_completed_during_preparation=5,
+        old_plan_frames_admitted_after_request_before_commit=5,
         frames_dropped=0,
         frames_duplicated=0,
         reused_processor_count=9,

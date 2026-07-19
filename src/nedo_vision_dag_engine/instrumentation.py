@@ -144,7 +144,7 @@ class ReconfigurationMeasurement:
     failure_reason: str | None
     candidate_cleanup_failure_count: int
     retirement_failure_count: int
-    old_plan_frames_completed_during_preparation: int = 0
+    old_plan_frames_admitted_after_request_before_commit: int = 0
     retirement_status: RetirementStatus = RetirementStatus.NOT_REQUIRED
     retirement_failure_reason: str | None = None
 
@@ -164,8 +164,8 @@ class ReconfigurationMeasurement:
             raise ValueError("candidate_cleanup_failure_count must be non-negative.")
         if self.retirement_failure_count < 0:
             raise ValueError("retirement_failure_count must be non-negative.")
-        if self.old_plan_frames_completed_during_preparation < 0:
-            raise ValueError("old_plan_frames_completed_during_preparation must be non-negative.")
+        if self.old_plan_frames_admitted_after_request_before_commit < 0:
+            raise ValueError("old_plan_frames_admitted_after_request_before_commit must be non-negative.")
         _validate_ordered_pair(
             self.validation_started_ns,
             self.validation_completed_ns,

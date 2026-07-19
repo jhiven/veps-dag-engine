@@ -543,6 +543,28 @@ def test_explicit_reset_uses_new_stateful_instance_and_emits_event() -> None:
         controller.close()
 
 
+def test_wait_for_retirement_returns_none_before_commit() -> None:
+    registry = _stateless_registry([])
+    compiler = WorkflowCompiler("test")
+    initial = _compile_initial(compiler, registry, _source_only_specification())
+    executor = PipelineExecutor(initial.plan)
+    controller = ReconfigurationController(executor, compiler, registry, clock=IncrementingClock())
+
+    try:
+        controller.submit(_request("ready-req", 1, _linear_specification()))
+        ready = controller.wait_for_status(
+            "ready-req",
+            frozenset({ReconfigurationStatus.READY}),
+            timeout_seconds=2.0,
+        )
+        assert ready is not None
+        assert ready.status is ReconfigurationStatus.READY
+        # wait_for_retirement should time out / return None because status is READY, not COMMITTED
+        assert controller.wait_for_retirement("ready-req", timeout_seconds=0.05) is None
+    finally:
+        controller.close()
+
+
 def test_abort_ready_candidate_cleans_staged_resources() -> None:
     events: list[str] = []
     registry = _stateless_registry(events)

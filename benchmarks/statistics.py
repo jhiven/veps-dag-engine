@@ -48,10 +48,16 @@ class PairedStats:
 class TOSTResult:
     equivalent: bool
     p_value: float
+    p_value_lower: float
+    p_value_upper: float
     t_stat_lower: float
     t_stat_upper: float
     margin: float
+    relative_margin_percent: float
     mean_diff: float
+    mean_relative_diff_percent: float
+    ci_90_lower: float
+    ci_90_upper: float
     ci_95_lower: float
     ci_95_upper: float
 
@@ -160,14 +166,15 @@ def calculate_tost_equivalence(
     treat = np.asarray(treatment_values, dtype=np.float64)
     n = len(base)
     if n < 2:
-        return TOSTResult(False, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+        return TOSTResult(False, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, relative_margin * 100.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 
     diffs = treat - base
+    mean_base = float(np.mean(base))
     mean_diff = float(np.mean(diffs))
     std_diff = float(np.std(diffs, ddof=1))
     se_diff = std_diff / np.sqrt(n)
 
-    margin = abs(relative_margin * float(np.mean(base)))
+    margin = abs(relative_margin * mean_base)
 
     t_stat_lower = (mean_diff - (-margin)) / se_diff if se_diff > 0 else 0.0
     cdf_lower = float(np.float64(stats.t.cdf(t_stat_lower, df=n - 1)))
@@ -179,19 +186,27 @@ def calculate_tost_equivalence(
 
     p_value = max(p_val_lower, p_val_upper)
     equivalent = bool(p_value < 0.05)
+    mean_rel_diff_pct = (mean_diff / mean_base * 100.0) if mean_base != 0 else 0.0
 
     def mean_fn(d: np.ndarray) -> float:
         return float(np.mean(d))
 
-    ci_lower, ci_upper = _bootstrap_ci(diffs, mean_fn)
+    ci_90_lower, ci_90_upper = _bootstrap_ci(diffs, mean_fn, confidence_level=0.90)
+    ci_95_lower, ci_95_upper = _bootstrap_ci(diffs, mean_fn, confidence_level=0.95)
 
     return TOSTResult(
         equivalent=equivalent,
         p_value=p_value,
+        p_value_lower=p_val_lower,
+        p_value_upper=p_val_upper,
         t_stat_lower=float(t_stat_lower),
         t_stat_upper=float(t_stat_upper),
         margin=margin,
+        relative_margin_percent=relative_margin * 100.0,
         mean_diff=mean_diff,
-        ci_95_lower=ci_lower,
-        ci_95_upper=ci_upper,
+        mean_relative_diff_percent=mean_rel_diff_pct,
+        ci_90_lower=ci_90_lower,
+        ci_90_upper=ci_90_upper,
+        ci_95_lower=ci_95_lower,
+        ci_95_upper=ci_95_upper,
     )

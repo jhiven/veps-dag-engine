@@ -116,6 +116,7 @@ def _generate_table_2(data: BenchmarkArtifactData, csv_path: str, md_path: str) 
         "Max Output Gap Median (ns)",
         "Max Output Gap p95 (ns)",
         "Commit Median (ns)",
+        "Old-Plan Frames Before Commit",
         "Processor Reuse Count",
         "Dropped Frames",
         "Duplicated Frames",
@@ -146,6 +147,7 @@ def _generate_table_2(data: BenchmarkArtifactData, csv_path: str, md_path: str) 
             cmt_stats = calculate_summary_stats(cmt_vals) if cmt_vals else None
 
             reuse_cnt = samples[0].reused_processor_count if samples else 0
+            old_frames_cnt = sum(s.old_plan_frames_admitted_after_request_before_commit for s in samples)
             drop_cnt = sum(s.frames_dropped for s in samples)
             dup_cnt = sum(s.frames_duplicated for s in samples)
 
@@ -157,6 +159,7 @@ def _generate_table_2(data: BenchmarkArtifactData, csv_path: str, md_path: str) 
                 f"{gap_stats.median:.1f}" if gap_stats else "N/A",
                 f"{gap_stats.p95:.1f}" if gap_stats else "N/A",
                 f"{cmt_stats.median:.1f}" if cmt_stats else "N/A",
+                str(old_frames_cnt),
                 str(reuse_cnt),
                 str(drop_cnt),
                 str(dup_cnt),
