@@ -47,9 +47,12 @@ class ReconfigurationSampleRow:
     boundary_wait_ns: int | None
     commit_ns: int | None
     request_to_effect_ns: int | None
-    retirement_ns: int | None
+    retirement_queue_delay_ns: int | None
+    retirement_duration_ns: int | None
+    commit_to_retirement_complete_ns: int | None
     maximum_output_gap_ns: int | None
     frames_completed_during_request: int
+    old_plan_frames_completed_during_preparation: int
     frames_dropped: int
     frames_duplicated: int
     reused_processor_count: int
@@ -114,9 +117,12 @@ RECONFIGURATION_HEADERS: tuple[str, ...] = (
     "boundary_wait_ns",
     "commit_ns",
     "request_to_effect_ns",
-    "retirement_ns",
+    "retirement_queue_delay_ns",
+    "retirement_duration_ns",
+    "commit_to_retirement_complete_ns",
     "maximum_output_gap_ns",
     "frames_completed_during_request",
+    "old_plan_frames_completed_during_preparation",
     "frames_dropped",
     "frames_duplicated",
     "reused_processor_count",

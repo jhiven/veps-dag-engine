@@ -294,7 +294,7 @@ def verify_cmd(run_directory: str) -> None:
     if os.path.exists(reconfig_csv):
         reconfig_samples = read_reconfiguration_rows(reconfig_csv)
         for s in reconfig_samples:
-            for val in (s.validation_ns, s.preparation_ns, s.request_to_ready_ns, s.boundary_wait_ns, s.commit_ns, s.request_to_effect_ns, s.retirement_ns, s.maximum_output_gap_ns):
+            for val in (s.validation_ns, s.preparation_ns, s.request_to_ready_ns, s.boundary_wait_ns, s.commit_ns, s.request_to_effect_ns, s.retirement_queue_delay_ns, s.retirement_duration_ns, s.commit_to_retirement_complete_ns, s.maximum_output_gap_ns):
                 if val is not None and val < 0:
                     raise ValueError(f"Negative timing interval found in reconfiguration record: {s}")
 

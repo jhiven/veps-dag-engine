@@ -165,17 +165,19 @@ class PipelineExecutor:
 
     def claim_management(self, token: object) -> None:
         """Claim exclusive management of this executor."""
-        with self._plan_lock:
-            if self._manager_token is not None:
-                raise RuntimeError("executor is already managed")
-            self._manager_token = token
+        with self._execution_lock:
+            with self._plan_lock:
+                if self._manager_token is not None:
+                    raise RuntimeError("executor is already managed")
+                self._manager_token = token
 
     def release_management(self, token: object) -> None:
         """Release exclusive management of this executor."""
-        with self._plan_lock:
-            if self._manager_token is not token:
-                raise RuntimeError("invalid management token for release")
-            self._manager_token = None
+        with self._execution_lock:
+            with self._plan_lock:
+                if self._manager_token is not token:
+                    raise RuntimeError("invalid management token for release")
+                self._manager_token = None
 
     def _require_unmanaged(self) -> None:
         if self._manager_token is not None:
@@ -190,24 +192,23 @@ class PipelineExecutor:
 
     def commit(self, new_plan: ExecutionPlan) -> PlanSwap:
         """Public commit. Raises if managed by a controller."""
-        self._require_unmanaged()
         with self._execution_lock:
             with self._plan_lock:
+                self._require_unmanaged()
                 return self._commit_plan_locked(new_plan)
 
     def commit_managed(self, token: object, new_plan: ExecutionPlan) -> PlanSwap:
-        if token is not self._manager_token:
-            raise RuntimeError("invalid executor management token")
         with self._execution_lock:
             with self._plan_lock:
+                if token is not self._manager_token:
+                    raise RuntimeError("invalid executor management token")
                 return self._commit_plan_locked(new_plan)
 
     def commit_if_version(self, expected_version: int, new_plan: ExecutionPlan) -> PlanSwap | None:
         """Public conditional commit. Raises if managed by a controller."""
-        self._require_unmanaged()
-        # For public unmanaged use, we bypass token check since it's unmanaged
         with self._execution_lock:
             with self._plan_lock:
+                self._require_unmanaged()
                 if self._active_plan.version != expected_version:
                     return None
                 return self._commit_plan_locked(new_plan)
@@ -215,35 +216,38 @@ class PipelineExecutor:
     def commit_if_version_managed(
         self, token: object, expected_version: int, new_plan: ExecutionPlan
     ) -> PlanSwap | None:
-        if token is not self._manager_token:
-            raise RuntimeError("invalid executor management token")
         with self._execution_lock:
             with self._plan_lock:
+                if token is not self._manager_token:
+                    raise RuntimeError("invalid executor management token")
                 if self._active_plan.version != expected_version:
                     return None
                 return self._commit_plan_locked(new_plan)
 
     def admit_frame(self, admitted_at_ns: int, frame_id: int | None = None) -> FrameResult:
-        """Public admission path.  Raises if managed by a controller."""
-        self._require_unmanaged()
-        # Unmanaged fast path
-        return self._admit_frame_locked(admitted_at_ns, frame_id)
+        """Public admission path. Raises if managed by a controller."""
+        return self._admit_frame_locked(token=None, is_managed=False, admitted_at_ns=admitted_at_ns, frame_id=frame_id)
 
     def admit_frame_managed(
         self, token: object, admitted_at_ns: int, frame_id: int | None = None
     ) -> FrameResult:
         """Execute a frame when managed by a controller."""
-        if token is not self._manager_token:
-            raise RuntimeError("invalid executor management token")
-        return self._admit_frame_locked(admitted_at_ns, frame_id)
+        return self._admit_frame_locked(token=token, is_managed=True, admitted_at_ns=admitted_at_ns, frame_id=frame_id)
 
-    def _admit_frame_locked(self, admitted_at_ns: int, frame_id: int | None = None) -> FrameResult:
+    def _admit_frame_locked(
+        self, token: object | None, is_managed: bool, admitted_at_ns: int, frame_id: int | None = None
+    ) -> FrameResult:
         """Core frame execution logic."""
         if admitted_at_ns < 0:
             raise ValueError("admitted_at_ns must be non-negative.")
 
         with self._execution_lock:
             with self._plan_lock:
+                if is_managed:
+                    if token is not self._manager_token:
+                        raise RuntimeError("invalid executor management token")
+                else:
+                    self._require_unmanaged()
                 plan = self._active_plan
             resolved_frame_id = self._next_frame_id if frame_id is None else frame_id
             if resolved_frame_id < 0:

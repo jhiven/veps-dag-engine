@@ -17,6 +17,7 @@ __all__ = [
     "NanosecondClock",
     "FrameStatus",
     "ReconfigurationStatus",
+    "RetirementStatus",
     "RuntimeEventKind",
     "FrameExecutionEvent",
     "ReconfigurationEvent",
@@ -59,6 +60,14 @@ class ReconfigurationStatus(Enum):
             ReconfigurationStatus.STALE,
             ReconfigurationStatus.ABORTED,
         }
+
+
+class RetirementStatus(Enum):
+    NOT_REQUIRED = "not_required"
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
 
 
 class RuntimeEventKind(Enum):
@@ -129,11 +138,15 @@ class ReconfigurationMeasurement:
     committed_at_ns: int | None
     first_new_frame_admitted_ns: int | None
     first_new_frame_completed_ns: int | None
+    retirement_started_ns: int | None
     retirement_completed_ns: int | None
     terminal_status: ReconfigurationStatus
     failure_reason: str | None
     candidate_cleanup_failure_count: int
     retirement_failure_count: int
+    old_plan_frames_completed_during_preparation: int = 0
+    retirement_status: RetirementStatus = RetirementStatus.NOT_REQUIRED
+    retirement_failure_reason: str | None = None
 
     def __post_init__(self) -> None:
         if not self.request_id:
@@ -151,6 +164,8 @@ class ReconfigurationMeasurement:
             raise ValueError("candidate_cleanup_failure_count must be non-negative.")
         if self.retirement_failure_count < 0:
             raise ValueError("retirement_failure_count must be non-negative.")
+        if self.old_plan_frames_completed_during_preparation < 0:
+            raise ValueError("old_plan_frames_completed_during_preparation must be non-negative.")
         _validate_ordered_pair(
             self.validation_started_ns,
             self.validation_completed_ns,
@@ -165,8 +180,13 @@ class ReconfigurationMeasurement:
         _validate_ordered_pair(self.commit_started_ns, self.committed_at_ns, "commit")
         _validate_ordered_pair(
             self.committed_at_ns,
+            self.retirement_started_ns,
+            "retirement queue",
+        )
+        _validate_ordered_pair(
+            self.retirement_started_ns,
             self.retirement_completed_ns,
-            "retirement",
+            "retirement execution",
         )
 
     def _timestamps(self) -> tuple[tuple[str, int | None], ...]:
@@ -182,6 +202,7 @@ class ReconfigurationMeasurement:
             ("committed_at_ns", self.committed_at_ns),
             ("first_new_frame_admitted_ns", self.first_new_frame_admitted_ns),
             ("first_new_frame_completed_ns", self.first_new_frame_completed_ns),
+            ("retirement_started_ns", self.retirement_started_ns),
             ("retirement_completed_ns", self.retirement_completed_ns),
         )
 
@@ -197,7 +218,9 @@ class ReconfigurationMeasurement:
                 self.request_received_ns,
                 self.first_new_frame_completed_ns,
             ),
-            retirement_ns=_duration(self.committed_at_ns, self.retirement_completed_ns),
+            retirement_queue_delay_ns=_duration(self.committed_at_ns, self.retirement_started_ns),
+            retirement_duration_ns=_duration(self.retirement_started_ns, self.retirement_completed_ns),
+            commit_to_retirement_complete_ns=_duration(self.committed_at_ns, self.retirement_completed_ns),
         )
 
 
@@ -209,7 +232,9 @@ class ReconfigurationTimings:
     boundary_wait_ns: int | None
     commit_ns: int | None
     request_to_effect_ns: int | None
-    retirement_ns: int | None
+    retirement_queue_delay_ns: int | None
+    retirement_duration_ns: int | None
+    commit_to_retirement_complete_ns: int | None
 
 
 @dataclass(frozen=True, slots=True)

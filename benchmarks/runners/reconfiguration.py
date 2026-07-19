@@ -18,6 +18,8 @@ from benchmarks.scenarios import (
 from benchmarks.storage import append_reconfiguration_rows, write_reconfiguration_header
 from nedo_vision_dag_engine.compiler import CompiledCandidate, StateDirective, WorkflowCompiler
 from nedo_vision_dag_engine.executor import PipelineExecutor
+from nedo_vision_dag_engine.instrumentation import RetirementStatus
+from nedo_vision_dag_engine.lifecycle import retire_superseded_processors
 from nedo_vision_dag_engine.reconfiguration import (
     ReconfigurationController,
     ReconfigurationRequest,
@@ -227,6 +229,11 @@ def _run_reconfig_repetition(
         cand = replace(cand, plan=new_plan)
 
         t_commit_start = time.perf_counter_ns()
+        t_ret_start = time.perf_counter_ns()
+        retire_report = retire_superseded_processors(previous_plan=initial_plan, active_plan=cand.plan)
+        t_ret_end = time.perf_counter_ns()
+        if not retire_report.succeeded:
+            raise RuntimeError(f"stop_rebuild_restart processor retirement failed: {retire_report.failures}")
         new_executor = PipelineExecutor(initial_plan=cand.plan)
         current_executor = new_executor
         t_commit_end = time.perf_counter_ns()
@@ -261,6 +268,7 @@ def _run_reconfig_repetition(
         prep_ns = t_prep_end - t_prep_start
         req_ready_ns = t_prep_end - t_request
         commit_ns = t_commit_end - t_commit_start
+        retire_duration_ns = t_ret_end - t_ret_start
 
         first_new_frame = next(e for e in frame_log if e.plan_version == cand.plan.version)
         req_effect_ns = first_new_frame.completion_ns - t_request
@@ -295,9 +303,12 @@ def _run_reconfig_repetition(
             boundary_wait_ns=0,
             commit_ns=commit_ns,
             request_to_effect_ns=req_effect_ns,
-            retirement_ns=0,
+            retirement_queue_delay_ns=0,
+            retirement_duration_ns=retire_duration_ns,
+            commit_to_retirement_complete_ns=retire_duration_ns,
             maximum_output_gap_ns=max_output_gap_ns,
             frames_completed_during_request=frames_during_request,
+            old_plan_frames_completed_during_preparation=0,
             frames_dropped=dropped_frame_count,
             frames_duplicated=0,
             reused_processor_count=len(cand.reused_node_ids),
@@ -362,6 +373,11 @@ def _run_reconfig_repetition(
 
         t_commit_start = time.perf_counter_ns()
         current_executor.commit(cand.plan)
+        t_ret_start = time.perf_counter_ns()
+        retire_report = retire_superseded_processors(previous_plan=initial_plan, active_plan=cand.plan)
+        t_ret_end = time.perf_counter_ns()
+        if not retire_report.succeeded:
+            raise RuntimeError(f"pause_compile_resume processor retirement failed: {retire_report.failures}")
         t_commit_end = time.perf_counter_ns()
 
         # Unpause worker
@@ -394,6 +410,7 @@ def _run_reconfig_repetition(
         prep_ns = t_prep_end - t_prep_start
         req_ready_ns = t_prep_end - t_request
         commit_ns = t_commit_end - t_commit_start
+        retire_duration_ns = t_ret_end - t_ret_start
 
         first_new_frame = next(e for e in frame_log if e.plan_version == cand.plan.version)
         req_effect_ns = first_new_frame.completion_ns - t_request
@@ -428,9 +445,12 @@ def _run_reconfig_repetition(
             boundary_wait_ns=0,
             commit_ns=commit_ns,
             request_to_effect_ns=req_effect_ns,
-            retirement_ns=0,
+            retirement_queue_delay_ns=0,
+            retirement_duration_ns=retire_duration_ns,
+            commit_to_retirement_complete_ns=retire_duration_ns,
             maximum_output_gap_ns=max_output_gap_ns,
             frames_completed_during_request=frames_during_request,
+            old_plan_frames_completed_during_preparation=0,
             frames_dropped=dropped_frame_count,
             frames_duplicated=0,
             reused_processor_count=len(cand.reused_node_ids),
@@ -476,7 +496,7 @@ def _run_reconfig_repetition(
         t_request = time.perf_counter_ns()
 
         req = ReconfigurationRequest(
-            request_id=f"req_{scenario_id}_{repetition}",
+            request_id="reconfig_1",
             base_version=initial_plan.version,
             target_specification=target_spec,
             state_directive=state_directive,
@@ -484,11 +504,20 @@ def _run_reconfig_repetition(
         )
 
         controller.submit(req)
-        record = controller.wait_for_effect(req.request_id, timeout_seconds=10.0)
 
-        if record is None or record.status != ReconfigurationStatus.COMMITTED:
-            status_val = record.status.value if record else "TIMEOUT"
-            raise RuntimeError(f"Reconfiguration failed in benchmark: {status_val}")
+        # Wait for effect
+        rec_eff = controller.wait_for_effect(req.request_id, timeout_seconds=10.0)
+        if rec_eff is None:
+            raise RuntimeError("prepare_and_commit wait_for_effect timed out.")
+
+        # Wait for retirement
+        ret_rec = controller.wait_for_retirement(req.request_id, timeout_seconds=10.0)
+        if ret_rec is None:
+            raise RuntimeError("prepare_and_commit wait_for_retirement timed out.")
+        if ret_rec.retirement_status is RetirementStatus.FAILED:
+            raise RuntimeError(f"processor retirement failed during benchmark: {ret_rec.retirement_failure_reason}")
+
+        record = controller.record(req.request_id)
 
         old_plan_version = initial_plan.version
         new_plan_version = record.candidate_version or (initial_plan.version + 1)
@@ -533,7 +562,17 @@ def _run_reconfig_repetition(
             if record.first_new_frame_completed_ns
             else 0
         )
-        retire_ns = (
+        retire_queue_delay_ns = (
+            record.retirement_started_ns - record.commit_ns
+            if record.retirement_started_ns and record.commit_ns
+            else 0
+        )
+        retire_duration_ns = (
+            record.retirement_completed_ns - record.retirement_started_ns
+            if record.retirement_completed_ns and record.retirement_started_ns
+            else 0
+        )
+        commit_to_retire_complete_ns = (
             record.retirement_completed_ns - record.commit_ns
             if record.retirement_completed_ns and record.commit_ns
             else 0
@@ -570,9 +609,12 @@ def _run_reconfig_repetition(
             boundary_wait_ns=boundary_wait_ns,
             commit_ns=commit_ns,
             request_to_effect_ns=req_effect_ns,
-            retirement_ns=retire_ns,
+            retirement_queue_delay_ns=retire_queue_delay_ns,
+            retirement_duration_ns=retire_duration_ns,
+            commit_to_retirement_complete_ns=commit_to_retire_complete_ns,
             maximum_output_gap_ns=max_output_gap_ns,
             frames_completed_during_request=frames_during_request,
+            old_plan_frames_completed_during_preparation=record.old_plan_frames_completed_during_preparation,
             frames_dropped=dropped_frame_count,
             frames_duplicated=0,
             reused_processor_count=record.reused_processor_count,

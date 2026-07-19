@@ -255,6 +255,7 @@ def test_reconfiguration_measurement_exposes_all_intervals() -> None:
         committed_at_ns=53,
         first_new_frame_admitted_ns=54,
         first_new_frame_completed_ns=60,
+        retirement_started_ns=55,
         retirement_completed_ns=58,
         terminal_status=ReconfigurationStatus.COMMITTED,
         failure_reason=None,
@@ -270,7 +271,9 @@ def test_reconfiguration_measurement_exposes_all_intervals() -> None:
     assert timings.boundary_wait_ns == 9
     assert timings.commit_ns == 3
     assert timings.request_to_effect_ns == 50
-    assert timings.retirement_ns == 5
+    assert timings.retirement_queue_delay_ns == 2
+    assert timings.retirement_duration_ns == 3
+    assert timings.commit_to_retirement_complete_ns == 5
 
 
 def test_controller_records_latest_measurement_and_state_reuse() -> None:

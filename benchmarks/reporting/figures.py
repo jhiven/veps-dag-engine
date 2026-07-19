@@ -186,7 +186,7 @@ def _generate_figure_3(data: BenchmarkArtifactData, figures_dir: str) -> tuple[s
             prep = float(np.mean([s.preparation_ns or 0 for s in samples]))
             bound = float(np.mean([s.boundary_wait_ns or 0 for s in samples]))
             cmt = float(np.mean([s.commit_ns or 0 for s in samples]))
-            ret = float(np.mean([s.retirement_ns or 0 for s in samples]))
+            ret = float(np.mean([s.retirement_duration_ns or 0 for s in samples]))
         else:
             val = prep = bound = cmt = ret = 0.0
 
@@ -196,25 +196,35 @@ def _generate_figure_3(data: BenchmarkArtifactData, figures_dir: str) -> tuple[s
         commit_means.append(cmt / 1e3)
         retirement_means.append(ret / 1e3)
 
-    fig, ax = plt.subplots(figsize=(8, 4.5))
+    fig, ax = plt.subplots(figsize=(8.5, 5))
     x = np.arange(len(edit_types))
-    width = 0.5
+    width = 0.35
 
-    ax.bar(x, validation_means, width, label="Validation", color="#7570b3")
-    ax.bar(x, preparation_means, width, bottom=validation_means, label="Preparation", color="#1b9e77")
+    # Critical path stack (Validation, Preparation, Boundary Wait, Commit)
+    ax.bar(x - width/2, validation_means, width, label="Validation", color="#7570b3")
+    ax.bar(x - width/2, preparation_means, width, bottom=validation_means, label="Preparation", color="#1b9e77")
     bottom_bound = np.add(validation_means, preparation_means)
-    ax.bar(x, boundary_means, width, bottom=bottom_bound, label="Boundary Wait", color="#e6ab02")
+    ax.bar(x - width/2, boundary_means, width, bottom=bottom_bound, label="Boundary Wait", color="#e6ab02")
     bottom_cmt = np.add(bottom_bound, boundary_means)
-    ax.bar(x, commit_means, width, bottom=bottom_cmt, label="Commit", color="#d95f02")
-    bottom_ret = np.add(bottom_cmt, commit_means)
-    ax.bar(x, retirement_means, width, bottom=bottom_ret, label="Retirement", color="#66a61e")
+    ax.bar(x - width/2, commit_means, width, bottom=bottom_cmt, label="Commit", color="#d95f02")
+
+    # Off-path async retirement (separate bar)
+    ax.bar(x + width/2, retirement_means, width, label="Retirement (Off-Path Async)", color="#66a61e", hatch="//")
 
     ax.set_title("Reconfiguration Latency Breakdown (prepare_and_commit)", fontsize=11)
     ax.set_xticks(x)
     ax.set_xticklabels(edit_labels, rotation=15)
     ax.set_ylabel("Latency (µs)")
     ax.grid(True, linestyle="--", alpha=0.5)
-    ax.legend()
+    ax.legend(loc="upper left")
+
+    fig.text(
+        0.5, 0.01,
+        "Note: Retirement duration is reported separately because it executes asynchronously outside the request-to-effect critical path.",
+        ha="center", fontsize=8, style="italic"
+    )
+
+    fig.tight_layout(rect=(0.0, 0.04, 1.0, 1.0))
 
     base_path = os.path.join(figures_dir, "figure3_reconfiguration_breakdown")
     return _save_fig(fig, base_path)

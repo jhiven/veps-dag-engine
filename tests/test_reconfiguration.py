@@ -317,7 +317,9 @@ def test_ready_candidate_commits_before_next_frame_and_records_effect() -> None:
         assert executor.active_plan.version == 1
 
         frame_result = controller.admit_frame(admitted_at_ns=10_000, frame_id=7)
-        controller.wait_for_retirement("add-consumer")
+        ret_rec = controller.wait_for_retirement("add-consumer", timeout_seconds=2.0)
+        assert ret_rec is not None
+        assert ret_rec.retirement_completed_ns is not None
         record = controller.record("add-consumer")
 
         assert frame_result.plan_version == 2
@@ -532,7 +534,9 @@ def test_explicit_reset_uses_new_stateful_instance_and_emits_event() -> None:
         assert transition.new_plan_version == 2
         assert transition.policy is StateTransitionPolicy.RESET
         controller.admit_frame(1, 1)
-        controller.wait_for_retirement("reset-tracker")
+        ret_rec = controller.wait_for_retirement("reset-tracker", timeout_seconds=2.0)
+        assert ret_rec is not None
+        assert ret_rec.retirement_completed_ns is not None
         assert "cleanup:tracker-0" in events
         assert "cleanup:tracker-1" not in events
     finally:
@@ -686,7 +690,7 @@ def test_managed_executor_rejects_direct_commit() -> None:
     finally:
         controller.close()
 
-def test_retirement_runs_after_first_new_frame() -> None:
+def test_retirement_runs_asynchronously_after_commit() -> None:
     events: list[str] = []
     registry = _stateless_registry(events)
     compiler = WorkflowCompiler("test")
@@ -708,11 +712,227 @@ def test_retirement_runs_after_first_new_frame() -> None:
         controller.admit_frame(1, 1)
 
         # Now wait for retirement
-        controller.wait_for_retirement("req1")
+        ret_rec = controller.wait_for_retirement("req1", timeout_seconds=2.0)
+        assert ret_rec is not None
+        assert ret_rec.retirement_completed_ns is not None
 
         # Now the retirement should have happened
         record = controller.record("req1")
         assert record.retirement_report is not None
         assert "cleanup:consumer" in events
     finally:
+        controller.close()
+
+
+def test_old_token_invalid_after_controller_recreated() -> None:
+    registry = _stateless_registry([])
+    compiler = WorkflowCompiler("test")
+    initial = _compile_initial(compiler, registry, _linear_specification())
+    executor = PipelineExecutor(initial.plan)
+
+    controller_a = ReconfigurationController(executor, compiler, registry, clock=IncrementingClock())
+    token_a = getattr(controller_a, "_executor_token")
+    controller_a.close()
+
+    controller_b = ReconfigurationController(executor, compiler, registry, clock=IncrementingClock())
+    try:
+        with pytest.raises(RuntimeError, match="invalid executor management token"):
+            executor.admit_frame_managed(token_a, 1)
+    finally:
+        controller_b.close()
+
+
+def test_claim_management_waits_for_unmanaged_frame() -> None:
+    frame_started = Event()
+    frame_release = Event()
+
+    class BlockingProcessor(RecordingProcessor):
+        def __init__(self) -> None:
+            super().__init__(SOURCE_DESCRIPTOR, [], "blocking")
+
+        def process(self, inputs: object, context: FrameContext) -> object:
+            frame_started.set()
+            frame_release.wait()
+            return ValueOutput(1)
+
+    builder = RegistryBuilder()
+    builder.register(
+        RegisteredProcessorType(
+            descriptor=SOURCE_DESCRIPTOR,
+            factory=BlockingProcessor,
+        )
+    )
+    reg = builder.snapshot()
+    compiler = WorkflowCompiler("test")
+    spec = _source_only_specification("source")
+    cand = compiler.compile(spec, reg)
+    assert isinstance(cand, CompiledCandidate)
+    executor = PipelineExecutor(cand.plan)
+
+    t = Thread(target=executor.admit_frame, args=(1, 1), daemon=True)
+    t.start()
+    assert frame_started.wait(timeout=2.0)
+
+    claim_done = Event()
+    claimed_tokens: list[object] = []
+
+    def claim_worker() -> None:
+        token = object()
+        executor.claim_management(token)
+        claimed_tokens.append(token)
+        claim_done.set()
+
+    t_claim = Thread(target=claim_worker, daemon=True)
+    t_claim.start()
+
+    time.sleep(0.05)
+    assert not claim_done.is_set()
+
+    frame_release.set()
+    t.join()
+    t_claim.join()
+    assert claim_done.is_set()
+    assert len(claimed_tokens) == 1
+    executor.release_management(claimed_tokens[0])
+
+
+def test_invalid_token_cannot_admit_or_commit() -> None:
+    registry = _stateless_registry([])
+    compiler = WorkflowCompiler("test")
+    initial = _compile_initial(compiler, registry, _linear_specification())
+    executor = PipelineExecutor(initial.plan)
+    controller = ReconfigurationController(executor, compiler, registry, clock=IncrementingClock())
+
+    try:
+        with pytest.raises(RuntimeError, match="invalid executor management token"):
+            executor.admit_frame_managed(object(), 1)
+
+        cand = compiler.compile(_source_only_specification(), registry, previous_plan=initial.plan)
+        assert isinstance(cand, CompiledCandidate)
+        with pytest.raises(RuntimeError, match="invalid executor management token"):
+            executor.commit_managed(object(), cand.plan)
+    finally:
+        controller.close()
+
+
+def test_two_controllers_cannot_claim_same_executor() -> None:
+    registry = _stateless_registry([])
+    compiler = WorkflowCompiler("test")
+    initial = _compile_initial(compiler, registry, _linear_specification())
+    executor = PipelineExecutor(initial.plan)
+    c1 = ReconfigurationController(executor, compiler, registry, clock=IncrementingClock())
+    try:
+        with pytest.raises(RuntimeError, match="already managed"):
+            ReconfigurationController(executor, compiler, registry, clock=IncrementingClock())
+    finally:
+        c1.close()
+
+
+def test_close_waits_for_pending_retirement() -> None:
+    cleanup_ran = Event()
+
+    class TrackingProcessor(RecordingProcessor):
+        def __init__(self) -> None:
+            super().__init__(SOURCE_DESCRIPTOR, [], "tracking")
+
+        def cleanup(self) -> None:
+            cleanup_ran.set()
+
+    builder = RegistryBuilder()
+    builder.register(
+        RegisteredProcessorType(
+            descriptor=SOURCE_DESCRIPTOR,
+            factory=TrackingProcessor,
+        )
+    )
+    reg = builder.snapshot()
+    compiler = WorkflowCompiler("test")
+    spec1 = _source_only_specification("source")
+    cand1 = compiler.compile(spec1, reg)
+    assert isinstance(cand1, CompiledCandidate)
+    executor = PipelineExecutor(cand1.plan)
+
+    controller = ReconfigurationController(executor, compiler, reg, clock=IncrementingClock())
+
+    spec2 = WorkflowSpecification(nodes=(), edges=())
+    controller.submit(_request("r1", 1, spec2))
+    controller.wait_for_status("r1", frozenset({ReconfigurationStatus.READY}), timeout_seconds=2.0)
+    controller.commit_ready()
+
+    controller.close()
+
+    assert cleanup_ran.is_set()
+
+
+def test_frame_runs_concurrently_during_blocked_retirement() -> None:
+    cleanup_started = Event()
+    cleanup_release = Event()
+    cleaned_up = Event()
+
+    class BlockingCleanupProcessor(RecordingProcessor):
+        def __init__(self) -> None:
+            super().__init__(PASS_DESCRIPTOR, [], "blocking_cleanup")
+
+        def cleanup(self) -> None:
+            cleanup_started.set()
+            cleanup_release.wait()
+            cleaned_up.set()
+
+    class NormalProcessor(RecordingProcessor):
+        def __init__(self) -> None:
+            super().__init__(SOURCE_DESCRIPTOR, [], "normal")
+
+    builder = RegistryBuilder()
+    builder.register(
+        RegisteredProcessorType(
+            descriptor=SOURCE_DESCRIPTOR,
+            factory=NormalProcessor,
+        )
+    )
+    builder.register(
+        RegisteredProcessorType(
+            descriptor=PASS_DESCRIPTOR,
+            factory=BlockingCleanupProcessor,
+        )
+    )
+    reg = builder.snapshot()
+
+    compiler = WorkflowCompiler("test")
+    spec1 = _linear_specification("pass", "source")
+    cand1 = compiler.compile(spec1, reg)
+    assert isinstance(cand1, CompiledCandidate)
+
+    executor = PipelineExecutor(cand1.plan)
+    controller = ReconfigurationController(executor, compiler, reg, clock=IncrementingClock())
+
+    try:
+        spec2 = _source_only_specification("source")
+        controller.submit(_request("swap", 1, spec2))
+        ready_rec = controller.wait_for_status("swap", frozenset({ReconfigurationStatus.READY}), timeout_seconds=2.0)
+        assert ready_rec is not None
+        assert ready_rec.status is ReconfigurationStatus.READY
+
+        res = controller.commit_ready()
+        assert res is not None
+        assert res.status is ReconfigurationStatus.COMMITTED
+
+        cleanup_started.wait(timeout=2.0)
+        assert cleanup_started.is_set()
+
+        # Execute frame on new plan WHILE old processor cleanup is blocked in background thread
+        frame_res = controller.admit_frame(10, 1)
+        assert frame_res.plan_version == 2
+        assert frame_res.executed_node_ids == ("source",)
+
+        # Confirm cleanup has not completed yet
+        assert not cleaned_up.is_set()
+
+        # Unblock cleanup
+        cleanup_release.set()
+        ret_rec = controller.wait_for_retirement("swap", timeout_seconds=2.0)
+        assert ret_rec is not None
+        assert ret_rec.retirement_completed_ns is not None
+        assert cleaned_up.is_set()
+    finally:
+        cleanup_release.set()
         controller.close()

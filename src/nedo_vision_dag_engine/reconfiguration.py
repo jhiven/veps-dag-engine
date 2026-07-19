@@ -23,6 +23,7 @@ from nedo_vision_dag_engine.instrumentation import (
     ReconfigurationEvent,
     ReconfigurationMeasurement,
     ReconfigurationStatus,
+    RetirementStatus,
     RuntimeInstrumentation,
     StateReuseEvent,
 )
@@ -138,6 +139,9 @@ class ReconfigurationRecord:
     reused_processor_count: int = 0
     staged_processor_count: int = 0
     retired_processor_count: int = 0
+    old_plan_frames_completed_during_preparation: int = 0
+    retirement_status: RetirementStatus = RetirementStatus.NOT_REQUIRED
+    retirement_failure_reason: str | None = None
 
     @property
     def is_terminal(self) -> bool:
@@ -195,7 +199,16 @@ class _StopCommand:
 
 type _WorkItem = _CompilationJob | _StopCommand
 
+
+@dataclass(frozen=True, slots=True)
+class _RetirementStopCommand:
+    pass
+
+
 _STOP = _StopCommand()
+_RETIREMENT_STOP = _RetirementStopCommand()
+
+type _RetirementWorkItem = _PendingRetirement | _RetirementStopCommand
 
 
 @dataclass(frozen=True, slots=True)
@@ -205,6 +218,22 @@ class _PendingRetirement:
     request_id: str
     previous_plan: ExecutionPlan
     active_plan: ExecutionPlan
+
+
+def _retirement_finished(record: ReconfigurationRecord) -> bool:
+    if record.status in {
+        ReconfigurationStatus.REJECTED,
+        ReconfigurationStatus.FAILED,
+        ReconfigurationStatus.STALE,
+        ReconfigurationStatus.ABORTED,
+    }:
+        return True
+
+    return record.retirement_status in {
+        RetirementStatus.NOT_REQUIRED,
+        RetirementStatus.COMPLETED,
+        RetirementStatus.FAILED,
+    }
 
 
 class ReconfigurationController:
@@ -221,11 +250,10 @@ class ReconfigurationController:
     """
 
     __slots__ = (
-        "_abort_requested_ids",
         "_active_request_id",
         "_admission_lock",
-        "_clock",
         "_closed",
+        "_clock",
         "_committed_request_by_plan_version",
         "_compiler",
         "_compiler_lock",
@@ -243,6 +271,7 @@ class ReconfigurationController:
         "_state_lock",
         "_work_queue",
         "_worker",
+        "_abort_requested_ids",
     )
 
     def __init__(
@@ -268,7 +297,7 @@ class ReconfigurationController:
         self._compiler_lock = Lock()
         self._work_queue: Queue[_WorkItem] = Queue()
         self._ready_queue: Queue[str] = Queue()
-        self._retirement_queue: Queue[_PendingRetirement | None] = Queue()
+        self._retirement_queue: Queue[_RetirementWorkItem] = Queue()
         self._records: dict[str, ReconfigurationRecord] = {}
         self._instrumentation: RuntimeInstrumentation = executor.instrumentation
         self._ready_candidates: dict[str, _ReadyCandidate] = {}
@@ -428,7 +457,7 @@ class ReconfigurationController:
                 frame_id=frame_id,
             )
             completed_at_ns = self._clock()
-            self._record_first_frame(result, admitted_at_ns, completed_at_ns)
+            self._record_frame_completion(result, admitted_at_ns, completed_at_ns)
             return result
 
     def record(self, request_id: str) -> ReconfigurationRecord:
@@ -522,10 +551,7 @@ class ReconfigurationController:
         with self._condition:
             self._record_or_raise_locked(request_id)
             reached = self._condition.wait_for(
-                lambda: (
-                    self._records[request_id].status is not ReconfigurationStatus.COMMITTED
-                    or self._records[request_id].retirement_completed_ns is not None
-                ),
+                lambda: _retirement_finished(self._records[request_id]),
                 timeout=timeout_seconds,
             )
             if not reached:
@@ -535,6 +561,8 @@ class ReconfigurationController:
     def close(self) -> None:
         if current_thread() is self._worker:
             raise RuntimeError("the reconfiguration worker cannot close its own controller.")
+        if current_thread() is self._retirement_worker:
+            raise RuntimeError("the retirement worker cannot close its own controller.")
 
         ready_candidate: _ReadyCandidate | None = None
         ready_request_id: str | None = None
@@ -570,18 +598,14 @@ class ReconfigurationController:
                     self._abort_requested_ids.discard(ready_request_id)
                     self._finish_terminal_locked(aborted_record, aborted_at_ns, reason)
 
-        self._retirement_queue.put(None)
         if self._worker.is_alive():
-            try:
-                self._worker.join()
-            except RuntimeError:
-                pass
+            self._worker.join()
+
+        self._retirement_queue.put(_RETIREMENT_STOP)
+        self._retirement_queue.join()
         if self._retirement_worker.is_alive():
-            try:
-                self._retirement_worker.join()
-            except RuntimeError:
-                pass
-                
+            self._retirement_worker.join()
+
         self._executor.release_management(self._executor_token)
 
     def __enter__(self) -> ReconfigurationController:
@@ -899,15 +923,6 @@ class ReconfigurationController:
             in {StatePolicy.PRESERVABLE, StatePolicy.RESETTABLE}
         )
 
-        # Schedule physical retirement on the dedicated background worker.
-        self._retirement_queue.put(
-            _PendingRetirement(
-                request_id=request.request_id,
-                previous_plan=plan_swap.previous_plan,
-                active_plan=plan_swap.active_plan,
-            )
-        )
-
         with self._condition:
             record = self._record_or_raise_locked(request.request_id)
             committed_record = replace(
@@ -917,9 +932,8 @@ class ReconfigurationController:
                 commit_ns=committed_at_ns,
                 reused_processor_count=len(candidate.reused_node_ids),
                 staged_processor_count=len(candidate.staged_node_ids),
-                retired_processor_count=(
-                    len(plan_swap.previous_plan.steps) - len(candidate.reused_node_ids)
-                ),
+                retired_processor_count=0,
+                retirement_status=RetirementStatus.PENDING,
             )
             for transition_event in transition_events:
                 self._instrumentation.record_state_transition(transition_event)
@@ -932,6 +946,15 @@ class ReconfigurationController:
                 committed_at_ns,
                 None,
             )
+
+        # Schedule physical retirement on the dedicated background worker AFTER publishing COMMITTED.
+        self._retirement_queue.put(
+            _PendingRetirement(
+                request_id=request.request_id,
+                previous_plan=plan_swap.previous_plan,
+                active_plan=plan_swap.active_plan,
+            )
+        )
 
         return BoundaryCommitResult(
             request_id=request.request_id,
@@ -968,13 +991,28 @@ class ReconfigurationController:
             self._compiler.forget_version(candidate.plan.version)
         return cleanup_report, _cleanup_failure_reason("candidate cleanup", cleanup_report)
 
-    def _record_first_frame(
+    def _record_frame_completion(
         self,
         result: FrameResult,
         admitted_at_ns: int,
         completed_at_ns: int,
     ) -> None:
         with self._condition:
+            active_id = self._active_request_id
+            if active_id is not None:
+                record = self._records.get(active_id)
+                if (
+                    record is not None
+                    and record.commit_started_ns is None
+                    and result.plan_version == record.base_version
+                    and completed_at_ns >= record.request_received_ns
+                ):
+                    updated_record = replace(
+                        record,
+                        old_plan_frames_completed_during_preparation=record.old_plan_frames_completed_during_preparation + 1,
+                    )
+                    self._records[active_id] = updated_record
+
             request_id = self._committed_request_by_plan_version.get(result.plan_version)
             if request_id is None:
                 return
@@ -989,64 +1027,132 @@ class ReconfigurationController:
             self._records[request_id] = updated_record
             self._record_measurement(updated_record)
             self._committed_request_by_plan_version.pop(result.plan_version, None)
-            
+
             if self._effect_pending_request_id == request_id:
                 self._effect_pending_request_id = None
-                
+
             self._condition.notify_all()
 
     def _retirement_worker_main(self) -> None:
-        while not self._closed:
+        while True:
+            item = self._retirement_queue.get()
             try:
-                deferred = self._retirement_queue.get(timeout=1.0)
-            except Empty:
-                continue
+                if isinstance(item, _RetirementStopCommand):
+                    return
+                try:
+                    self._process_pending_retirement(item)
+                except Exception as error:
+                    self._fail_pending_retirement(item, error)
+            finally:
+                self._retirement_queue.task_done()
 
-            if deferred is None:
-                break
-
-            retirement_started_at_ns = self._clock()
-            try:
-                retirement_report = retire_superseded_processors(
-                    previous_plan=deferred.previous_plan,
-                    active_plan=deferred.active_plan,
-                )
-                retirement_reason = _cleanup_failure_reason("processor retirement", retirement_report)
-            except Exception as e:
-                retirement_report = CleanupReport(
+    def _fail_pending_retirement(self, deferred: _PendingRetirement, error: Exception) -> None:
+        completed_at_ns = self._clock()
+        err_msg = f"unexpected retirement worker failure: {error!r}"
+        report = CleanupReport(
+            reason=CleanupReason.PLAN_RETIREMENT,
+            attempted_node_ids=(),
+            cleaned_node_ids=(),
+            failures=(
+                ProcessorCleanupFailure(
+                    node_id="engine",
+                    processor_type="unknown",
                     reason=CleanupReason.PLAN_RETIREMENT,
-                    attempted_node_ids=(),
-                    cleaned_node_ids=(),
-                    failures=(ProcessorCleanupFailure(node_id="engine", processor_type="unknown", reason=CleanupReason.PLAN_RETIREMENT, error=repr(e)),),
+                    error=repr(error),
+                ),
+            ),
+        )
+        with self._condition:
+            record = self._records.get(deferred.request_id)
+            if record is not None:
+                updated_record = replace(
+                    record,
+                    retirement_status=RetirementStatus.FAILED,
+                    retirement_completed_ns=completed_at_ns,
+                    retirement_report=report,
+                    retirement_failure_reason=err_msg,
                 )
-                retirement_reason = f"processor retirement raised unexpected exception: {e!r}"
-
-            retirement_completed_at_ns = self._clock()
-
-            try:
-                with self._compiler_lock:
-                    self._compiler.forget_version(deferred.previous_plan.version)
-            except Exception as e:
-                err_msg = f"compiler forget_version failed: {e!r}"
-                retirement_reason = _combine_reasons(retirement_reason or "", err_msg) if retirement_reason else err_msg
-                failures = list(retirement_report.failures)
-                failures.append(ProcessorCleanupFailure(node_id="compiler", processor_type="unknown", reason=CleanupReason.PLAN_RETIREMENT, error=repr(e)))
-                retirement_report = replace(retirement_report, failures=tuple(failures))
-
-            with self._condition:
-                record = self._records.get(deferred.request_id)
-                if record is not None:
-                    updated_record = replace(
-                        record,
-                        retirement_started_ns=retirement_started_at_ns,
-                        retirement_completed_ns=retirement_completed_at_ns,
-                        failure_reason=retirement_reason,
-                        retirement_report=retirement_report,
-                        retired_processor_count=len(retirement_report.cleaned_node_ids),
-                    )
-                    self._records[deferred.request_id] = updated_record
+                self._records[deferred.request_id] = updated_record
+                try:
                     self._record_measurement(updated_record)
-                    self._condition.notify_all()
+                except Exception:
+                    pass
+                self._condition.notify_all()
+
+    def _process_pending_retirement(self, deferred: _PendingRetirement) -> None:
+        retirement_started_at_ns = self._clock()
+
+        with self._condition:
+            record = self._records.get(deferred.request_id)
+            if record is not None:
+                updated_record = replace(
+                    record,
+                    retirement_status=RetirementStatus.RUNNING,
+                    retirement_started_ns=retirement_started_at_ns,
+                )
+                self._records[deferred.request_id] = updated_record
+                self._condition.notify_all()
+
+        try:
+            retirement_report = retire_superseded_processors(
+                previous_plan=deferred.previous_plan,
+                active_plan=deferred.active_plan,
+            )
+            retirement_reason = _cleanup_failure_reason("processor retirement", retirement_report)
+        except Exception as e:
+            retirement_report = CleanupReport(
+                reason=CleanupReason.PLAN_RETIREMENT,
+                attempted_node_ids=(),
+                cleaned_node_ids=(),
+                failures=(
+                    ProcessorCleanupFailure(
+                        node_id="engine",
+                        processor_type="unknown",
+                        reason=CleanupReason.PLAN_RETIREMENT,
+                        error=repr(e),
+                    ),
+                ),
+            )
+            retirement_reason = f"processor retirement raised unexpected exception: {e!r}"
+
+        try:
+            with self._compiler_lock:
+                self._compiler.forget_version(deferred.previous_plan.version)
+        except Exception as e:
+            err_msg = f"compiler forget_version failed: {e!r}"
+            retirement_reason = (
+                _combine_reasons(retirement_reason or "", err_msg) if retirement_reason else err_msg
+            )
+            failures = list(retirement_report.failures)
+            failures.append(
+                ProcessorCleanupFailure(
+                    node_id="compiler",
+                    processor_type="unknown",
+                    reason=CleanupReason.PLAN_RETIREMENT,
+                    error=repr(e),
+                )
+            )
+            retirement_report = replace(retirement_report, failures=tuple(failures))
+
+        retirement_completed_at_ns = self._clock()
+
+        is_success = (retirement_reason is None) and (retirement_report.succeeded)
+        ret_status = RetirementStatus.COMPLETED if is_success else RetirementStatus.FAILED
+
+        with self._condition:
+            record = self._records.get(deferred.request_id)
+            if record is not None:
+                updated_record = replace(
+                    record,
+                    retirement_status=ret_status,
+                    retirement_completed_ns=retirement_completed_at_ns,
+                    retirement_report=retirement_report,
+                    retirement_failure_reason=retirement_reason,
+                    retired_processor_count=len(retirement_report.cleaned_node_ids),
+                )
+                self._records[deferred.request_id] = updated_record
+                self._record_measurement(updated_record)
+                self._condition.notify_all()
 
     def _record_measurement(self, record: ReconfigurationRecord) -> None:
         candidate_cleanup_failure_count = (
@@ -1076,11 +1182,15 @@ class ReconfigurationController:
                 committed_at_ns=record.commit_ns,
                 first_new_frame_admitted_ns=record.first_new_frame_admitted_ns,
                 first_new_frame_completed_ns=record.first_new_frame_completed_ns,
+                retirement_started_ns=record.retirement_started_ns,
                 retirement_completed_ns=record.retirement_completed_ns,
                 terminal_status=record.status,
                 failure_reason=record.failure_reason,
                 candidate_cleanup_failure_count=candidate_cleanup_failure_count,
                 retirement_failure_count=retirement_failure_count,
+                old_plan_frames_completed_during_preparation=record.old_plan_frames_completed_during_preparation,
+                retirement_status=record.retirement_status,
+                retirement_failure_reason=record.retirement_failure_reason,
             )
         )
 

@@ -15,6 +15,7 @@ from benchmarks.scenarios import (
 from benchmarks.storage import append_conformance_rows, write_conformance_header
 from nedo_vision_dag_engine.compiler import CompiledCandidate, StateDirective, WorkflowCompiler
 from nedo_vision_dag_engine.executor import PipelineExecutor
+from nedo_vision_dag_engine.instrumentation import RetirementStatus
 from nedo_vision_dag_engine.reconfiguration import (
     ReconfigurationController,
     ReconfigurationRequest,
@@ -349,6 +350,7 @@ def _run_stateful_conformance_campaign(run_id: str, profile: str) -> Conformance
     reconfigs_rejected = 0
     continuity_failures = 0
     unexpected_resets = 0
+    processor_instance_leaks = 0
 
     target_statuses = frozenset({
         ReconfigurationStatus.READY,
@@ -374,6 +376,9 @@ def _run_stateful_conformance_campaign(run_id: str, profile: str) -> Conformance
         rec_pres = controller.commit_ready()
         if rec_pres and rec_pres.status == ReconfigurationStatus.COMMITTED:
             controller.admit_frame(admitted_at_ns=time.monotonic_ns())
+            pres_ret = controller.wait_for_retirement(req_pres.request_id, timeout_seconds=5.0)
+            if pres_ret is None or pres_ret.retirement_status is not RetirementStatus.COMPLETED:
+                processor_instance_leaks += 1
 
     if rec_pres and rec_pres.status == ReconfigurationStatus.COMMITTED:
         reconfigs_committed += 1
@@ -393,6 +398,9 @@ def _run_stateful_conformance_campaign(run_id: str, profile: str) -> Conformance
         rec_reset = controller.commit_ready()
         if rec_reset and rec_reset.status == ReconfigurationStatus.COMMITTED:
             controller.admit_frame(admitted_at_ns=time.monotonic_ns())
+            reset_ret = controller.wait_for_retirement(req_reset.request_id, timeout_seconds=5.0)
+            if reset_ret is None or reset_ret.retirement_status is not RetirementStatus.COMPLETED:
+                processor_instance_leaks += 1
 
     if rec_reset and rec_reset.status == ReconfigurationStatus.COMMITTED:
         reconfigs_committed += 1
@@ -419,7 +427,7 @@ def _run_stateful_conformance_campaign(run_id: str, profile: str) -> Conformance
     controller_v2.close()
     controller.close()
 
-    status_str = "PASS" if (continuity_failures == 0 and unexpected_resets == 0) else "FAIL"
+    status_str = "PASS" if (continuity_failures == 0 and unexpected_resets == 0 and processor_instance_leaks == 0) else "FAIL"
 
     return ConformanceResultRow(
         run_id=run_id,
@@ -441,6 +449,6 @@ def _run_stateful_conformance_campaign(run_id: str, profile: str) -> Conformance
         unexpected_state_resets=unexpected_resets,
         active_plan_changed_after_failed_candidate=0,
         candidate_resource_leaks=0,
-        processor_instance_leaks=0,
+        processor_instance_leaks=processor_instance_leaks,
         terminal_status=status_str,
     )
