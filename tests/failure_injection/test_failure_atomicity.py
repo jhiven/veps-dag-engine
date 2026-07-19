@@ -570,7 +570,8 @@ class TestStaleCandidate:
 
             # Advance active plan externally so the candidate becomes stale
             external_plan = replace(initial.plan, version=10)
-            executor.commit_internal(external_plan)
+            token = getattr(executor, "_manager_token")
+            executor.commit_managed(token, external_plan)
 
             result = controller.commit_ready()
             assert result is not None
@@ -598,7 +599,8 @@ class TestStaleCandidate:
             assert ready is not None
 
             external_plan = replace(initial.plan, version=10)
-            executor.commit_internal(external_plan)
+            token = getattr(executor, "_manager_token")
+            executor.commit_managed(token, external_plan)
 
             result = controller.commit_ready()
             assert result is not None
@@ -626,7 +628,8 @@ class TestStaleCandidate:
                 timeout_seconds=2.0,
             )
             external_plan = replace(initial.plan, version=10)
-            executor.commit_internal(external_plan)
+            token = getattr(executor, "_manager_token")
+            executor.commit_managed(token, external_plan)
             controller.commit_ready()
 
             # Source was reused (not staged) so it must not have been cleaned

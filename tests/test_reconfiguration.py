@@ -317,6 +317,7 @@ def test_ready_candidate_commits_before_next_frame_and_records_effect() -> None:
         assert executor.active_plan.version == 1
 
         frame_result = controller.admit_frame(admitted_at_ns=10_000, frame_id=7)
+        controller.wait_for_retirement("add-consumer")
         record = controller.record("add-consumer")
 
         assert frame_result.plan_version == 2
@@ -356,7 +357,8 @@ def test_stale_candidate_is_cleaned_without_replacing_active_plan() -> None:
         assert ready is not None
 
         external_plan = replace(initial.plan, version=3)
-        executor.commit_internal(external_plan)
+        token = getattr(executor, "_manager_token")
+        executor.commit_managed(token, external_plan)
         result = controller.commit_ready()
         record = controller.record("stale")
 
@@ -530,6 +532,7 @@ def test_explicit_reset_uses_new_stateful_instance_and_emits_event() -> None:
         assert transition.new_plan_version == 2
         assert transition.policy is StateTransitionPolicy.RESET
         controller.admit_frame(1, 1)
+        controller.wait_for_retirement("reset-tracker")
         assert "cleanup:tracker-0" in events
         assert "cleanup:tracker-1" not in events
     finally:
@@ -698,10 +701,14 @@ def test_retirement_runs_after_first_new_frame() -> None:
         # Commit it
         res = controller.commit_ready()
         assert res is not None
-        assert len(res.cleanup_report.cleaned_node_ids) == 0
+        assert res.retirement_deferred is True
+        assert res.cleanup_report is None
 
         # Now admit a frame
         controller.admit_frame(1, 1)
+
+        # Now wait for retirement
+        controller.wait_for_retirement("req1")
 
         # Now the retirement should have happened
         record = controller.record("req1")

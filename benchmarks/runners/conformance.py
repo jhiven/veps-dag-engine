@@ -277,6 +277,8 @@ def _run_failure_atomicity_campaign(run_id: str, profile: str) -> ConformanceRes
     if controller.active_plan.version != v_before:
         plan_changed_count += 1
 
+    controller.close()
+    
     # 3. Setup failure
     reconfigs_requested += 1
     fail_reg = stateless_registry(log, pass_failure=InjectedFailurePoint.SETUP)
@@ -302,7 +304,6 @@ def _run_failure_atomicity_campaign(run_id: str, profile: str) -> ConformanceRes
         plan_changed_count += 1
 
     fail_controller.close()
-    controller.close()
 
     status_str = "PASS" if plan_changed_count == 0 else "FAIL"
 
@@ -371,6 +372,8 @@ def _run_stateful_conformance_campaign(run_id: str, profile: str) -> Conformance
     rec_pres = controller.wait_for_status(req_pres.request_id, target_statuses, timeout_seconds=5.0)
     if rec_pres and rec_pres.status == ReconfigurationStatus.READY:
         rec_pres = controller.commit_ready()
+        if rec_pres and rec_pres.status == ReconfigurationStatus.COMMITTED:
+            controller.admit_frame(admitted_at_ns=time.monotonic_ns())
 
     if rec_pres and rec_pres.status == ReconfigurationStatus.COMMITTED:
         reconfigs_committed += 1
@@ -388,11 +391,14 @@ def _run_stateful_conformance_campaign(run_id: str, profile: str) -> Conformance
     rec_reset = controller.wait_for_status(req_reset.request_id, target_statuses, timeout_seconds=5.0)
     if rec_reset and rec_reset.status == ReconfigurationStatus.READY:
         rec_reset = controller.commit_ready()
+        if rec_reset and rec_reset.status == ReconfigurationStatus.COMMITTED:
+            controller.admit_frame(admitted_at_ns=time.monotonic_ns())
 
     if rec_reset and rec_reset.status == ReconfigurationStatus.COMMITTED:
         reconfigs_committed += 1
 
     # 3. REJECT test (incompatible type change with PRESERVE)
+    controller.close()
     reg_v2 = tracker_and_v2_registry()
     controller_v2 = ReconfigurationController(executor=executor, compiler=compiler, registry=reg_v2)
 

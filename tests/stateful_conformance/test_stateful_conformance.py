@@ -379,6 +379,7 @@ class TestExplicitReset:
             assert old_tracker.snapshot_state().cleanup_count == 0
 
             controller.admit_frame(admitted_at_ns=2, frame_id=1)
+            controller.wait_for_retirement("reset3")
 
             # After commit: old tracker retired
             assert old_tracker.snapshot_state().cleanup_count == 1
