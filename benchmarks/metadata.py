@@ -7,6 +7,7 @@ import os
 from dataclasses import asdict, dataclass
 from typing import Any
 
+from benchmarks.scenarios import WorkloadCalibrationDetail
 from benchmarks.system import SystemEnvironment
 
 __all__ = [
@@ -55,7 +56,7 @@ class RunMetadata:
     compiler_version: str
     equivalence_margins: dict[str, float]
     scenario_ordering_policy: str
-    workload_calibration: dict[str, int]
+    workload_calibration: dict[str, Any]
 
     @classmethod
     def create(
@@ -74,7 +75,7 @@ class RunMetadata:
         workflow_specification_hashes: dict[str, str],
         registry_snapshot_identifiers: dict[str, str],
         compiler_version: str,
-        workload_calibration: dict[str, int],
+        workload_calibration: dict[str, Any],
     ) -> RunMetadata:
         return cls(
             artifact_schema_version="1.0.0",
@@ -139,6 +140,19 @@ def write_run_json(path: str, metadata: RunMetadata) -> None:
         json.dump(asdict(metadata), file, indent=2)
 
 
+def _parse_workload_calibration(val: Any) -> WorkloadCalibrationDetail | Any:
+    if hasattr(val, "get") and callable(getattr(val, "get", None)):
+        return WorkloadCalibrationDetail(
+            workload_id=str(val.get("workload_id")),
+            calibrated_iterations=int(str(val.get("calibrated_iterations"))),
+            median_ns=float(str(val.get("median_ns"))),
+            p95_ns=float(str(val.get("p95_ns"))),
+            calibration_repetitions=int(str(val.get("calibration_repetitions"))),
+            target_description=str(val.get("target_description")),
+        )
+    return val
+
+
 def load_run_json(path: str) -> RunMetadata:
     with open(path, "r", encoding="utf-8") as file:
         d: dict[str, Any] = json.load(file)
@@ -182,7 +196,8 @@ def load_run_json(path: str) -> RunMetadata:
         },
         scenario_ordering_policy=str(d["scenario_ordering_policy"]),
         workload_calibration={
-            str(k): int(v) for k, v in d["workload_calibration"].items()
+            str(k): _parse_workload_calibration(v)
+            for k, v in d["workload_calibration"].items()
         },
     )
 

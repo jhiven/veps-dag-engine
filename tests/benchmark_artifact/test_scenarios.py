@@ -26,9 +26,9 @@ def test_workload_calibration() -> None:
     assert "minimal" in calib
     assert "approximately_1_ms" in calib
     assert "approximately_5_ms" in calib
-    assert calib["minimal"] == 0
-    assert calib["approximately_1_ms"] > 0
-    assert calib["approximately_5_ms"] > calib["approximately_1_ms"]
+    assert calib["minimal"].calibrated_iterations == 0
+    assert calib["approximately_1_ms"].calibrated_iterations > 0
+    assert calib["approximately_5_ms"].calibrated_iterations > calib["approximately_1_ms"].calibrated_iterations
 
 
 def test_linear_5_hard_coded_and_compiled_equivalence() -> None:

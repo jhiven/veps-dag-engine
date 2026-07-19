@@ -27,11 +27,22 @@ from benchmarks.reporting.tables import generate_all_tables
 from benchmarks.runners.conformance import run_conformance_suite
 from benchmarks.runners.reconfiguration import run_reconfiguration_suite
 from benchmarks.runners.steady_state import run_steady_state_suite
-from benchmarks.scenarios import calibrate_workload_iterations
+from benchmarks.scenarios import (
+    apply_reconfiguration_edit,
+    build_branch_merge_9_spec,
+    build_linear_5_spec,
+    calibrate_workload_iterations,
+    create_reconfiguration_registry,
+    create_workload_registry,
+    generate_layered_dag,
+    make_reconfiguration_base_spec,
+)
 from benchmarks.storage import (
     read_reconfiguration_rows,
 )
 from benchmarks.system import collect_system_environment
+from nedo_vision_dag_engine.specification import specification_hash
+from tests.support.workflows import linear, tracker_only
 
 __all__ = ["main"]
 
@@ -52,6 +63,7 @@ def run_benchmarks(
     profile: str,
     base_output_dir: str = "benchmark-results",
     seed: int = 42,
+    pin_cpu: int | None = 0,
 ) -> str:
     run_id = f"run_{datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
     run_dir = os.path.join(base_output_dir, run_id)
@@ -60,7 +72,7 @@ def run_benchmarks(
     utc_start = datetime.datetime.now(datetime.timezone.utc).isoformat()
     start_time_ns = time.monotonic_ns()
 
-    env = collect_system_environment()
+    env = collect_system_environment(pin_cpu=pin_cpu)
 
     selected_suites = ("steady-state", "reconfiguration", "conformance") if suite == "all" else (suite,)
 
@@ -68,7 +80,12 @@ def run_benchmarks(
     if "steady-state" in selected_suites:
         selected_scenarios.extend(["linear_5", "branch_merge_9"])
     if "reconfiguration" in selected_suites:
-        selected_scenarios.extend(["insert_stateless_node", "remove_stateless_node", "rewire_stateless_edge", "compatible_edit_preserving_tracker"])
+        selected_scenarios.extend([
+            "insert_stateless_node",
+            "remove_stateless_node",
+            "rewire_stateless_edge",
+            "compatible_edit_preserving_tracker",
+        ])
     if "conformance" in selected_suites:
         selected_scenarios.extend(["frame_consistency", "failure_atomicity", "stateful"])
 
@@ -77,7 +94,35 @@ def run_benchmarks(
     ops_per_rep = 50 if profile == "smoke" else 1000
 
     # Calibrate workloads
-    calibrated_iters = calibrate_workload_iterations()
+    calibrated_details = calibrate_workload_iterations(
+        calibration_repetitions=5 if profile == "smoke" else 30
+    )
+    calibrated_iters = {k: v.calibrated_iterations for k, v in calibrated_details.items()}
+
+    # Compute canonical specification hashes
+    base_spec = make_reconfiguration_base_spec()
+    wf_hashes = {
+        "linear_5": specification_hash(build_linear_5_spec()),
+        "branch_merge_9": specification_hash(build_branch_merge_9_spec()),
+        "reconfiguration_base": specification_hash(base_spec),
+        "reconfig_insert_stateless_node": specification_hash(apply_reconfiguration_edit(base_spec, "insert_stateless_node")),
+        "reconfig_remove_stateless_node": specification_hash(apply_reconfiguration_edit(base_spec, "remove_stateless_node")),
+        "reconfig_rewire_stateless_edge": specification_hash(apply_reconfiguration_edit(base_spec, "rewire_stateless_edge")),
+        "reconfig_compatible_edit_preserving_tracker": specification_hash(apply_reconfiguration_edit(base_spec, "compatible_edit_preserving_tracker")),
+        "graph_size_5": specification_hash(generate_layered_dag(5)),
+        "graph_size_25": specification_hash(generate_layered_dag(25)),
+        "graph_size_100": specification_hash(generate_layered_dag(100)),
+        "conformance_stress": specification_hash(base_spec),
+        "conformance_failure_atomicity": specification_hash(linear()),
+        "conformance_stateful": specification_hash(tracker_only("synthetic_tracker")),
+    }
+
+    # Compute registry snapshot identifiers
+    reg_snapshot_ids = {
+        "steady_state": f"registry:sha256:{create_workload_registry(calibrated_iters['approximately_1_ms']).snapshot_id}",
+        "reconfiguration": f"registry:sha256:{create_reconfiguration_registry(extra_tracker=True).snapshot_id}",
+        "conformance": f"registry:sha256:{create_reconfiguration_registry().snapshot_id}",
+    }
 
     run_meta = RunMetadata.create(
         run_id=run_id,
@@ -91,10 +136,10 @@ def run_benchmarks(
         profile=profile,
         repetition_count=repetition_count,
         operations_per_repetition=ops_per_rep,
-        workflow_specification_hashes={},
-        registry_snapshot_identifiers={},
+        workflow_specification_hashes=wf_hashes,
+        registry_snapshot_identifiers=reg_snapshot_ids,
         compiler_version="0.1.0",
-        workload_calibration=calibrated_iters,
+        workload_calibration=calibrated_details,
     )
 
     run_json_path = os.path.join(run_dir, "run.json")

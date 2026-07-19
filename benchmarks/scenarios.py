@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import time
+from dataclasses import dataclass
+
+import numpy as np
 
 from nedo_vision_dag_engine.processor import (
     FrameContext,
@@ -29,6 +32,7 @@ from tests.support.tracker import (
 
 __all__ = [
     "WorkloadProcessor",
+    "WorkloadCalibrationDetail",
     "calibrate_workload_iterations",
     "create_workload_registry",
     "build_linear_5_spec",
@@ -42,6 +46,16 @@ __all__ = [
 ]
 
 
+@dataclass(frozen=True, slots=True)
+class WorkloadCalibrationDetail:
+    workload_id: str
+    calibrated_iterations: int
+    median_ns: float
+    p95_ns: float
+    calibration_repetitions: int
+    target_description: str
+
+
 def do_cpu_work(iterations: int) -> int:
     acc = 0
     for i in range(iterations):
@@ -49,8 +63,17 @@ def do_cpu_work(iterations: int) -> int:
     return acc
 
 
-def calibrate_workload_iterations() -> dict[str, int]:
-    """Calibrate CPU work iterations before timing regions start."""
+def _measure_iterations(iterations: int, repetitions: int = 30) -> tuple[float, float]:
+    times_ns: list[float] = []
+    for _ in range(repetitions):
+        t0 = time.perf_counter_ns()
+        do_cpu_work(iterations)
+        times_ns.append(float(time.perf_counter_ns() - t0))
+    return float(np.median(times_ns)), float(np.percentile(times_ns, 95))
+
+
+def calibrate_workload_iterations(calibration_repetitions: int = 30) -> dict[str, WorkloadCalibrationDetail]:
+    """Calibrate CPU work iterations per processor invocation before benchmark runs."""
     test_iters = 10000
     start = time.perf_counter_ns()
     do_cpu_work(test_iters)
@@ -74,10 +97,34 @@ def calibrate_workload_iterations() -> dict[str, int]:
         if dt_5ms > 0:
             iters_5ms = max(1, int(iters_5ms * (5_000_000 / dt_5ms)))
 
+    med_1ms, p95_1ms = _measure_iterations(iters_1ms, calibration_repetitions)
+    med_5ms, p95_5ms = _measure_iterations(iters_5ms, calibration_repetitions)
+
     return {
-        "minimal": 0,
-        "approximately_1_ms": iters_1ms,
-        "approximately_5_ms": iters_5ms,
+        "minimal": WorkloadCalibrationDetail(
+            workload_id="minimal",
+            calibrated_iterations=0,
+            median_ns=0.0,
+            p95_ns=0.0,
+            calibration_repetitions=calibration_repetitions,
+            target_description="minimal zero-cost baseline",
+        ),
+        "approximately_1_ms": WorkloadCalibrationDetail(
+            workload_id="approximately_1_ms",
+            calibrated_iterations=iters_1ms,
+            median_ns=med_1ms,
+            p95_ns=p95_1ms,
+            calibration_repetitions=calibration_repetitions,
+            target_description="approximately 1 ms per processor invocation",
+        ),
+        "approximately_5_ms": WorkloadCalibrationDetail(
+            workload_id="approximately_5_ms",
+            calibrated_iterations=iters_5ms,
+            median_ns=med_5ms,
+            p95_ns=p95_5ms,
+            calibration_repetitions=calibration_repetitions,
+            target_description="approximately 5 ms per processor invocation",
+        ),
     }
 
 

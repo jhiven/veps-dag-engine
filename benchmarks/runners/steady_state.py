@@ -17,10 +17,44 @@ from benchmarks.scenarios import (
 from benchmarks.storage import append_steady_state_rows, write_steady_state_header
 from nedo_vision_dag_engine.compiler import CompiledCandidate, WorkflowCompiler
 from nedo_vision_dag_engine.executor import PipelineExecutor, execute_frame
+from nedo_vision_dag_engine.instrumentation import (
+    FrameExecutionEvent,
+    FrameStatus,
+    RuntimeEventEnvelope,
+    RuntimeEventKind,
+    RuntimeInstrumentation,
+)
 from nedo_vision_dag_engine.processor import FrameContext
 from nedo_vision_dag_engine.workspace import WorkspacePool
 
 __all__ = ["run_steady_state_suite"]
+
+
+_DUMMY_EVENT = FrameExecutionEvent(
+    frame_id=0,
+    plan_version=1,
+    admission_timestamp_ns=0,
+    completion_timestamp_ns=0,
+    executed_node_ids=(),
+    skipped_node_ids=(),
+    status=FrameStatus.COMPLETED,
+    error=None,
+)
+_DUMMY_ENVELOPE = RuntimeEventEnvelope(
+    sequence_number=1,
+    recorded_at_ns=0,
+    kind=RuntimeEventKind.FRAME_EXECUTION,
+    event=_DUMMY_EVENT,
+)
+
+
+class NoOpRuntimeInstrumentation(RuntimeInstrumentation):
+    """No-op instrumentation to ensure instrumentation parity during RQ1 steady-state measurements."""
+
+    __slots__ = ()
+
+    def record_frame(self, event: FrameExecutionEvent) -> RuntimeEventEnvelope:
+        return _DUMMY_ENVELOPE
 
 
 def _get_execution_order(repetition: int) -> tuple[str, str, str]:
@@ -59,9 +93,9 @@ def run_steady_state_suite(
                 warmup_ops = 5
             else:
                 if workload_id == "approximately_5_ms":
-                    ops_per_rep = 100
+                    ops_per_rep = 1000
                 elif workload_id == "approximately_1_ms":
-                    ops_per_rep = 500
+                    ops_per_rep = 1000
                 else:
                     ops_per_rep = 2000
                 warmup_ops = 50
@@ -119,7 +153,11 @@ def run_steady_state_suite(
                             workspace_pool.release(ws)
 
                     elif impl == "versioned_compiled":
-                        executor = PipelineExecutor(initial_plan=plan, workspace_pool=workspace_pool)
+                        executor = PipelineExecutor(
+                            initial_plan=plan,
+                            workspace_pool=workspace_pool,
+                            instrumentation=NoOpRuntimeInstrumentation(),
+                        )
 
                         for f in range(warmup_ops):
                             executor.admit_frame(admitted_at_ns=0, frame_id=f)
