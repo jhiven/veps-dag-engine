@@ -98,14 +98,35 @@ def execute_frame(
 
 
 class PipelineExecutor:
-    """Serializes frame admission and plan publication at one boundary lock."""
+    """Serializes frame admission and plan publication.
+
+    Two locks cooperate to separate plan-reference access from frame
+    execution:
+
+    - ``_plan_lock`` protects reads and writes of the ``_active_plan``
+      reference.  Any caller that only needs to read the current plan
+      (e.g. a reconfiguration controller capturing a snapshot for
+      background compilation) acquires this lock alone and releases it
+      in microseconds, even while a frame is mid-execution.
+
+    - ``_execution_lock`` serializes frame admission and plan commits.
+      It is held for the entire duration of frame execution and
+      ``commit``/``commit_if_version``.  These operations acquire
+      ``_plan_lock`` internally for the plan-reference read/write but
+      release it before executing the frame body.
+
+    Lock ordering is always ``_execution_lock`` then ``_plan_lock``,
+    never reversed, which prevents deadlock.
+    """
 
     __slots__ = (
         "_active_plan",
-        "_boundary_lock",
         "_clock",
+        "_execution_lock",
         "_instrumentation",
+        "_managed",
         "_next_frame_id",
+        "_plan_lock",
         "_workspace_pool",
     )
 
@@ -119,7 +140,9 @@ class PipelineExecutor:
         self._active_plan = initial_plan
         self._workspace_pool = workspace_pool if workspace_pool is not None else WorkspacePool()
         self._next_frame_id = 0
-        self._boundary_lock = Lock()
+        self._plan_lock = Lock()
+        self._execution_lock = Lock()
+        self._managed = False
         self._clock = clock
         self._instrumentation = (
             instrumentation if instrumentation is not None else RuntimeInstrumentation(clock=clock)
@@ -127,29 +150,70 @@ class PipelineExecutor:
 
     @property
     def active_plan(self) -> ExecutionPlan:
-        with self._boundary_lock:
+        with self._plan_lock:
             return self._active_plan
+
+    def active_plan_snapshot(self) -> ExecutionPlan:
+        """Return the current active plan without holding the execution lock.
+
+        This is safe for a reconfiguration controller to call while a
+        frame is executing: the plan reference itself is immutable and
+        the read is protected by ``_plan_lock`` alone.
+        """
+        with self._plan_lock:
+            return self._active_plan
+
+    def mark_managed(self) -> None:
+        """Called by ReconfigurationController to indicate this executor
+        is now managed and direct admission calls should be rejected."""
+        self._managed = True
+
+    def _require_unmanaged(self) -> None:
+        if self._managed:
+            raise RuntimeError(
+                "this executor is managed by a ReconfigurationController; "
+                "use the controller's admit_frame() method instead."
+            )
 
     @property
     def instrumentation(self) -> RuntimeInstrumentation:
         return self._instrumentation
 
     def commit(self, new_plan: ExecutionPlan) -> PlanSwap:
-        with self._boundary_lock:
-            return self._commit_locked(new_plan)
+        """Public commit. Raises if managed by a controller."""
+        self._require_unmanaged()
+        return self.commit_internal(new_plan)
+
+    def commit_internal(self, new_plan: ExecutionPlan) -> PlanSwap:
+        with self._execution_lock:
+            with self._plan_lock:
+                return self._commit_plan_locked(new_plan)
 
     def commit_if_version(self, expected_version: int, new_plan: ExecutionPlan) -> PlanSwap | None:
-        with self._boundary_lock:
-            if self._active_plan.version != expected_version:
-                return None
-            return self._commit_locked(new_plan)
+        """Public conditional commit. Raises if managed by a controller."""
+        self._require_unmanaged()
+        return self.commit_if_version_internal(expected_version, new_plan)
+
+    def commit_if_version_internal(self, expected_version: int, new_plan: ExecutionPlan) -> PlanSwap | None:
+        with self._execution_lock:
+            with self._plan_lock:
+                if self._active_plan.version != expected_version:
+                    return None
+                return self._commit_plan_locked(new_plan)
 
     def admit_frame(self, admitted_at_ns: int, frame_id: int | None = None) -> FrameResult:
+        """Public admission path.  Raises if managed by a controller."""
+        self._require_unmanaged()
+        return self.admit_frame_internal(admitted_at_ns, frame_id)
+
+    def admit_frame_internal(self, admitted_at_ns: int, frame_id: int | None = None) -> FrameResult:
+        """Execute a frame.  Used by both the public API and the controller."""
         if admitted_at_ns < 0:
             raise ValueError("admitted_at_ns must be non-negative.")
 
-        with self._boundary_lock:
-            plan = self._active_plan
+        with self._execution_lock:
+            with self._plan_lock:
+                plan = self._active_plan
             resolved_frame_id = self._next_frame_id if frame_id is None else frame_id
             if resolved_frame_id < 0:
                 raise ValueError("frame_id must be non-negative.")
@@ -176,7 +240,8 @@ class PipelineExecutor:
             )
             return result
 
-    def _commit_locked(self, new_plan: ExecutionPlan) -> PlanSwap:
+    def _commit_plan_locked(self, new_plan: ExecutionPlan) -> PlanSwap:
+        """Swap plan while holding ``_plan_lock``.  Caller must also hold ``_execution_lock``."""
         previous_plan = self._active_plan
         if new_plan.version <= previous_plan.version:
             raise ValueError(

@@ -249,7 +249,8 @@ class TestSetupFailure:
             assert len(active_cleanup_events) <= 2  # only staged processors
 
             # No new frame should be executing on the old plan
-            frame_result = executor.admit_frame(admitted_at_ns=1_000, frame_id=99)
+            # The test is validating state after a controller failure. We must admit the frame via the controller.
+            frame_result = controller.admit_frame(admitted_at_ns=1_000, frame_id=99)
             assert frame_result.plan_version == 1
         finally:
             controller.close()
@@ -569,7 +570,7 @@ class TestStaleCandidate:
 
             # Advance active plan externally so the candidate becomes stale
             external_plan = replace(initial.plan, version=10)
-            executor.commit(external_plan)
+            executor.commit_internal(external_plan)
 
             result = controller.commit_ready()
             assert result is not None
@@ -597,7 +598,7 @@ class TestStaleCandidate:
             assert ready is not None
 
             external_plan = replace(initial.plan, version=10)
-            executor.commit(external_plan)
+            executor.commit_internal(external_plan)
 
             result = controller.commit_ready()
             assert result is not None
@@ -625,7 +626,7 @@ class TestStaleCandidate:
                 timeout_seconds=2.0,
             )
             external_plan = replace(initial.plan, version=10)
-            executor.commit(external_plan)
+            executor.commit_internal(external_plan)
             controller.commit_ready()
 
             # Source was reused (not staged) so it must not have been cleaned
@@ -716,7 +717,7 @@ class TestAbortCleanup:
             assert id(source_proc) not in cleaned_ids
 
             # Executor still usable
-            result = executor.admit_frame(admitted_at_ns=1, frame_id=0)
+            result = controller.admit_frame(admitted_at_ns=1, frame_id=0)
             assert result.status is FrameStatus.COMPLETED
         finally:
             controller.close()

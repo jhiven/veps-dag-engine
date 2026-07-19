@@ -356,7 +356,7 @@ def test_stale_candidate_is_cleaned_without_replacing_active_plan() -> None:
         assert ready is not None
 
         external_plan = replace(initial.plan, version=3)
-        executor.commit(external_plan)
+        executor.commit_internal(external_plan)
         result = controller.commit_ready()
         record = controller.record("stale")
 
@@ -529,6 +529,7 @@ def test_explicit_reset_uses_new_stateful_instance_and_emits_event() -> None:
         assert transition.old_plan_version == 1
         assert transition.new_plan_version == 2
         assert transition.policy is StateTransitionPolicy.RESET
+        controller.admit_frame(1, 1)
         assert "cleanup:tracker-0" in events
         assert "cleanup:tracker-1" not in events
     finally:
@@ -632,3 +633,79 @@ def test_executor_plan_swap_waits_for_in_flight_frame() -> None:
     assert frame_results[0].plan_version == 1
     assert swap_results[0] is not None
     assert executor.active_plan.version == 2
+
+def test_submit_does_not_block_during_frame_execution() -> None:
+    events: list[str] = []
+    registry = _stateless_registry(events)
+    compiler = WorkflowCompiler("test")
+    initial = _compile_initial(compiler, registry, _source_only_specification())
+    executor = PipelineExecutor(initial.plan)
+    controller = ReconfigurationController(executor, compiler, registry, clock=IncrementingClock())
+
+    try:
+        # We need a blocking frame to simulate an in-flight execution.
+        # If we just acquire `_execution_lock`, `submit` should still succeed immediately
+        # because `submit` only acquires `_plan_lock` indirectly via `active_plan_snapshot`.
+        execution_lock = getattr(executor, "_execution_lock")
+        with execution_lock:
+            # We are currently executing a frame
+            controller.submit(_request("nonblocking", 1, _linear_specification()))
+            # If submit blocked on _execution_lock, it would deadlock here.
+            # Thus, the test will hang if it's broken.
+    finally:
+        controller.close()
+
+def test_managed_executor_rejects_direct_admit_frame() -> None:
+    events: list[str] = []
+    registry = _stateless_registry(events)
+    compiler = WorkflowCompiler("test")
+    initial = _compile_initial(compiler, registry, _source_only_specification())
+    executor = PipelineExecutor(initial.plan)
+    controller = ReconfigurationController(executor, compiler, registry, clock=IncrementingClock())
+
+    try:
+        with pytest.raises(RuntimeError, match="managed by a ReconfigurationController"):
+            executor.admit_frame(1, 1)
+    finally:
+        controller.close()
+
+def test_managed_executor_rejects_direct_commit() -> None:
+    events: list[str] = []
+    registry = _stateless_registry(events)
+    compiler = WorkflowCompiler("test")
+    initial = _compile_initial(compiler, registry, _source_only_specification())
+    executor = PipelineExecutor(initial.plan)
+    controller = ReconfigurationController(executor, compiler, registry, clock=IncrementingClock())
+
+    try:
+        with pytest.raises(RuntimeError, match="managed by a ReconfigurationController"):
+            executor.commit(initial.plan)
+    finally:
+        controller.close()
+
+def test_retirement_runs_after_first_new_frame() -> None:
+    events: list[str] = []
+    registry = _stateless_registry(events)
+    compiler = WorkflowCompiler("test")
+    initial = _compile_initial(compiler, registry, _linear_specification())
+    executor = PipelineExecutor(initial.plan)
+    controller = ReconfigurationController(executor, compiler, registry, clock=IncrementingClock())
+
+    try:
+        controller.submit(_request("req1", 1, _source_only_specification()))
+        controller.wait_for_status("req1", frozenset({ReconfigurationStatus.READY}), timeout_seconds=2.0)
+        
+        # Commit it
+        res = controller.commit_ready()
+        assert res is not None
+        assert len(res.cleanup_report.cleaned_node_ids) == 0
+
+        # Now admit a frame
+        controller.admit_frame(1, 1)
+
+        # Now the retirement should have happened
+        record = controller.record("req1")
+        assert record.retirement_report is not None
+        assert "cleanup:consumer" in events
+    finally:
+        controller.close()
