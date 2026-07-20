@@ -111,15 +111,15 @@ def _generate_table_2(data: BenchmarkArtifactData, csv_path: str, md_path: str) 
     headers = [
         "Edit Type",
         "Baseline",
-        "Req to Effect Median (ns)",
-        "Req to Effect p95 (ns)",
-        "Max Output Gap Median (ns)",
-        "Max Output Gap p95 (ns)",
+        "Request-to-Effect Median (ns)",
+        "Request-to-Effect p95 (ns)",
+        "Transition Gap Median (ns)",
+        "Transition Gap p95 (ns)",
         "Commit Median (ns)",
-        "Old-Plan Frames Before Commit",
+        "Old-Plan Frames Median [p95]",
         "Processor Reuse Count",
-        "Dropped Frames",
-        "Duplicated Frames",
+        "Dropped Frames Total",
+        "Duplicated Frames Total",
     ]
 
     rows: list[list[str]] = []
@@ -139,17 +139,36 @@ def _generate_table_2(data: BenchmarkArtifactData, csv_path: str, md_path: str) 
                 continue
 
             eff_vals = [float(s.request_to_effect_ns) for s in samples if s.request_to_effect_ns is not None]
-            gap_vals = [float(s.maximum_output_gap_ns) for s in samples if s.maximum_output_gap_ns is not None]
+            gap_vals = [float(s.transition_output_gap_ns) for s in samples if s.transition_output_gap_ns is not None]
             cmt_vals = [float(s.commit_ns) for s in samples if s.commit_ns is not None]
 
             eff_stats = calculate_summary_stats(eff_vals) if eff_vals else None
             gap_stats = calculate_summary_stats(gap_vals) if gap_vals else None
             cmt_stats = calculate_summary_stats(cmt_vals) if cmt_vals else None
 
-            reuse_cnt = samples[0].reused_processor_count if samples else 0
-            old_frames_cnt = sum(s.old_plan_frames_admitted_after_request_before_commit for s in samples)
+            # Processor reuse count must be deterministic across repetitions.
+            reuse_values = {s.reused_processor_count for s in samples}
+            if len(reuse_values) != 1:
+                raise RuntimeError(
+                    f"Reuse count differs across repetitions for {edit}/{base}: {reuse_values}"
+                )
+            reuse_cnt = samples[0].reused_processor_count
+
+            # Old-plan frame count per repetition (median / p95), not a simple sum.
+            old_frame_values = [
+                float(s.old_plan_frames_admitted_after_request_before_commit)
+                for s in samples
+            ]
+            old_frame_stats = calculate_summary_stats(old_frame_values) if old_frame_values else None
+
             drop_cnt = sum(s.frames_dropped for s in samples)
             dup_cnt = sum(s.frames_duplicated for s in samples)
+
+            old_frames_str = (
+                f"{old_frame_stats.median:.0f} [{old_frame_stats.p95:.0f}]"
+                if old_frame_stats
+                else "N/A"
+            )
 
             rows.append([
                 edit,
@@ -159,7 +178,7 @@ def _generate_table_2(data: BenchmarkArtifactData, csv_path: str, md_path: str) 
                 f"{gap_stats.median:.1f}" if gap_stats else "N/A",
                 f"{gap_stats.p95:.1f}" if gap_stats else "N/A",
                 f"{cmt_stats.median:.1f}" if cmt_stats else "N/A",
-                str(old_frames_cnt),
+                old_frames_str,
                 str(reuse_cnt),
                 str(drop_cnt),
                 str(dup_cnt),

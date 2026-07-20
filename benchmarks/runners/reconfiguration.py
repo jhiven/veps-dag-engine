@@ -39,6 +39,19 @@ class FrameLogEntry:
     completion_ns: int
 
 
+def _compute_maximum_output_gap_ns(frame_log: list[FrameLogEntry]) -> int | None:
+    """Maximum gap between consecutive frame completions across the entire log."""
+    if len(frame_log) < 2:
+        return None
+    completions = sorted(entry.completion_ns for entry in frame_log)
+    gaps = tuple(
+        current - previous
+        for previous, current in zip(completions, completions[1:], strict=False)
+        if current >= previous
+    )
+    return max(gaps, default=None)
+
+
 def run_reconfiguration_suite(
     run_id: str,
     output_csv_path: str,
@@ -180,6 +193,11 @@ def _run_reconfig_repetition(
                     fid, arr_ns = frame_queue.get(timeout=0.005)
                 except Exception:
                     continue
+                # Double-check: the main thread may have paused us while we
+                # were blocked inside get().  Skip this dequeued frame so
+                # that no old-plan frame is admitted after the pause signal.
+                if worker_paused.is_set():
+                    continue
                 t_adm = time.perf_counter_ns()
                 res = current_executor.admit_frame(admitted_at_ns=arr_ns, frame_id=fid)
                 t_comp = time.perf_counter_ns()
@@ -208,6 +226,14 @@ def _run_reconfig_repetition(
 
         # Pause worker during synchronous rebuild
         worker_paused.set()
+        # Drain any frames that were already queued before the pause;
+        # they will not be processed and must not slip through after
+        # the worker double-checks the pause flag.
+        while True:
+            try:
+                frame_queue.get_nowait()
+            except Exception:
+                break
 
         compiler = WorkflowCompiler("0.1.0")
 
@@ -284,6 +310,7 @@ def _run_reconfig_repetition(
             if last_old_frame is not None
             else 0
         )
+        global_max_output_gap_ns = _compute_maximum_output_gap_ns(frame_log)
         frames_during_request = sum(
             1 for e in frame_log if t_request <= e.completion_ns <= first_new_frame.completion_ns
         )
@@ -319,7 +346,8 @@ def _run_reconfig_repetition(
             retirement_queue_delay_ns=0,
             retirement_duration_ns=retire_duration_ns,
             commit_to_retirement_complete_ns=None,
-            maximum_output_gap_ns=max_output_gap_ns,
+            maximum_output_gap_ns=global_max_output_gap_ns,
+            transition_output_gap_ns=max_output_gap_ns,
             frames_completed_during_request=frames_during_request,
             old_plan_frames_admitted_after_request_before_commit=old_frames_before_commit,
             frames_dropped=dropped_frame_count,
@@ -341,6 +369,11 @@ def _run_reconfig_repetition(
                 try:
                     fid, arr_ns = frame_queue.get(timeout=0.005)
                 except Exception:
+                    continue
+                # Double-check: the main thread may have paused us while we
+                # were blocked inside get().  Skip this dequeued frame so
+                # that no old-plan frame is admitted after the pause signal.
+                if worker_paused.is_set():
                     continue
                 t_adm = time.perf_counter_ns()
                 res = current_executor.admit_frame(admitted_at_ns=arr_ns, frame_id=fid)
@@ -370,6 +403,14 @@ def _run_reconfig_repetition(
 
         # Pause worker during synchronous compilation
         worker_paused.set()
+        # Drain any frames that were already queued before the pause;
+        # they will not be processed and must not slip through after
+        # the worker double-checks the pause flag.
+        while True:
+            try:
+                frame_queue.get_nowait()
+            except Exception:
+                break
 
         t_val_start = time.perf_counter_ns()
         validated = init_compiler.validate(target_spec, registry)
@@ -439,6 +480,7 @@ def _run_reconfig_repetition(
             if last_old_frame is not None
             else 0
         )
+        global_max_output_gap_ns = _compute_maximum_output_gap_ns(frame_log)
         frames_during_request = sum(
             1 for e in frame_log if t_request <= e.completion_ns <= first_new_frame.completion_ns
         )
@@ -474,7 +516,8 @@ def _run_reconfig_repetition(
             retirement_queue_delay_ns=0,
             retirement_duration_ns=retire_duration_ns,
             commit_to_retirement_complete_ns=None,
-            maximum_output_gap_ns=max_output_gap_ns,
+            maximum_output_gap_ns=global_max_output_gap_ns,
+            transition_output_gap_ns=max_output_gap_ns,
             frames_completed_during_request=frames_during_request,
             old_plan_frames_admitted_after_request_before_commit=old_frames_before_commit,
             frames_dropped=dropped_frame_count,
@@ -610,11 +653,12 @@ def _run_reconfig_repetition(
             key=lambda e: e.completion_ns,
             default=None,
         )
-        max_output_gap_ns = (
+        transition_output_gap_ns = (
             first_new_frame.completion_ns - last_old_frame.completion_ns
             if last_old_frame is not None
             else 0
         )
+        global_max_output_gap_ns = _compute_maximum_output_gap_ns(frame_log)
         frames_during_request = sum(
             1 for e in frame_log if t_request <= e.completion_ns <= first_new_frame.completion_ns
         )
@@ -638,7 +682,8 @@ def _run_reconfig_repetition(
             retirement_queue_delay_ns=retire_queue_delay_ns,
             retirement_duration_ns=retire_duration_ns,
             commit_to_retirement_complete_ns=commit_to_retire_complete_ns,
-            maximum_output_gap_ns=max_output_gap_ns,
+            maximum_output_gap_ns=global_max_output_gap_ns,
+            transition_output_gap_ns=transition_output_gap_ns,
             frames_completed_during_request=frames_during_request,
             old_plan_frames_admitted_after_request_before_commit=record.old_plan_frames_admitted_after_request_before_commit,
             frames_dropped=dropped_frame_count,

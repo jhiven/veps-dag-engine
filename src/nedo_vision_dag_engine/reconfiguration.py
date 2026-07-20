@@ -907,6 +907,16 @@ class ReconfigurationController:
 
         with self._condition:
             record = self._record_or_raise_locked(request.request_id)
+
+            retirement_required = bool(
+                plan_swap.previous_plan.processor_ids - candidate.reused_node_ids
+            )
+            retirement_status = (
+                RetirementStatus.PENDING
+                if retirement_required
+                else RetirementStatus.NOT_REQUIRED
+            )
+
             committed_record = replace(
                 record,
                 status=ReconfigurationStatus.COMMITTED,
@@ -915,7 +925,7 @@ class ReconfigurationController:
                 reused_processor_count=len(candidate.reused_node_ids),
                 staged_processor_count=len(candidate.staged_node_ids),
                 retired_processor_count=0,
-                retirement_status=RetirementStatus.PENDING,
+                retirement_status=retirement_status,
             )
             for transition_event in transition_events:
                 self._instrumentation.record_state_transition(transition_event)
@@ -929,14 +939,16 @@ class ReconfigurationController:
                 None,
             )
 
-        # Schedule physical retirement on the dedicated background worker AFTER publishing COMMITTED.
-        self._retirement_queue.put(
-            _PendingRetirement(
-                request_id=request.request_id,
-                previous_plan=plan_swap.previous_plan,
-                active_plan=plan_swap.active_plan,
+        # Schedule physical retirement on the dedicated background worker
+        # only when non-reused processor instances actually exist.
+        if retirement_required:
+            self._retirement_queue.put(
+                _PendingRetirement(
+                    request_id=request.request_id,
+                    previous_plan=plan_swap.previous_plan,
+                    active_plan=plan_swap.active_plan,
+                )
             )
-        )
 
         return BoundaryCommitResult(
             request_id=request.request_id,
@@ -945,7 +957,7 @@ class ReconfigurationController:
             candidate_version=candidate.plan.version,
             committed_at_ns=committed_at_ns,
             state_transition_events=transition_events,
-            retirement_deferred=True,
+            retirement_deferred=retirement_required,
             cleanup_report=None,
         )
 

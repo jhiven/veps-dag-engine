@@ -60,6 +60,8 @@ class TOSTResult:
     ci_90_upper: float
     ci_95_lower: float
     ci_95_upper: float
+    bootstrap_ci_95_lower: float
+    bootstrap_ci_95_upper: float
 
 
 def _bootstrap_ci(
@@ -100,10 +102,16 @@ def calculate_summary_stats(values: Sequence[float] | np.ndarray) -> SummaryStat
     p25 = float(np.percentile(arr, 25.0))
     iqr_val = p75 - p25
 
-    def med_fn(a: np.ndarray) -> float:
-        return float(np.median(a))
-
-    ci_lower, ci_upper = _bootstrap_ci(arr, med_fn)
+    # Parametric 95 % CI for the mean (t-distribution), consistent with
+    # the mean and std_dev reported in the same row.
+    if n >= 2:
+        se = std_val / np.sqrt(n)
+        critical = float(stats.t.ppf(0.975, df=n - 1))
+        ci_lower = mean_val - critical * se
+        ci_upper = mean_val + critical * se
+    else:
+        ci_lower = mean_val
+        ci_upper = mean_val
 
     return SummaryStats(
         count=n,
@@ -162,11 +170,22 @@ def calculate_tost_equivalence(
     treatment_values: Sequence[float] | np.ndarray,
     relative_margin: float = 0.01,
 ) -> TOSTResult:
+    """Two one-sided test (TOST) for paired equivalence.
+
+    Uses a paired t-distribution for both p-values and confidence intervals
+    so that the equivalence decision and the reported intervals are
+    internally consistent.  Bootstrap CIs are also computed and stored
+    separately for diagnostic use.
+    """
     base = np.asarray(baseline_values, dtype=np.float64)
     treat = np.asarray(treatment_values, dtype=np.float64)
     n = len(base)
     if n < 2:
-        return TOSTResult(False, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, relative_margin * 100.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+        return TOSTResult(
+            False, 1.0, 1.0, 1.0, 0.0, 0.0,
+            0.0, relative_margin * 100.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        )
 
     diffs = treat - base
     mean_base = float(np.mean(base))
@@ -176,23 +195,52 @@ def calculate_tost_equivalence(
 
     margin = abs(relative_margin * mean_base)
 
-    t_stat_lower = (mean_diff - (-margin)) / se_diff if se_diff > 0 else 0.0
-    cdf_lower = float(np.float64(stats.t.cdf(t_stat_lower, df=n - 1)))
-    p_val_lower = float(1.0 - cdf_lower)
+    if se_diff == 0:
+        # All paired differences are identical (and may all be zero).
+        # The t-test is degenerate; decide equivalence directly from
+        # whether the constant difference lies within the margin.
+        equivalent = bool(-margin < mean_diff < margin)
+        p_val_lower = 0.0 if mean_diff > -margin else 1.0
+        p_val_upper = 0.0 if mean_diff < margin else 1.0
+        p_value = max(p_val_lower, p_val_upper)
+        t_stat_lower = 0.0
+        t_stat_upper = 0.0
+        ci_90_lower = mean_diff
+        ci_90_upper = mean_diff
+        ci_95_lower = mean_diff
+        ci_95_upper = mean_diff
+    else:
+        df = n - 1
 
-    t_stat_upper = (margin - mean_diff) / se_diff if se_diff > 0 else 0.0
-    cdf_upper = float(np.float64(stats.t.cdf(t_stat_upper, df=n - 1)))
-    p_val_upper = float(1.0 - cdf_upper)
+        t_stat_lower = (mean_diff - (-margin)) / se_diff
+        t_stat_lower_val = float(t_stat_lower)
+        cdf_lower: float = stats.t.cdf(t_stat_lower_val, df=df)
+        p_val_lower = 1.0 - cdf_lower
 
-    p_value = max(p_val_lower, p_val_upper)
-    equivalent = bool(p_value < 0.05)
+        t_stat_upper = (margin - mean_diff) / se_diff
+        t_stat_upper_val = float(t_stat_upper)
+        cdf_upper: float = stats.t.cdf(t_stat_upper_val, df=df)
+        p_val_upper = float(1.0 - cdf_upper)
+
+        p_value = max(p_val_lower, p_val_upper)
+        equivalent = bool(p_value < 0.05)
+
+        # Parametric confidence intervals from the t-distribution
+        critical_90 = float(stats.t.ppf(0.95, df=df))
+        ci_90_lower = mean_diff - critical_90 * se_diff
+        ci_90_upper = mean_diff + critical_90 * se_diff
+
+        critical_95 = float(stats.t.ppf(0.975, df=df))
+        ci_95_lower = mean_diff - critical_95 * se_diff
+        ci_95_upper = mean_diff + critical_95 * se_diff
+
     mean_rel_diff_pct = (mean_diff / mean_base * 100.0) if mean_base != 0 else 0.0
 
+    # Bootstrap CIs for diagnostic comparison
     def mean_fn(d: np.ndarray) -> float:
         return float(np.mean(d))
 
-    ci_90_lower, ci_90_upper = _bootstrap_ci(diffs, mean_fn, confidence_level=0.90)
-    ci_95_lower, ci_95_upper = _bootstrap_ci(diffs, mean_fn, confidence_level=0.95)
+    boot_95_lower, boot_95_upper = _bootstrap_ci(diffs, mean_fn, confidence_level=0.95)
 
     return TOSTResult(
         equivalent=equivalent,
@@ -209,4 +257,6 @@ def calculate_tost_equivalence(
         ci_90_upper=ci_90_upper,
         ci_95_lower=ci_95_lower,
         ci_95_upper=ci_95_upper,
+        bootstrap_ci_95_lower=boot_95_lower,
+        bootstrap_ci_95_upper=boot_95_upper,
     )

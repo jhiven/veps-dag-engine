@@ -19,6 +19,7 @@ from nedo_vision_dag_engine.processor import (
     StatefulProcessorDescriptor,
     TransitionContext,
 )
+from nedo_vision_dag_engine.instrumentation import RetirementStatus
 from nedo_vision_dag_engine.reconfiguration import (
     ReconfigurationController,
     ReconfigurationInProgress,
@@ -319,7 +320,9 @@ def test_ready_candidate_commits_before_next_frame_and_records_effect() -> None:
         frame_result = controller.admit_frame(admitted_at_ns=10_000, frame_id=7)
         ret_rec = controller.wait_for_retirement("add-consumer", timeout_seconds=2.0)
         assert ret_rec is not None
-        assert ret_rec.retirement_completed_ns is not None
+        # Adding a consumer only reuses the source; no processor is removed or replaced,
+        # so retirement is NOT_REQUIRED and no timestamp is recorded.
+        assert ret_rec.retirement_status is RetirementStatus.NOT_REQUIRED
         record = controller.record("add-consumer")
 
         assert frame_result.plan_version == 2
@@ -328,8 +331,7 @@ def test_ready_candidate_commits_before_next_frame_and_records_effect() -> None:
         assert record.commit_ns is not None
         assert record.first_new_frame_admitted_ns == 10_000
         assert record.first_new_frame_completed_ns is not None
-        assert record.retirement_report is not None
-        assert record.retirement_report.attempted_node_ids == ()
+        assert record.retirement_status is RetirementStatus.NOT_REQUIRED
         assert tuple(event.status for event in controller.event_log()) == (
             ReconfigurationStatus.RECEIVED,
             ReconfigurationStatus.VALIDATING,

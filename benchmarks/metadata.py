@@ -78,7 +78,7 @@ class RunMetadata:
         workload_calibration: dict[str, Any],
     ) -> RunMetadata:
         return cls(
-            artifact_schema_version="1.2.0",
+            artifact_schema_version="1.4.0",
             benchmark_suite_version="0.1.0",
             run_id=run_id,
             utc_start_datetime=utc_start_datetime,

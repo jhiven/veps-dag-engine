@@ -56,17 +56,20 @@ def generate_summary_csv(data: BenchmarkArtifactData, output_path: str) -> None:
             "",
         ])
 
-    # 2. Reconfiguration Summaries (req_to_effect, max_output_gap, old_plan_frames)
+    # 2. Reconfiguration Summaries (req_to_effect, transition_gap, max_output_gap, old_plan_frames)
     reconfig_effect_key: dict[tuple[str, str, str], list[float]] = defaultdict(list)
-    reconfig_gap_key: dict[tuple[str, str, str], list[float]] = defaultdict(list)
+    reconfig_trans_gap_key: dict[tuple[str, str, str], list[float]] = defaultdict(list)
+    reconfig_max_gap_key: dict[tuple[str, str, str], list[float]] = defaultdict(list)
     reconfig_frames_key: dict[tuple[str, str, str], list[float]] = defaultdict(list)
 
     for rsample in data.reconfiguration_samples:
         key = (rsample.scenario_id, rsample.edit_type, rsample.baseline)
         if rsample.request_to_effect_ns is not None:
             reconfig_effect_key[key].append(float(rsample.request_to_effect_ns))
+        if rsample.transition_output_gap_ns is not None:
+            reconfig_trans_gap_key[key].append(float(rsample.transition_output_gap_ns))
         if rsample.maximum_output_gap_ns is not None:
-            reconfig_gap_key[key].append(float(rsample.maximum_output_gap_ns))
+            reconfig_max_gap_key[key].append(float(rsample.maximum_output_gap_ns))
         reconfig_frames_key[key].append(float(rsample.old_plan_frames_admitted_after_request_before_commit))
 
     for (scen, edit, base), vals in reconfig_effect_key.items():
@@ -85,10 +88,26 @@ def generate_summary_csv(data: BenchmarkArtifactData, output_path: str) -> None:
             "",
         ])
 
-    for (scen, edit, base), vals in reconfig_gap_key.items():
+    for (scen, edit, base), vals in reconfig_trans_gap_key.items():
         stats = calculate_summary_stats(vals)
         rows.append([
-            "reconfiguration_max_output_gap",
+            "reconfiguration_transition_output_gap",
+            f"{scen}:{edit}:{base}",
+            str(stats.count),
+            f"{stats.mean:.2f}",
+            f"{stats.std_dev:.2f}",
+            f"{stats.median:.2f}",
+            f"{stats.p95:.2f}",
+            f"{stats.p99:.2f}",
+            f"{stats.ci_95_lower:.2f}",
+            f"{stats.ci_95_upper:.2f}",
+            "",
+        ])
+
+    for (scen, edit, base), vals in reconfig_max_gap_key.items():
+        stats = calculate_summary_stats(vals)
+        rows.append([
+            "reconfiguration_maximum_output_gap",
             f"{scen}:{edit}:{base}",
             str(stats.count),
             f"{stats.mean:.2f}",
@@ -135,6 +154,8 @@ def generate_summary_csv(data: BenchmarkArtifactData, output_path: str) -> None:
         "ci_90_upper_ns",
         "ci_95_lower_ns",
         "ci_95_upper_ns",
+        "bootstrap_ci_95_lower_ns",
+        "bootstrap_ci_95_upper_ns",
         "p_value_lower",
         "p_value_upper",
         "tost_p_value",
@@ -162,12 +183,14 @@ def generate_summary_csv(data: BenchmarkArtifactData, output_path: str) -> None:
                         work,
                         str(len(base_vals)),
                         f"{tost.mean_diff:.2f}",
-                        f"{tost.mean_relative_diff_percent:.4f}%",
-                        f"{tost.relative_margin_percent:.2f}%",
+                        f"{tost.mean_relative_diff_percent:.4f}",
+                        f"{tost.relative_margin_percent:.2f}",
                         f"{tost.ci_90_lower:.2f}",
                         f"{tost.ci_90_upper:.2f}",
                         f"{tost.ci_95_lower:.2f}",
                         f"{tost.ci_95_upper:.2f}",
+                        f"{tost.bootstrap_ci_95_lower:.2f}",
+                        f"{tost.bootstrap_ci_95_upper:.2f}",
                         f"{tost.p_value_lower:.4f}",
                         f"{tost.p_value_upper:.4f}",
                         f"{tost.p_value:.4f}",

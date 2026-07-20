@@ -377,7 +377,10 @@ def _run_stateful_conformance_campaign(run_id: str, profile: str) -> Conformance
         if rec_pres and rec_pres.status == ReconfigurationStatus.COMMITTED:
             controller.admit_frame(admitted_at_ns=time.monotonic_ns())
             pres_ret = controller.wait_for_retirement(req_pres.request_id, timeout_seconds=5.0)
-            if pres_ret is None or pres_ret.retirement_status is not RetirementStatus.COMPLETED:
+            if pres_ret is None or pres_ret.retirement_status not in {
+                RetirementStatus.COMPLETED,
+                RetirementStatus.NOT_REQUIRED,
+            }:
                 processor_instance_leaks += 1
 
     if rec_pres and rec_pres.status == ReconfigurationStatus.COMMITTED:
@@ -399,7 +402,10 @@ def _run_stateful_conformance_campaign(run_id: str, profile: str) -> Conformance
         if rec_reset and rec_reset.status == ReconfigurationStatus.COMMITTED:
             controller.admit_frame(admitted_at_ns=time.monotonic_ns())
             reset_ret = controller.wait_for_retirement(req_reset.request_id, timeout_seconds=5.0)
-            if reset_ret is None or reset_ret.retirement_status is not RetirementStatus.COMPLETED:
+            if reset_ret is None or reset_ret.retirement_status not in {
+                RetirementStatus.COMPLETED,
+                RetirementStatus.NOT_REQUIRED,
+            }:
                 processor_instance_leaks += 1
 
     if rec_reset and rec_reset.status == ReconfigurationStatus.COMMITTED:
