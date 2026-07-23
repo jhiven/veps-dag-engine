@@ -26,6 +26,7 @@ from benchmarks.reporting.summarize import generate_summary_csv
 from benchmarks.reporting.tables import generate_all_tables
 from benchmarks.runners.conformance import run_conformance_suite
 from benchmarks.runners.reconfiguration import run_reconfiguration_suite
+from benchmarks.runners.reconfiguration_stress import run_reconfiguration_stress_suite
 from benchmarks.runners.steady_state import run_steady_state_suite
 from benchmarks.scenarios import (
     apply_reconfiguration_edit,
@@ -74,9 +75,9 @@ def run_benchmarks(
     utc_start = datetime.datetime.now(datetime.timezone.utc).isoformat()
     start_time_ns = time.monotonic_ns()
 
-    valid_suite_names = {"steady-state", "reconfiguration", "conformance"}
+    valid_suite_names = {"steady-state", "reconfiguration", "reconfiguration-stress", "conformance"}
     if suite == "all":
-        selected_suites = ("steady-state", "reconfiguration", "conformance")
+        selected_suites = ("steady-state", "reconfiguration", "conformance", "reconfiguration-stress")
     else:
         parts = [s.strip() for s in suite.split(",") if s.strip()]
         for p in parts:
@@ -101,6 +102,12 @@ def run_benchmarks(
         ])
     if "conformance" in selected_suites:
         selected_scenarios.extend(["frame_consistency", "failure_atomicity", "stateful"])
+    if "reconfiguration-stress" in selected_suites:
+        selected_scenarios.extend([
+            "stress_delay0ms",
+            "stress_delay20ms",
+            "stress_delay50ms",
+        ])
 
     repetition_count = 5 if profile == "smoke" else 30
     warmup_count = 5 if profile == "smoke" else 50
@@ -186,6 +193,18 @@ def run_benchmarks(
             )
             row_counts["reconfiguration-samples.csv"] = _count_csv_data_rows(reconfig_csv)
             sha256_dict["reconfiguration-samples.csv"] = _calculate_file_sha256(reconfig_csv)
+
+        if "reconfiguration-stress" in selected_suites:
+            stress_csv = os.path.join(run_dir, "reconfiguration-stress-samples.csv")
+            run_reconfiguration_stress_suite(
+                run_id=run_id,
+                output_csv_path=stress_csv,
+                profile=profile,
+                repetition_count=repetition_count,
+                seed=seed,
+            )
+            row_counts["reconfiguration-stress-samples.csv"] = _count_csv_data_rows(stress_csv)
+            sha256_dict["reconfiguration-stress-samples.csv"] = _calculate_file_sha256(stress_csv)
 
         if "conformance" in selected_suites:
             conformance_csv = os.path.join(run_dir, "conformance-results.csv")

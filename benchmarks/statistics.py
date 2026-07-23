@@ -7,6 +7,7 @@ from dataclasses import dataclass
 
 import numpy as np
 from scipy import stats
+# from benchmarks.t_dist import t_cdf, t_ppf
 
 __all__ = [
     "SummaryStats",
@@ -107,6 +108,8 @@ def calculate_summary_stats(values: Sequence[float] | np.ndarray) -> SummaryStat
     if n >= 2:
         se = std_val / np.sqrt(n)
         critical = float(stats.t.ppf(0.975, df=n - 1))
+        # critical = t_ppf(0.975, n - 1)
+
         ci_lower = mean_val - critical * se
         ci_upper = mean_val + critical * se
     else:
@@ -215,11 +218,14 @@ def calculate_tost_equivalence(
         t_stat_lower = (mean_diff - (-margin)) / se_diff
         t_stat_lower_val = float(t_stat_lower)
         cdf_lower: float = stats.t.cdf(t_stat_lower_val, df=df)
+        # cdf_lower: float = t_cdf(t_stat_lower_val, df)
+
         p_val_lower = 1.0 - cdf_lower
 
         t_stat_upper = (margin - mean_diff) / se_diff
         t_stat_upper_val = float(t_stat_upper)
         cdf_upper: float = stats.t.cdf(t_stat_upper_val, df=df)
+        # cdf_upper: float = t_cdf(t_stat_upper_val, df)
         p_val_upper = float(1.0 - cdf_upper)
 
         p_value = max(p_val_lower, p_val_upper)
@@ -227,10 +233,12 @@ def calculate_tost_equivalence(
 
         # Parametric confidence intervals from the t-distribution
         critical_90 = float(stats.t.ppf(0.95, df=df))
+        # critical_90 = t_ppf(0.95, df)
         ci_90_lower = mean_diff - critical_90 * se_diff
         ci_90_upper = mean_diff + critical_90 * se_diff
 
         critical_95 = float(stats.t.ppf(0.975, df=df))
+        # critical_95 = t_ppf(0.975, df)
         ci_95_lower = mean_diff - critical_95 * se_diff
         ci_95_upper = mean_diff + critical_95 * se_diff
 

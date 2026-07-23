@@ -32,6 +32,7 @@ from tests.support.tracker import (
 
 __all__ = [
     "WorkloadProcessor",
+    "StagingDelayedWorkloadProcessor",
     "WorkloadCalibrationDetail",
     "calibrate_workload_iterations",
     "create_workload_registry",
@@ -41,6 +42,7 @@ __all__ = [
     "execute_hard_coded_branch_merge_9",
     "generate_layered_dag",
     "create_reconfiguration_registry",
+    "create_reconfiguration_stress_registry",
     "make_reconfiguration_base_spec",
     "apply_reconfiguration_edit",
 ]
@@ -157,6 +159,74 @@ class WorkloadProcessor:
 
     def cleanup(self) -> None:
         pass
+
+
+class StagingDelayedWorkloadProcessor(WorkloadProcessor):
+    """A WorkloadProcessor whose ``setup()`` sleeps for a configurable
+    duration, simulating non-trivial model loading or resource staging.
+
+    The delay is applied **only during initial setup**, not on every frame.
+    This is the key property that the ``prepare_and_commit`` baseline
+    exploits: staging happens off-path on the background worker while the
+    old plan continues processing frames.
+    """
+
+    __slots__ = ("_staging_delay_s",)
+
+    def __init__(self, type_name: str, iterations: int, staging_delay_s: float) -> None:
+        super().__init__(type_name, iterations)
+        self._staging_delay_s = staging_delay_s
+
+    def setup(self, context: SetupContext) -> None:
+        if self._staging_delay_s > 0:
+            time.sleep(self._staging_delay_s)
+
+
+def create_reconfiguration_stress_registry(
+    staging_delay_s: float = 0.0,
+    extra_tracker: bool = True,
+) -> RegistrySnapshot:
+    """Registry whose ``workload_node_99`` (the type used for ``n_extra``
+    in insert/rewire edits) carries a staging delay, simulating model-load
+    latency during candidate preparation.
+    """
+    builder = RegistryBuilder()
+    for i in range(150):
+        type_name = f"workload_node_{i}"
+        descriptor = ProcessorDescriptor(
+            type_name=type_name,
+            input_schema=object,
+            output_schema=PassOutput,
+            config_schema=object,
+            state_policy=StatePolicy.STATELESS,
+            state_schema_version=None,
+        )
+        if i == 99 and staging_delay_s > 0:
+            t_name = type_name
+            delay = staging_delay_s
+            builder.register(
+                RegisteredProcessorType(
+                    descriptor=descriptor,
+                    factory=lambda t=t_name, d=delay: StagingDelayedWorkloadProcessor(t, 0, d),
+                )
+            )
+        else:
+            t_name = type_name
+            builder.register(
+                RegisteredProcessorType(
+                    descriptor=descriptor,
+                    factory=lambda t=t_name: WorkloadProcessor(t, 0),
+                )
+            )
+    if extra_tracker:
+        builder.register(
+            RegisteredProcessorType(
+                descriptor=SYNTHETIC_TRACKER_DESCRIPTOR,
+                factory=make_synthetic_tracker,
+                stateful_descriptor=SYNTHETIC_TRACKER_STATEFUL_DESCRIPTOR,
+            )
+        )
+    return builder.snapshot()
 
 
 def create_workload_registry(iterations: int) -> RegistrySnapshot:

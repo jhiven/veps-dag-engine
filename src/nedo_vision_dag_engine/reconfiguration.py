@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, replace
-from queue import Empty, Queue
-from threading import Condition, Lock, RLock, Thread, current_thread
+from queue import Queue
+from threading import Condition, Lock, Thread, current_thread
 from types import TracebackType
 
 from nedo_vision_dag_engine.compiler import (
@@ -263,7 +263,6 @@ class ReconfigurationController:
         "_executor_token",
         "_instrumentation",
         "_ready_candidates",
-        "_ready_queue",
         "_records",
         "_registry",
         "_retirement_queue",
@@ -291,12 +290,11 @@ class ReconfigurationController:
         self._compiler = compiler
         self._registry = registry
         self._clock = clock
-        self._state_lock = RLock()
+        self._state_lock = Lock()
         self._condition = Condition(self._state_lock)
-        self._admission_lock = RLock()
+        self._admission_lock = Lock()
         self._compiler_lock = Lock()
         self._work_queue: Queue[_WorkItem] = Queue()
-        self._ready_queue: Queue[str] = Queue()
         self._retirement_queue: Queue[_RetirementWorkItem] = Queue()
         self._records: dict[str, ReconfigurationRecord] = {}
         self._instrumentation: RuntimeInstrumentation = executor.instrumentation
@@ -448,6 +446,26 @@ class ReconfigurationController:
 
     def admit_frame(self, admitted_at_ns: int, frame_id: int | None = None) -> FrameResult:
         with self._admission_lock:
+            # ── fast path: no reconfiguration transaction in progress ──
+            # Reading _active_request_id and _ready_candidates under
+            # _admission_lock alone is a benign race: the worker thread
+            # populates _ready_candidates under _state_lock, so we may
+            # miss a just-became-ready candidate for at most one frame.
+            # That is harmless — the candidate commits on the *next*
+            # admission instead.
+            if (
+                self._active_request_id is None
+                and not self._ready_candidates
+                and self._effect_pending_request_id is None
+                and not self._closed
+            ):
+                return self._executor.admit_frame_managed(
+                    token=self._executor_token,
+                    admitted_at_ns=admitted_at_ns,
+                    frame_id=frame_id,
+                )
+
+            # ── slow path: reconfiguration in progress ──
             with self._condition:
                 self._require_open_locked()
             self._commit_ready_unlocked()
@@ -787,7 +805,6 @@ class ReconfigurationController:
                 retired_processor_count=len(job.previous_plan.steps) - len(compilation_result.reused_node_ids),
             )
             self._publish_transition_locked(ready_record, ready_at_ns, None)
-            self._ready_queue.put(request.request_id)
 
     def _finish_preparation_failure(
         self,
@@ -962,16 +979,16 @@ class ReconfigurationController:
         )
 
     def _take_ready_candidate(self) -> _ReadyCandidate | None:
-        while True:
-            try:
-                request_id = self._ready_queue.get_nowait()
-            except Empty:
-                return None
+        """Return and remove the first ready candidate, if any.
 
-            with self._condition:
-                ready_candidate = self._ready_candidates.pop(request_id, None)
-            if ready_candidate is not None:
-                return ready_candidate
+        There is at most one active reconfiguration at a time, so the
+        ready-candidates dict holds either zero or one entry.
+        """
+        with self._condition:
+            if not self._ready_candidates:
+                return None
+            request_id = next(iter(self._ready_candidates))
+            return self._ready_candidates.pop(request_id)
 
     def _discard_candidate(
         self,
