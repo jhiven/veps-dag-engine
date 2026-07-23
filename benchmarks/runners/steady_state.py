@@ -25,6 +25,7 @@ from nedo_vision_dag_engine.instrumentation import (
     RuntimeInstrumentation,
 )
 from nedo_vision_dag_engine.processor import FrameContext
+from nedo_vision_dag_engine.specification import WorkflowSpecification
 from nedo_vision_dag_engine.workspace import WorkspacePool
 
 __all__ = ["run_steady_state_suite"]
@@ -66,6 +67,45 @@ def _get_execution_order(repetition: int) -> tuple[str, str, str]:
     return orders[(repetition - 1) % len(orders)]
 
 
+def _calibrate_adaptive_operations(
+    topology: str,
+    workload_id: str,
+    iters: int,
+    spec: WorkflowSpecification,
+    profile: str,
+    minimum_measurement_duration_ns: int = 150_000_000,
+    maximum_operation_count: int = 500_000,
+    calibration_pilot_operations: int = 50,
+) -> int:
+    if profile == "smoke":
+        return 20 if workload_id == "approximately_5_ms" else 50
+
+    registry = create_workload_registry(iters)
+    compiler = WorkflowCompiler("0.1.0")
+    candidate = compiler.compile(spec, registry)
+    if not isinstance(candidate, CompiledCandidate):
+        return 1000
+
+    plan = candidate.plan
+    workspace_pool = WorkspacePool()
+    ws = workspace_pool.acquire(plan.output_slot_count)
+    try:
+        # Warmup pilot
+        for f in range(5):
+            execute_frame(plan, f, 0, ws)
+
+        t0 = time.perf_counter_ns()
+        for f in range(calibration_pilot_operations):
+            execute_frame(plan, 5 + f, 0, ws)
+        t1 = time.perf_counter_ns()
+        elapsed = t1 - t0
+        per_frame_ns = elapsed / calibration_pilot_operations if calibration_pilot_operations > 0 else 1000.0
+        target_ops = max(20, min(maximum_operation_count, int(minimum_measurement_duration_ns / max(1.0, per_frame_ns))))
+        return target_ops
+    finally:
+        workspace_pool.release(ws)
+
+
 def run_steady_state_suite(
     run_id: str,
     output_csv_path: str,
@@ -73,6 +113,9 @@ def run_steady_state_suite(
     repetition_count: int,
     calibrated_iterations: dict[str, int],
     seed: int = 42,
+    minimum_measurement_duration_ns: int = 150_000_000,
+    maximum_operation_count: int = 500_000,
+    calibration_pilot_operations: int = 50,
 ) -> tuple[SteadyStateSampleRow, ...]:
     write_steady_state_header(output_csv_path)
 
@@ -88,18 +131,18 @@ def run_steady_state_suite(
         for workload_id in workload_ids:
             iters = calibrated_iterations[workload_id]
 
-            if profile == "smoke":
-                ops_per_rep = 20 if workload_id == "approximately_5_ms" else 50
-                warmup_ops = 5
-            else:
-                if workload_id == "approximately_5_ms":
-                    ops_per_rep = 1000
-                elif workload_id == "approximately_1_ms":
-                    ops_per_rep = 1000
-                else:
-                    ops_per_rep = 2000
-                warmup_ops = 50
-
+            # Perform single shared pilot calibration per topology & workload
+            ops_per_rep = _calibrate_adaptive_operations(
+                topology=topology,
+                workload_id=workload_id,
+                iters=iters,
+                spec=spec,
+                profile=profile,
+                minimum_measurement_duration_ns=minimum_measurement_duration_ns,
+                maximum_operation_count=maximum_operation_count,
+                calibration_pilot_operations=calibration_pilot_operations,
+            )
+            warmup_ops = 5 if profile == "smoke" else 50
             scenario_id = f"steady_state_{topology}_{workload_id}"
 
             for rep in range(1, repetition_count + 1):
@@ -121,6 +164,7 @@ def run_steady_state_suite(
                         processors = [step.processor_ref for step in plan.steps]
                         procs_typed = [p for p in processors if isinstance(p, WorkloadProcessor)]
 
+                        # Centralized Warmup
                         for f in range(warmup_ops):
                             ctx = FrameContext(frame_id=f, plan_version=1, admitted_at_ns=0)
                             if topology == "linear_5":
@@ -131,7 +175,7 @@ def run_steady_state_suite(
 
                         t0 = time.perf_counter_ns()
                         for f in range(ops_per_rep):
-                            ctx = FrameContext(frame_id=f, plan_version=1, admitted_at_ns=0)
+                            ctx = FrameContext(frame_id=warmup_ops + f, plan_version=1, admitted_at_ns=0)
                             if topology == "linear_5":
                                 execute_hard_coded_linear_5(tuple(procs_typed), ctx)
                             else:
@@ -142,12 +186,13 @@ def run_steady_state_suite(
                     elif impl == "static_compiled":
                         ws = workspace_pool.acquire(plan.output_slot_count)
                         try:
+                            # Centralized Warmup
                             for f in range(warmup_ops):
                                 execute_frame(plan, f, 0, ws)
 
                             t0 = time.perf_counter_ns()
                             for f in range(ops_per_rep):
-                                execute_frame(plan, f, 0, ws)
+                                execute_frame(plan, warmup_ops + f, 0, ws)
                             t1 = time.perf_counter_ns()
                         finally:
                             workspace_pool.release(ws)
@@ -159,12 +204,17 @@ def run_steady_state_suite(
                             instrumentation=NoOpRuntimeInstrumentation(),
                         )
 
+                        # Centralized Warmup
                         for f in range(warmup_ops):
-                            executor.admit_frame(admitted_at_ns=0, frame_id=f)
+                            res_w = executor.admit_frame(admitted_at_ns=0, frame_id=f)
+                            if res_w.status is not FrameStatus.COMPLETED or res_w.plan_version != 1:
+                                raise RuntimeError("Warmup frame execution failed or plan version changed.")
 
                         t0 = time.perf_counter_ns()
                         for f in range(ops_per_rep):
-                            executor.admit_frame(admitted_at_ns=0, frame_id=warmup_ops + f)
+                            res_m = executor.admit_frame(admitted_at_ns=0, frame_id=warmup_ops + f)
+                            if res_m.status is not FrameStatus.COMPLETED or res_m.plan_version != 1:
+                                raise RuntimeError("Measured frame execution failed or plan version changed.")
                         t1 = time.perf_counter_ns()
 
                     else:

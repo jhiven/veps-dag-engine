@@ -9,9 +9,11 @@ from typing import TextIO
 
 from benchmarks.model import (
     CONFORMANCE_HEADERS,
+    INTERFERENCE_HEADERS,
     RECONFIGURATION_HEADERS,
     STEADY_STATE_HEADERS,
     ConformanceResultRow,
+    InterferenceSampleRow,
     ReconfigurationSampleRow,
     SteadyStateSampleRow,
 )
@@ -26,6 +28,9 @@ __all__ = [
     "write_conformance_header",
     "append_conformance_rows",
     "read_conformance_rows",
+    "write_interference_header",
+    "append_interference_rows",
+    "read_interference_rows",
 ]
 
 
@@ -33,7 +38,9 @@ def _format_optional_int(value: int | None) -> str:
     return str(value) if value is not None else ""
 
 
-def _parse_optional_int(value: str) -> int | None:
+def _parse_optional_int(value: str | None) -> int | None:
+    if value is None:
+        return None
     v = value.strip()
     return int(v) if v else None
 
@@ -151,6 +158,23 @@ def append_reconfiguration_rows(
             str(row.staged_processor_count),
             str(row.retired_processor_count),
             row.state_transition_policy,
+            _format_optional_int(row.admission_stop_ns),
+            _format_optional_int(row.executor_teardown_ns),
+            _format_optional_int(row.executor_reconstruction_ns),
+            _format_optional_int(row.publication_ns),
+            _format_optional_int(row.executor_restart_ns),
+            _format_optional_int(row.first_admission_wait_ns),
+            _format_optional_int(row.first_completion_wait_ns),
+            _format_optional_int(row.retirement_ns),
+            _format_optional_int(row.total_synchronous_ns),
+            str(row.phases_may_overlap),
+            _format_optional_int(row.sum_of_instrumented_phase_durations_ns),
+            _format_optional_int(row.instrumented_phase_sum_ns),
+            _format_optional_int(row.critical_path_instrumented_ns),
+            _format_optional_int(row.unattributed_critical_path_ns),
+            _format_optional_int(row.unattributed_request_time_ns),
+            _format_optional_int(row.instrumented_duration_overlap_ns),
+            _format_optional_int(row.instrumented_duration_outside_effect_window_ns),
         ]
         for row in rows
     ]
@@ -182,25 +206,42 @@ def read_reconfiguration_rows(path: str) -> tuple[ReconfigurationSampleRow, ...]
                     old_plan_version=int(d["old_plan_version"]),
                     new_plan_version=int(d["new_plan_version"]),
                     terminal_status=d["terminal_status"],
-                    validation_ns=_parse_optional_int(d["validation_ns"]),
-                    preparation_ns=_parse_optional_int(d["preparation_ns"]),
-                    request_to_ready_ns=_parse_optional_int(d["request_to_ready_ns"]),
-                    boundary_wait_ns=_parse_optional_int(d["boundary_wait_ns"]),
-                    commit_ns=_parse_optional_int(d["commit_ns"]),
-                    request_to_effect_ns=_parse_optional_int(d["request_to_effect_ns"]),
-                    retirement_queue_delay_ns=_parse_optional_int(d["retirement_queue_delay_ns"]),
-                    retirement_duration_ns=_parse_optional_int(d["retirement_duration_ns"]),
-                    commit_to_retirement_complete_ns=_parse_optional_int(d["commit_to_retirement_complete_ns"]),
-                    maximum_output_gap_ns=_parse_optional_int(d["maximum_output_gap_ns"]),
-                    transition_output_gap_ns=_parse_optional_int(d["transition_output_gap_ns"]),
+                    validation_ns=_parse_optional_int(d.get("validation_ns")),
+                    preparation_ns=_parse_optional_int(d.get("preparation_ns")),
+                    request_to_ready_ns=_parse_optional_int(d.get("request_to_ready_ns")),
+                    boundary_wait_ns=_parse_optional_int(d.get("boundary_wait_ns")),
+                    commit_ns=_parse_optional_int(d.get("commit_ns")),
+                    request_to_effect_ns=_parse_optional_int(d.get("request_to_effect_ns")),
+                    retirement_queue_delay_ns=_parse_optional_int(d.get("retirement_queue_delay_ns")),
+                    retirement_duration_ns=_parse_optional_int(d.get("retirement_duration_ns")),
+                    commit_to_retirement_complete_ns=_parse_optional_int(d.get("commit_to_retirement_complete_ns")),
+                    maximum_output_gap_ns=_parse_optional_int(d.get("maximum_output_gap_ns")),
+                    transition_output_gap_ns=_parse_optional_int(d.get("transition_output_gap_ns")),
                     frames_completed_during_request=int(d["frames_completed_during_request"]),
-                    old_plan_frames_admitted_after_request_before_commit=int(d["old_plan_frames_admitted_after_request_before_commit"]),
+                    old_plan_frames_admitted_after_request_before_commit=int(d.get("old_plan_frames_admitted_after_request_before_commit", 0)),
                     frames_dropped=int(d["frames_dropped"]),
                     frames_duplicated=int(d["frames_duplicated"]),
                     reused_processor_count=int(d["reused_processor_count"]),
                     staged_processor_count=int(d["staged_processor_count"]),
                     retired_processor_count=int(d["retired_processor_count"]),
                     state_transition_policy=d["state_transition_policy"],
+                    admission_stop_ns=_parse_optional_int(d.get("admission_stop_ns")),
+                    executor_teardown_ns=_parse_optional_int(d.get("executor_teardown_ns")),
+                    executor_reconstruction_ns=_parse_optional_int(d.get("executor_reconstruction_ns")),
+                    publication_ns=_parse_optional_int(d.get("publication_ns")),
+                    executor_restart_ns=_parse_optional_int(d.get("executor_restart_ns")),
+                    first_admission_wait_ns=_parse_optional_int(d.get("first_admission_wait_ns")),
+                    first_completion_wait_ns=_parse_optional_int(d.get("first_completion_wait_ns")),
+                    retirement_ns=_parse_optional_int(d.get("retirement_ns")),
+                    total_synchronous_ns=_parse_optional_int(d.get("total_synchronous_ns")),
+                    phases_may_overlap=d.get("phases_may_overlap", "False").lower() == "true",
+                    sum_of_instrumented_phase_durations_ns=_parse_optional_int(d.get("sum_of_instrumented_phase_durations_ns")),
+                    instrumented_phase_sum_ns=_parse_optional_int(d.get("instrumented_phase_sum_ns")),
+                    critical_path_instrumented_ns=_parse_optional_int(d.get("critical_path_instrumented_ns")),
+                    unattributed_critical_path_ns=_parse_optional_int(d.get("unattributed_critical_path_ns")),
+                    unattributed_request_time_ns=_parse_optional_int(d.get("unattributed_request_time_ns")),
+                    instrumented_duration_overlap_ns=_parse_optional_int(d.get("instrumented_duration_overlap_ns")),
+                    instrumented_duration_outside_effect_window_ns=_parse_optional_int(d.get("instrumented_duration_outside_effect_window_ns")),
                 )
             )
     return tuple(rows)
@@ -289,6 +330,74 @@ def read_conformance_rows(path: str) -> tuple[ConformanceResultRow, ...]:
                     candidate_resource_leaks=int(d["candidate_resource_leaks"]),
                     processor_instance_leaks=int(d["processor_instance_leaks"]),
                     terminal_status=d["terminal_status"],
+                )
+            )
+    return tuple(rows)
+
+
+def write_interference_header(file_or_path: str | TextIO) -> None:
+    if isinstance(file_or_path, str):
+        os.makedirs(os.path.dirname(os.path.abspath(file_or_path)), exist_ok=True)
+        with open(file_or_path, "w", newline="", encoding="utf-8") as file:
+            writer = csv.writer(file)
+            writer.writerow(INTERFERENCE_HEADERS)
+    else:
+        writer = csv.writer(file_or_path)
+        writer.writerow(INTERFERENCE_HEADERS)
+        file_or_path.flush()
+
+
+def append_interference_rows(
+    file_or_path: str | TextIO, rows: Iterable[InterferenceSampleRow]
+) -> None:
+    formatted_rows = [
+        [
+            row.run_id,
+            row.scenario_id,
+            row.preparation_category,
+            str(row.repetition),
+            f"{row.frame_latency_before_median_ns:.2f}",
+            f"{row.frame_latency_during_median_ns:.2f}",
+            f"{row.frame_latency_during_p95_ns:.2f}",
+            f"{row.frame_latency_after_median_ns:.2f}",
+            str(row.frames_completed_during_preparation),
+            f"{row.throughput_before_fps:.2f}",
+            f"{row.throughput_during_fps:.2f}",
+            f"{row.throughput_after_fps:.2f}",
+        ]
+        for row in rows
+    ]
+
+    if isinstance(file_or_path, str):
+        with open(file_or_path, "a", newline="", encoding="utf-8") as file:
+            writer = csv.writer(file)
+            writer.writerows(formatted_rows)
+            file.flush()
+    else:
+        writer = csv.writer(file_or_path)
+        writer.writerows(formatted_rows)
+        file_or_path.flush()
+
+
+def read_interference_rows(path: str) -> tuple[InterferenceSampleRow, ...]:
+    rows: list[InterferenceSampleRow] = []
+    with open(path, "r", newline="", encoding="utf-8") as file:
+        reader = csv.DictReader(file)
+        for d in reader:
+            rows.append(
+                InterferenceSampleRow(
+                    run_id=d["run_id"],
+                    scenario_id=d["scenario_id"],
+                    preparation_category=d["preparation_category"],
+                    repetition=int(d["repetition"]),
+                    frame_latency_before_median_ns=float(d["frame_latency_before_median_ns"]),
+                    frame_latency_during_median_ns=float(d["frame_latency_during_median_ns"]),
+                    frame_latency_during_p95_ns=float(d["frame_latency_during_p95_ns"]),
+                    frame_latency_after_median_ns=float(d["frame_latency_after_median_ns"]),
+                    frames_completed_during_preparation=int(d["frames_completed_during_preparation"]),
+                    throughput_before_fps=float(d["throughput_before_fps"]),
+                    throughput_during_fps=float(d["throughput_during_fps"]),
+                    throughput_after_fps=float(d["throughput_after_fps"]),
                 )
             )
     return tuple(rows)

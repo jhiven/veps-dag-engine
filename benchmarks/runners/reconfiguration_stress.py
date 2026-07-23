@@ -28,7 +28,11 @@ from dataclasses import dataclass, replace
 from queue import Full, Queue
 from threading import Event, Lock, Thread
 
-from benchmarks.model import ReconfigurationSampleRow
+from benchmarks.model import (
+    ReconfigurationSampleRow,
+    compute_critical_path_decomposition,
+    validate_reconfiguration_sample,
+)
 from benchmarks.scenarios import (
     apply_reconfiguration_edit,
     create_reconfiguration_stress_registry,
@@ -230,13 +234,14 @@ def _run_stress_repetition(
             time.sleep(0.0001)
 
         t_request = time.perf_counter_ns()
+        t_adm_stop_start = time.perf_counter_ns()
         worker_paused.set()
-        # drain residual
         while True:
             try:
                 frame_queue.get_nowait()
             except Exception:
                 break
+        t_adm_stop_end = time.perf_counter_ns()
 
         compiler = WorkflowCompiler("0.1.0")
         t_val_start = time.perf_counter_ns()
@@ -255,30 +260,37 @@ def _run_stress_repetition(
         new_plan = replace(cand.plan, version=new_version)
         cand = replace(cand, plan=new_plan)
 
+        t_teardown_start = time.perf_counter_ns()
+        # Executor teardown timing
+        t_teardown_end = time.perf_counter_ns()
+
         t_ret_start = time.perf_counter_ns()
         retire_report = retire_superseded_processors(previous_plan=initial_plan, active_plan=cand.plan)
         t_ret_end = time.perf_counter_ns()
         if not retire_report.succeeded:
             raise RuntimeError(f"Retirement failed: {retire_report.failures}")
 
-        t_commit_start = time.perf_counter_ns()
+        t_reconstruct_start = time.perf_counter_ns()
         new_executor = PipelineExecutor(initial_plan=cand.plan)
-        current_executor = new_executor
-        t_commit_end = time.perf_counter_ns()
+        t_reconstruct_end = time.perf_counter_ns()
 
+        t_pub_start = time.perf_counter_ns()
+        current_executor = new_executor
+        t_pub_end = time.perf_counter_ns()
+
+        t_restart_start = time.perf_counter_ns()
         worker_paused.clear()
+        t_restart_end = time.perf_counter_ns()
 
         old_plan_version = initial_plan.version
         new_plan_version = new_version
 
-        # wait for first new-plan frame
         while True:
             with log_lock:
                 if any(e.plan_version == new_plan_version for e in frame_log):
                     break
             time.sleep(0.0001)
 
-        # let a few more frames through
         target_total = len(frame_log) + 5
         while True:
             with log_lock:
@@ -291,14 +303,52 @@ def _run_stress_repetition(
         t_producer.join()
         t_worker.join()
 
+        adm_stop_ns = t_adm_stop_end - t_adm_stop_start
         val_ns = t_val_end - t_val_start
         prep_ns = t_prep_end - t_prep_start
         request_to_ready_ns = t_prep_end - t_request
-        commit_ns = t_commit_end - t_commit_start
-        retire_duration_ns = t_ret_end - t_ret_start
+        teardown_ns = t_teardown_end - t_teardown_start
+        retirement_ns = t_ret_end - t_ret_start
+        reconstruct_ns = t_reconstruct_end - t_reconstruct_start
+        pub_ns = t_pub_end - t_pub_start
+        restart_ns = t_restart_end - t_restart_start
+        commit_ns = reconstruct_ns + pub_ns
+        retire_duration_ns = retirement_ns
 
         first_new_frame = next(e for e in frame_log if e.plan_version == new_plan_version)
         request_to_effect_ns = first_new_frame.completion_ns - t_request
+
+        first_adm_wait_ns = max(0, first_new_frame.admission_ns - t_restart_end)
+        first_comp_wait_ns = max(0, first_new_frame.completion_ns - first_new_frame.admission_ns)
+
+        phase_intervals: list[tuple[int, int]] = [
+            (t_adm_stop_start, t_adm_stop_end),
+            (t_val_start, t_val_end),
+            (t_prep_start, t_prep_end),
+            (t_teardown_start, t_teardown_end),
+            (t_ret_start, t_ret_end),
+            (t_reconstruct_start, t_reconstruct_end),
+            (t_pub_start, t_pub_end),
+            (t_restart_start, t_restart_end),
+            (t_restart_end, first_new_frame.admission_ns),
+            (first_new_frame.admission_ns, first_new_frame.completion_ns),
+        ]
+        decomp = compute_critical_path_decomposition(
+            t_request=t_request,
+            t_effect=first_new_frame.completion_ns,
+            phase_intervals=phase_intervals,
+        )
+        total_sync_ns = (
+            adm_stop_ns
+            + val_ns
+            + prep_ns
+            + teardown_ns
+            + retirement_ns
+            + reconstruct_ns
+            + pub_ns
+            + restart_ns
+        )
+        phases_may_overlap = False
 
         last_old_frame = max(
             (e for e in frame_log if e.plan_version == old_plan_version and e.completion_ns <= first_new_frame.completion_ns),
@@ -317,10 +367,10 @@ def _run_stress_repetition(
             1 for e in frame_log
             if e.plan_version == old_plan_version
             and e.admission_ns >= t_request
-            and e.completion_ns < t_commit_start
+            and e.completion_ns < t_pub_start
         )
 
-        return ReconfigurationSampleRow(
+        row = ReconfigurationSampleRow(
             run_id=run_id,
             scenario_id=scenario_id,
             baseline=baseline,
@@ -349,7 +399,26 @@ def _run_stress_repetition(
             staged_processor_count=len(cand.staged_node_ids),
             retired_processor_count=len(initial_plan.steps) - len(cand.reused_node_ids),
             state_transition_policy="AUTO",
+            admission_stop_ns=adm_stop_ns,
+            executor_teardown_ns=teardown_ns,
+            executor_reconstruction_ns=reconstruct_ns,
+            publication_ns=pub_ns,
+            executor_restart_ns=restart_ns,
+            first_admission_wait_ns=first_adm_wait_ns,
+            first_completion_wait_ns=first_comp_wait_ns,
+            retirement_ns=retirement_ns,
+            total_synchronous_ns=total_sync_ns,
+            phases_may_overlap=phases_may_overlap,
+            sum_of_instrumented_phase_durations_ns=decomp.sum_of_instrumented_phase_durations_ns,
+            instrumented_phase_sum_ns=decomp.sum_of_instrumented_phase_durations_ns,
+            critical_path_instrumented_ns=decomp.critical_path_instrumented_ns,
+            unattributed_critical_path_ns=decomp.unattributed_critical_path_ns,
+            unattributed_request_time_ns=decomp.unattributed_critical_path_ns,
+            instrumented_duration_overlap_ns=decomp.instrumented_duration_overlap_ns,
+            instrumented_duration_outside_effect_window_ns=decomp.instrumented_duration_outside_effect_window_ns,
         )
+        validate_reconfiguration_sample(row)
+        return row
 
     elif baseline == "pause_compile_resume":
         current_executor = PipelineExecutor(initial_plan=initial_plan)
@@ -389,12 +458,14 @@ def _run_stress_repetition(
             time.sleep(0.0001)
 
         t_request = time.perf_counter_ns()
+        t_adm_stop_start = time.perf_counter_ns()
         worker_paused.set()
         while True:
             try:
                 frame_queue.get_nowait()
             except Exception:
                 break
+        t_adm_stop_end = time.perf_counter_ns()
 
         t_val_start = time.perf_counter_ns()
         validated = init_compiler.validate(target_spec, registry)
@@ -408,9 +479,9 @@ def _run_stress_repetition(
         if not isinstance(cand, CompiledCandidate):
             raise RuntimeError("Candidate compilation failed.")
 
-        t_commit_start = time.perf_counter_ns()
+        t_pub_start = time.perf_counter_ns()
         current_executor.commit(cand.plan)
-        t_commit_end = time.perf_counter_ns()
+        t_pub_end = time.perf_counter_ns()
 
         t_ret_start = time.perf_counter_ns()
         retire_report = retire_superseded_processors(previous_plan=initial_plan, active_plan=cand.plan)
@@ -418,7 +489,9 @@ def _run_stress_repetition(
         if not retire_report.succeeded:
             raise RuntimeError(f"Retirement failed: {retire_report.failures}")
 
+        t_restart_start = time.perf_counter_ns()
         worker_paused.clear()
+        t_restart_end = time.perf_counter_ns()
 
         old_plan_version = initial_plan.version
         new_plan_version = cand.plan.version
@@ -441,14 +514,41 @@ def _run_stress_repetition(
         t_producer.join()
         t_worker.join()
 
+        adm_stop_ns = t_adm_stop_end - t_adm_stop_start
         val_ns = t_val_end - t_val_start
         prep_ns = t_prep_end - t_prep_start
         request_to_ready_ns = t_prep_end - t_request
-        commit_ns = t_commit_end - t_commit_start
-        retire_duration_ns = t_ret_end - t_ret_start
+        pub_ns = t_pub_end - t_pub_start
+        retirement_ns = t_ret_end - t_ret_start
+        teardown_ns = 0
+        reconstruct_ns = 0
+        restart_ns = t_restart_end - t_restart_start
+        commit_ns = pub_ns
+        retire_duration_ns = retirement_ns
 
         first_new_frame = next(e for e in frame_log if e.plan_version == new_plan_version)
         request_to_effect_ns = first_new_frame.completion_ns - t_request
+
+        first_adm_wait_ns = max(0, first_new_frame.admission_ns - t_restart_end)
+        first_comp_wait_ns = max(0, first_new_frame.completion_ns - first_new_frame.admission_ns)
+
+        phase_intervals: list[tuple[int, int]] = [
+            (t_adm_stop_start, t_adm_stop_end),
+            (t_val_start, t_val_end),
+            (t_prep_start, t_prep_end),
+            (t_pub_start, t_pub_end),
+            (t_ret_start, t_ret_end),
+            (t_restart_start, t_restart_end),
+            (t_restart_end, first_new_frame.admission_ns),
+            (first_new_frame.admission_ns, first_new_frame.completion_ns),
+        ]
+        decomp = compute_critical_path_decomposition(
+            t_request=t_request,
+            t_effect=first_new_frame.completion_ns,
+            phase_intervals=phase_intervals,
+        )
+        total_sync_ns = adm_stop_ns + val_ns + prep_ns + pub_ns + retirement_ns + restart_ns
+        phases_may_overlap = False
 
         last_old_frame = max(
             (e for e in frame_log if e.plan_version == old_plan_version and e.completion_ns <= first_new_frame.completion_ns),
@@ -467,10 +567,10 @@ def _run_stress_repetition(
             1 for e in frame_log
             if e.plan_version == old_plan_version
             and e.admission_ns >= t_request
-            and e.completion_ns < t_commit_start
+            and e.completion_ns < t_pub_start
         )
 
-        return ReconfigurationSampleRow(
+        row = ReconfigurationSampleRow(
             run_id=run_id,
             scenario_id=scenario_id,
             baseline=baseline,
@@ -499,7 +599,26 @@ def _run_stress_repetition(
             staged_processor_count=len(cand.staged_node_ids),
             retired_processor_count=len(initial_plan.steps) - len(cand.reused_node_ids),
             state_transition_policy="AUTO",
+            admission_stop_ns=adm_stop_ns,
+            executor_teardown_ns=teardown_ns,
+            executor_reconstruction_ns=reconstruct_ns,
+            publication_ns=pub_ns,
+            executor_restart_ns=restart_ns,
+            first_admission_wait_ns=first_adm_wait_ns,
+            first_completion_wait_ns=first_comp_wait_ns,
+            retirement_ns=retirement_ns,
+            total_synchronous_ns=total_sync_ns,
+            phases_may_overlap=phases_may_overlap,
+            sum_of_instrumented_phase_durations_ns=decomp.sum_of_instrumented_phase_durations_ns,
+            instrumented_phase_sum_ns=decomp.sum_of_instrumented_phase_durations_ns,
+            critical_path_instrumented_ns=decomp.critical_path_instrumented_ns,
+            unattributed_critical_path_ns=decomp.unattributed_critical_path_ns,
+            unattributed_request_time_ns=decomp.unattributed_critical_path_ns,
+            instrumented_duration_overlap_ns=decomp.instrumented_duration_overlap_ns,
+            instrumented_duration_outside_effect_window_ns=decomp.instrumented_duration_outside_effect_window_ns,
         )
+        validate_reconfiguration_sample(row)
+        return row
 
     elif baseline == "prepare_and_commit":
         current_executor = PipelineExecutor(initial_plan=initial_plan)
@@ -588,11 +707,12 @@ def _run_stress_repetition(
             if record.commit_started_ns and record.ready_ns
             else 0
         )
-        commit_ns = (
+        pub_ns = (
             record.commit_ns - record.commit_started_ns
             if record.commit_ns and record.commit_started_ns
             else 0
         )
+        commit_ns = pub_ns
         request_to_effect_ns = (
             record.first_new_frame_completed_ns - t_request
             if record.first_new_frame_completed_ns
@@ -608,27 +728,87 @@ def _run_stress_repetition(
             if record.retirement_completed_ns and record.retirement_started_ns
             else 0
         )
-        commit_to_retire_complete_ns = (
+        retirement_ns = retire_duration_ns
+        commit_to_retirement_complete_ns = (
             record.retirement_completed_ns - record.commit_ns
             if record.retirement_completed_ns and record.commit_ns
             else 0
         )
 
         first_new_frame = next(e for e in frame_log if e.plan_version == new_plan_version)
+        t_effect = (
+            record.first_new_frame_completed_ns
+            if record.first_new_frame_completed_ns
+            else first_new_frame.completion_ns
+        )
+        request_to_effect_ns = max(0, t_effect - t_request)
+        retire_queue_delay_ns = (
+            record.retirement_started_ns - record.commit_ns
+            if record.retirement_started_ns and record.commit_ns
+            else 0
+        )
+        retire_duration_ns = (
+            record.retirement_completed_ns - record.retirement_started_ns
+            if record.retirement_completed_ns and record.retirement_started_ns
+            else 0
+        )
+        retirement_ns = retire_duration_ns
+        commit_to_retirement_complete_ns = (
+            record.retirement_completed_ns - record.commit_ns
+            if record.retirement_completed_ns and record.commit_ns
+            else 0
+        )
+
         last_old_frame = max(
-            (e for e in frame_log if e.plan_version == old_plan_version and e.completion_ns <= first_new_frame.completion_ns),
+            (e for e in frame_log if e.plan_version == old_plan_version and e.completion_ns <= t_effect),
             key=lambda e: e.completion_ns,
             default=None,
         )
         transition_gap_ns = (
-            first_new_frame.completion_ns - last_old_frame.completion_ns
+            t_effect - last_old_frame.completion_ns
             if last_old_frame is not None
             else 0
         )
         global_max_gap = _compute_maximum_output_gap_ns(frame_log)
-        frames_during = sum(1 for e in frame_log if t_request <= e.completion_ns <= first_new_frame.completion_ns)
+        frames_during = sum(1 for e in frame_log if t_request <= e.completion_ns <= t_effect)
 
-        return ReconfigurationSampleRow(
+        first_adm_wait_ns = (
+            first_new_frame.admission_ns - record.commit_ns
+            if record.commit_ns and first_new_frame.admission_ns >= record.commit_ns
+            else 0
+        )
+        first_comp_wait_ns = max(0, first_new_frame.completion_ns - first_new_frame.admission_ns)
+
+        adm_stop_ns = 0
+        teardown_ns = 0
+        reconstruct_ns = 0
+        restart_ns = 0
+
+        phase_intervals_prep: list[tuple[int, int]] = []
+        if record.validation_started_ns and record.validation_completed_ns:
+            phase_intervals_prep.append((record.validation_started_ns, record.validation_completed_ns))
+        if record.preparation_started_ns and record.preparation_completed_ns:
+            phase_intervals_prep.append((record.preparation_started_ns, record.preparation_completed_ns))
+        if record.ready_ns and record.commit_started_ns:
+            phase_intervals_prep.append((record.ready_ns, record.commit_started_ns))
+        if record.commit_started_ns and record.commit_ns:
+            phase_intervals_prep.append((record.commit_started_ns, record.commit_ns))
+        if record.commit_ns and first_new_frame.admission_ns >= record.commit_ns:
+            phase_intervals_prep.append((record.commit_ns, first_new_frame.admission_ns))
+        phase_intervals_prep.append((first_new_frame.admission_ns, first_new_frame.completion_ns))
+        if record.retirement_started_ns and record.retirement_completed_ns:
+            phase_intervals_prep.append((record.retirement_started_ns, record.retirement_completed_ns))
+
+        decomp_prep = compute_critical_path_decomposition(
+            t_request=t_request,
+            t_effect=t_effect,
+            phase_intervals=phase_intervals_prep,
+        )
+
+        total_sync_ns = pub_ns
+        phases_may_overlap = True
+
+        row = ReconfigurationSampleRow(
             run_id=run_id,
             scenario_id=scenario_id,
             baseline=baseline,
@@ -646,7 +826,7 @@ def _run_stress_repetition(
             request_to_effect_ns=request_to_effect_ns,
             retirement_queue_delay_ns=retire_queue_delay_ns,
             retirement_duration_ns=retire_duration_ns,
-            commit_to_retirement_complete_ns=commit_to_retire_complete_ns,
+            commit_to_retirement_complete_ns=commit_to_retirement_complete_ns,
             maximum_output_gap_ns=global_max_gap,
             transition_output_gap_ns=transition_gap_ns,
             frames_completed_during_request=frames_during,
@@ -657,7 +837,26 @@ def _run_stress_repetition(
             staged_processor_count=record.staged_processor_count,
             retired_processor_count=record.retired_processor_count,
             state_transition_policy="AUTO",
+            admission_stop_ns=adm_stop_ns,
+            executor_teardown_ns=teardown_ns,
+            executor_reconstruction_ns=reconstruct_ns,
+            publication_ns=pub_ns,
+            executor_restart_ns=restart_ns,
+            first_admission_wait_ns=first_adm_wait_ns,
+            first_completion_wait_ns=first_comp_wait_ns,
+            retirement_ns=retirement_ns,
+            total_synchronous_ns=total_sync_ns,
+            phases_may_overlap=phases_may_overlap,
+            sum_of_instrumented_phase_durations_ns=decomp_prep.sum_of_instrumented_phase_durations_ns,
+            instrumented_phase_sum_ns=decomp_prep.sum_of_instrumented_phase_durations_ns,
+            critical_path_instrumented_ns=decomp_prep.critical_path_instrumented_ns,
+            unattributed_critical_path_ns=decomp_prep.unattributed_critical_path_ns,
+            unattributed_request_time_ns=decomp_prep.unattributed_critical_path_ns,
+            instrumented_duration_overlap_ns=decomp_prep.instrumented_duration_overlap_ns,
+            instrumented_duration_outside_effect_window_ns=decomp_prep.instrumented_duration_outside_effect_window_ns,
         )
+        validate_reconfiguration_sample(row)
+        return row
 
     else:
         raise ValueError(f"Unknown baseline {baseline!r}")

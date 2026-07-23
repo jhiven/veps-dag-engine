@@ -394,10 +394,32 @@ class RuntimeInstrumentation:
             )
 
     def metrics_snapshot(self) -> RuntimeMetricsSnapshot:
-        frame_events = self.frame_events()
-        measurements = self.reconfiguration_measurements()
-        transition_events = self.state_transition_events()
-        reuse_events = self.state_reuse_events()
+        with self._lock:
+            events = tuple(self._events)
+            measurements = tuple(
+                sorted(
+                    self._latest_reconfiguration_measurements.values(),
+                    key=lambda measurement: (
+                        measurement.request_received_ns,
+                        measurement.request_id,
+                    ),
+                )
+            )
+        frame_events = tuple(
+            envelope.event
+            for envelope in events
+            if isinstance(envelope.event, FrameExecutionEvent)
+        )
+        transition_events = tuple(
+            envelope.event
+            for envelope in events
+            if isinstance(envelope.event, StateTransitionEvent)
+        )
+        reuse_events = tuple(
+            envelope.event
+            for envelope in events
+            if isinstance(envelope.event, StateReuseEvent)
+        )
 
         frame_occurrences: dict[int, int] = {}
         frame_versions: dict[int, set[int]] = {}

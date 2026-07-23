@@ -21,9 +21,13 @@ __all__ = [
     "FrameStatus",
     "FrameResult",
     "PlanSwap",
+    "PublicationResult",
     "execute_frame",
     "PipelineExecutor",
 ]
+
+# PublicationResult is a alias of PlanSwap for plan publication
+type PublicationResult = PlanSwap
 
 
 @dataclass(frozen=True, slots=True)
@@ -275,8 +279,24 @@ class PipelineExecutor:
             )
             return result
 
-    def _commit_plan_locked(self, new_plan: ExecutionPlan) -> PlanSwap:
-        """Swap plan while holding ``_plan_lock``.  Caller must also hold ``_execution_lock``."""
+    def snapshot_active_plan(self) -> ExecutionPlan:
+        """Centralized accessor for taking a thread-safe snapshot of the active plan.
+
+        Protected by ``_plan_lock``. Safe to call without holding ``_execution_lock``.
+        """
+        with self._plan_lock:
+            return self._active_plan
+
+    def publish_candidate_plan(self, new_plan: ExecutionPlan) -> PlanSwap:
+        """Centralized publication linearization point for candidate plans.
+
+        Linearization point:
+            The plan reference atomic assignment ``self._active_plan = new_plan``
+            is performed while holding ``_plan_lock``.
+            Caller MUST hold ``_execution_lock`` before calling this method to prevent
+            concurrent plan commits or frame execution race conditions. No external
+            callbacks or processor code runs while holding these locks.
+        """
         previous_plan = self._active_plan
         if new_plan.version <= previous_plan.version:
             raise ValueError(
@@ -285,3 +305,7 @@ class PipelineExecutor:
             )
         self._active_plan = new_plan
         return PlanSwap(previous_plan=previous_plan, active_plan=new_plan)
+
+    def _commit_plan_locked(self, new_plan: ExecutionPlan) -> PlanSwap:
+        """Swap plan while holding ``_plan_lock``. Caller must also hold ``_execution_lock``."""
+        return self.publish_candidate_plan(new_plan)

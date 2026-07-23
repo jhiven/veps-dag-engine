@@ -100,6 +100,17 @@ def test_reconfiguration_storage_roundtrip() -> None:
         staged_processor_count=1,
         retired_processor_count=0,
         state_transition_policy="AUTO",
+        admission_stop_ns=10,
+        executor_teardown_ns=20,
+        executor_reconstruction_ns=30,
+        publication_ns=40,
+        executor_restart_ns=50,
+        first_admission_wait_ns=60,
+        first_completion_wait_ns=70,
+        retirement_ns=80,
+        total_synchronous_ns=90,
+        instrumented_phase_sum_ns=360,
+        unattributed_request_time_ns=5,
     )
 
     append_reconfiguration_rows(path, [row])

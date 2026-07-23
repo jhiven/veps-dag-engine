@@ -447,18 +447,19 @@ class ReconfigurationController:
     def admit_frame(self, admitted_at_ns: int, frame_id: int | None = None) -> FrameResult:
         with self._admission_lock:
             # ── fast path: no reconfiguration transaction in progress ──
-            # Reading _active_request_id and _ready_candidates under
-            # _admission_lock alone is a benign race: the worker thread
-            # populates _ready_candidates under _state_lock, so we may
-            # miss a just-became-ready candidate for at most one frame.
-            # That is harmless — the candidate commits on the *next*
-            # admission instead.
-            if (
-                self._active_request_id is None
-                and not self._ready_candidates
-                and self._effect_pending_request_id is None
-                and not self._closed
-            ):
+            # _state_lock is acquired here for a brief read of controller
+            # state so that dict/list/reference reads never race with a
+            # concurrent worker-thread write under free-threaded Python.
+            # In the common case (no reconfiguration in flight) this lock
+            # is uncontended and costs at most a few nanoseconds.
+            with self._state_lock:
+                fast_path = (
+                    self._active_request_id is None
+                    and not self._ready_candidates
+                    and self._effect_pending_request_id is None
+                    and not self._closed
+                )
+            if fast_path:
                 return self._executor.admit_frame_managed(
                     token=self._executor_token,
                     admitted_at_ns=admitted_at_ns,

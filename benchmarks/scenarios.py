@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 import time
 from dataclasses import dataclass
 
@@ -56,6 +57,11 @@ class WorkloadCalibrationDetail:
     p95_ns: float
     calibration_repetitions: int
     target_description: str
+    workload_target_ns: int = 0
+    workload_calibration_parameter: int = 0
+    pilot_measured_processor_ns: float = 0.0
+    expected_topology_frame_ns: float = 0.0
+    calibration_runtime_id: str = ""
 
 
 def do_cpu_work(iterations: int) -> int:
@@ -101,6 +107,7 @@ def calibrate_workload_iterations(calibration_repetitions: int = 30) -> dict[str
 
     med_1ms, p95_1ms = _measure_iterations(iters_1ms, calibration_repetitions)
     med_5ms, p95_5ms = _measure_iterations(iters_5ms, calibration_repetitions)
+    runtime_id = f"{sys.implementation.name}-{sys.version.split()[0]}"
 
     return {
         "minimal": WorkloadCalibrationDetail(
@@ -110,6 +117,11 @@ def calibrate_workload_iterations(calibration_repetitions: int = 30) -> dict[str
             p95_ns=0.0,
             calibration_repetitions=calibration_repetitions,
             target_description="minimal zero-cost baseline",
+            workload_target_ns=0,
+            workload_calibration_parameter=0,
+            pilot_measured_processor_ns=0.0,
+            expected_topology_frame_ns=0.0,
+            calibration_runtime_id=runtime_id,
         ),
         "approximately_1_ms": WorkloadCalibrationDetail(
             workload_id="approximately_1_ms",
@@ -118,6 +130,11 @@ def calibrate_workload_iterations(calibration_repetitions: int = 30) -> dict[str
             p95_ns=p95_1ms,
             calibration_repetitions=calibration_repetitions,
             target_description="approximately 1 ms per processor invocation",
+            workload_target_ns=1_000_000,
+            workload_calibration_parameter=iters_1ms,
+            pilot_measured_processor_ns=med_1ms,
+            expected_topology_frame_ns=med_1ms * 5,
+            calibration_runtime_id=runtime_id,
         ),
         "approximately_5_ms": WorkloadCalibrationDetail(
             workload_id="approximately_5_ms",
@@ -126,6 +143,11 @@ def calibrate_workload_iterations(calibration_repetitions: int = 30) -> dict[str
             p95_ns=p95_5ms,
             calibration_repetitions=calibration_repetitions,
             target_description="approximately 5 ms per processor invocation",
+            workload_target_ns=5_000_000,
+            workload_calibration_parameter=iters_5ms,
+            pilot_measured_processor_ns=med_5ms,
+            expected_topology_frame_ns=med_5ms * 5,
+            calibration_runtime_id=runtime_id,
         ),
     }
 

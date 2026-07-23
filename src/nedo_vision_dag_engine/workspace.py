@@ -73,6 +73,13 @@ class Workspace(Sequence[object]):
 class WorkspacePool:
     """Keeps previously used, now-idle workspaces around for reuse,
     grouped by size, so most frames do not need to allocate a new one.
+
+    This pool is **not** internally synchronized.  The executor always
+    calls ``acquire`` and ``release`` from within
+    ``PipelineExecutor._admit_frame_locked``, which holds
+    ``_execution_lock``, serializing all access.  If the pool is ever
+    shared across callers that do not already hold a common lock, wrap it
+    or add internal locking.
     """
 
     def __init__(self) -> None:

@@ -14,7 +14,41 @@ from dataclasses import dataclass
 __all__ = [
     "SystemEnvironment",
     "collect_system_environment",
+    "is_free_threaded_build",
+    "is_gil_enabled",
+    "inspect_runtime_environment",
+    "verify_gil_configuration",
 ]
+
+
+def is_free_threaded_build() -> bool:
+    return hasattr(sys, "_is_gil_enabled")
+
+
+def is_gil_enabled() -> bool:
+    fn = getattr(sys, "_is_gil_enabled", None)
+    if callable(fn):
+        return bool(fn())
+    return True
+
+
+def inspect_runtime_environment() -> dict[str, object]:
+    return {
+        "python_version": platform.python_version(),
+        "free_threaded_build": is_free_threaded_build(),
+        "gil_enabled": is_gil_enabled(),
+        "implementation": platform.python_implementation(),
+        "platform": sys.platform,
+        "process_affinity": _get_cpu_affinity(),
+    }
+
+
+def verify_gil_configuration(require_gil_disabled: bool = False) -> None:
+    if require_gil_disabled and is_gil_enabled():
+        raise RuntimeError(
+            "require_gil_disabled is set to True, but the Python GIL is currently enabled. "
+            "Please run under Python 3.13+ free-threaded build with PYTHON_GIL=0."
+        )
 
 
 @dataclass(frozen=True, slots=True)
