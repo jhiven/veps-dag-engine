@@ -18,8 +18,19 @@ build-backend = "uv_build"
 typeCheckingMode = "strict"
 
 [dependency-groups]
-benchmark = ["matplotlib>=3.11.1", "numpy>=2.5.1", "psutil>=6.0.0", "scipy>=1.18.0"]
+benchmark = [
+    "matplotlib>=3.11.1",
+    "numpy>=2.5.1",
+    "psutil>=6.0.0",
+    "scipy>=1.18.0",
+]
 dev = ["pytest>=9.1.1", "scipy-stubs>=1.18.0.1"]
+realworld-video = [
+    "numpy>=2.5.1",
+    "opencv-python-headless>=4.11.0",
+    "torch>=2.6.0",
+    "transformers>=4.49.0",
+]
 
 [tool.pytest.ini_options]
 addopts = "-v --showlocals"

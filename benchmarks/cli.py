@@ -87,15 +87,15 @@ def run_benchmarks(
     utc_start = datetime.datetime.now(datetime.timezone.utc).isoformat()
     start_time_ns = time.monotonic_ns()
 
-    valid_suite_names = {"steady-state", "reconfiguration", "reconfiguration-stress", "conformance", "ablation", "interference"}
+    valid_suite_names = {"steady-state", "reconfiguration", "reconfiguration-stress", "conformance", "ablation", "interference", "realworld-video"}
     if suite == "all":
-        selected_suites = ("steady-state", "reconfiguration", "conformance", "reconfiguration-stress", "ablation", "interference")
+        selected_suites = ("steady-state", "reconfiguration", "conformance", "reconfiguration-stress", "ablation", "interference", "realworld-video")
     else:
         parts = [s.strip() for s in suite.split(",") if s.strip()]
         for p in parts:
             if p not in valid_suite_names:
                 raise ValueError(
-                    f"Unknown benchmark suite {p!r}. Valid options: 'all', 'steady-state', 'reconfiguration', 'conformance', 'ablation', 'interference' (or comma-separated combination)."
+                    f"Unknown benchmark suite {p!r}. Valid options: 'all', 'steady-state', 'reconfiguration', 'conformance', 'ablation', 'interference', 'realworld-video' (or comma-separated combination)."
                 )
         selected_suites = tuple(parts)
 
@@ -258,6 +258,19 @@ def run_benchmarks(
             )
             row_counts["interference-samples.csv"] = _count_csv_data_rows(interference_csv)
             sha256_dict["interference-samples.csv"] = _calculate_file_sha256(interference_csv)
+
+        if "realworld-video" in selected_suites:
+            from benchmarks.runners.realworld_video import run_realworld_video_suite
+
+            rw_video_csv = os.path.join(run_dir, "realworld-video-samples.csv")
+            run_realworld_video_suite(
+                run_id=run_id,
+                output_csv_path=rw_video_csv,
+                repetition_count=repetition_count,
+                use_fake_backends=True,
+            )
+            row_counts["realworld-video-samples.csv"] = _count_csv_data_rows(rw_video_csv)
+            sha256_dict["realworld-video-samples.csv"] = _calculate_file_sha256(rw_video_csv)
 
         # Generate summary, tables, and figures for selected suite data
         summary_csv = os.path.join(run_dir, "summary.csv")

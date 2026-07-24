@@ -317,6 +317,11 @@ class ReconfigurationController:
     def instrumentation(self) -> RuntimeInstrumentation:
         return self._instrumentation
 
+    def update_registry(self, registry: RegistrySnapshot) -> None:
+        """Update active registry snapshot used for candidate compilation."""
+        with self._compiler_lock:
+            self._registry = registry
+
     def submit(self, request: ReconfigurationRequest) -> ReconfigurationRecord:
         received_at_ns = self._clock()
         target_hash = specification_hash(request.target_specification)
