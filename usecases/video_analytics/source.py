@@ -1,4 +1,4 @@
-"""File-based video source abstraction using OpenCV VideoCapture with synthetic fallback for testing."""
+"""File-based video source abstraction using torchvision.io with synthetic fallback for testing."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ __all__ = [
 
 
 class FileVideoSource(FrameSource):
-    """CPU video decoder using OpenCV VideoCapture behind a typed adapter boundary."""
+    """CPU video decoder using torchvision.io behind a typed adapter boundary."""
 
     def __init__(
         self,
@@ -26,7 +26,7 @@ class FileVideoSource(FrameSource):
         clock: Clock | None = None,
     ) -> None:
         self._config: FileVideoSourceConfig = config
-        self._capture: Any | None = None
+        self._vframes: Any | None = None
         self._metadata: VideoMetadata | None = None
         self._current_frame_id: int = 0
         self._pacer: FramePacer | None = None
@@ -64,7 +64,12 @@ class FileVideoSource(FrameSource):
             raise FileNotFoundError(f"Video file not found: {self._config.video_path}")
 
         try:
-            import cv2  # type: ignore[import-not-found,import-untyped]
+            import torchvision.io  # type: ignore[import-not-found,import-untyped]  # pyright: ignore[reportUnknownVariableType]
+
+            vframes, _, info = torchvision.io.read_video(  # pyright: ignore[reportUnknownMemberType,reportUnknownVariableType]
+                self._config.video_path,
+                pts_unit="sec",
+            )
         except ImportError:
             self._is_synthetic = True
             fps = self._config.fallback_fps or 30.0
@@ -81,30 +86,31 @@ class FileVideoSource(FrameSource):
                 enabled=self._config.enable_pacing,
             )
             return self._metadata
+        except Exception as err:
+            raise ValueError(f"Failed to open video file with torchvision: {self._config.video_path}") from err
 
-        capture = cv2.VideoCapture(self._config.video_path)  # pyright: ignore[reportUnknownMemberType,reportUnknownVariableType]
-        if not capture.isOpened():  # pyright: ignore[reportUnknownMemberType]
-            capture.release()  # pyright: ignore[reportUnknownMemberType]
-            raise ValueError(f"Failed to open video file: {self._config.video_path}")
+        frame_count = int(getattr(vframes, "shape", [0])[0])  # pyright: ignore[reportUnknownArgumentType]
+        if frame_count == 0:
+            raise ValueError(f"Failed to decode video frames from: {self._config.video_path}")
 
-        self._capture = capture
+        height = int(getattr(vframes, "shape", [0, 0])[1])  # pyright: ignore[reportUnknownArgumentType]
+        width = int(getattr(vframes, "shape", [0, 0, 0])[2])  # pyright: ignore[reportUnknownArgumentType]
 
-        width = int(float(capture.get(cv2.CAP_PROP_FRAME_WIDTH)))  # pyright: ignore[reportUnknownMemberType,reportUnknownArgumentType]
-        height = int(float(capture.get(cv2.CAP_PROP_FRAME_HEIGHT)))  # pyright: ignore[reportUnknownMemberType,reportUnknownArgumentType]
-        raw_fps = float(capture.get(cv2.CAP_PROP_FPS))  # pyright: ignore[reportUnknownMemberType,reportUnknownArgumentType]
-        raw_count = int(float(capture.get(cv2.CAP_PROP_FRAME_COUNT)))  # pyright: ignore[reportUnknownMemberType,reportUnknownArgumentType]
+        raw_fps = 0.0
+        if isinstance(info, dict):
+            fps_val: Any = info.get("video_fps", 0.0)  # pyright: ignore[reportUnknownMemberType,reportUnknownVariableType,reportUnknownArgumentType]
+            if isinstance(fps_val, (int, float)):
+                raw_fps = float(fps_val)
 
         fps = raw_fps if raw_fps > 0.0 else (self._config.fallback_fps or 0.0)
         if fps <= 0.0:
-            capture.release()  # pyright: ignore[reportUnknownMemberType]
-            self._capture = None
             raise ValueError(
                 f"Video FPS is invalid ({raw_fps}) and no fallback_fps was configured."
             )
 
-        frame_count = raw_count if raw_count > 0 else None
-        duration_ns = int(round((frame_count / fps) * 1e9)) if frame_count is not None else None
+        duration_ns = int(round((frame_count / fps) * 1e9))
 
+        self._vframes = vframes
         self._metadata = VideoMetadata(
             width=width,
             height=height,
@@ -144,30 +150,26 @@ class FileVideoSource(FrameSource):
                 height=self._metadata.height,
             )
 
-        if self._capture is None:
-            raise RuntimeError("FileVideoSource capture is not open")
+        if self._vframes is None:
+            raise RuntimeError("FileVideoSource is not open")
 
-        import cv2  # type: ignore[import-not-found,import-untyped]
-
-        ret, frame_bgr = self._capture.read()  # pyright: ignore[reportUnknownMemberType,reportUnknownVariableType]
-        if not ret or frame_bgr is None:
+        total_frames = int(getattr(self._vframes, "shape", [0])[0])
+        if self._current_frame_id >= total_frames:
             return None
 
+        frame_tensor = self._vframes[self._current_frame_id]
         self._current_frame_id += 1
         frame_id = self._current_frame_id
 
         if self._pacer is not None:
             self._pacer.pace_frame(frame_id)
 
-        # Source timestamp in nanoseconds
-        timestamp_ms = float(self._capture.get(cv2.CAP_PROP_POS_MSEC))  # pyright: ignore[reportUnknownMemberType,reportUnknownArgumentType]
-        if timestamp_ms > 0.0:
-            source_timestamp_ns = int(round(timestamp_ms * 1e6))
-        else:
-            source_timestamp_ns = int(round((frame_id - 1) * (1e9 / self._metadata.fps)))
+        source_timestamp_ns = int(round((frame_id - 1) * (1e9 / self._metadata.fps)))
 
-        # Convert frame_bgr to NDArray[np.uint8]
-        image_bgr: np.ndarray[Any, np.dtype[np.uint8]] = np.asarray(frame_bgr, dtype=np.uint8)
+        # Convert RGB tensor to BGR uint8 numpy array
+        frame_rgb_np = frame_tensor.numpy()  # pyright: ignore[reportUnknownMemberType,reportUnknownVariableType]
+        frame_bgr_np = np.ascontiguousarray(frame_rgb_np[:, :, ::-1])  # pyright: ignore[reportUnknownVariableType]
+        image_bgr: np.ndarray[Any, np.dtype[np.uint8]] = np.asarray(frame_bgr_np, dtype=np.uint8)
 
         return FramePacket(
             frame_id=frame_id,
@@ -182,11 +184,7 @@ class FileVideoSource(FrameSource):
         if self._is_closed:
             return
         self._is_closed = True
-        if self._capture is not None:
-            try:
-                self._capture.release()  # pyright: ignore[reportUnknownMemberType]
-            finally:
-                self._capture = None
+        self._vframes = None
 
     @property
     def metadata(self) -> VideoMetadata | None:
