@@ -777,14 +777,18 @@ class TestLeakDetection:
             )
 
     def test_no_tracker_instances_remain_live_after_shutdown(self) -> None:
-        """After runtime shutdown, no tracker instance should remain in the live registry."""
-        live_before = GLOBAL_TRACKER_REGISTRY.live_count()
+        tracker_instances: list[SyntheticTracker] = []
+
+        def factory() -> Processor:
+            t = make_synthetic_tracker()
+            tracker_instances.append(t)
+            return t
 
         builder = RegistryBuilder()
         builder.register(
             RegisteredProcessorType(
                 descriptor=SYNTHETIC_TRACKER_DESCRIPTOR,
-                factory=make_synthetic_tracker,
+                factory=factory,
                 stateful_descriptor=SYNTHETIC_TRACKER_STATEFUL_DESCRIPTOR,
             )
         )
@@ -805,10 +809,9 @@ class TestLeakDetection:
         # Shutdown active plan
         shutdown_plan_processors(executor.active_plan)
 
-        live_after = GLOBAL_TRACKER_REGISTRY.live_count()
-        assert live_after == live_before, (
-            f"tracker registry still shows {live_after - live_before} live instances after shutdown"
-        )
+        assert len(tracker_instances) == 1
+        assert tracker_instances[0].snapshot_state().cleanup_count == 1
+        assert id(tracker_instances[0]) not in GLOBAL_TRACKER_REGISTRY.live_ids()
 
 
 # ---------------------------------------------------------------------------

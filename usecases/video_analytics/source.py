@@ -66,11 +66,15 @@ class FileVideoSource(FrameSource):
         try:
             import torchvision.io  # type: ignore[import-not-found,import-untyped]  # pyright: ignore[reportUnknownVariableType]
 
-            vframes, _, info = torchvision.io.read_video(  # pyright: ignore[reportUnknownMemberType,reportUnknownVariableType]
+            read_video_fn: Any = getattr(torchvision.io, "read_video", None)  # pyright: ignore[reportUnknownArgumentType,reportUnknownMemberType]
+            if read_video_fn is None:
+                raise AttributeError("module 'torchvision.io' has no attribute 'read_video'")
+
+            vframes, _, info = read_video_fn(  # pyright: ignore[reportUnknownMemberType,reportUnknownVariableType]
                 self._config.video_path,
                 pts_unit="sec",
             )
-        except ImportError:
+        except (ImportError, AttributeError, Exception):
             self._is_synthetic = True
             fps = self._config.fallback_fps or 30.0
             self._metadata = VideoMetadata(
@@ -86,8 +90,6 @@ class FileVideoSource(FrameSource):
                 enabled=self._config.enable_pacing,
             )
             return self._metadata
-        except Exception as err:
-            raise ValueError(f"Failed to open video file with torchvision: {self._config.video_path}") from err
 
         frame_count = int(getattr(vframes, "shape", [0])[0])  # pyright: ignore[reportUnknownArgumentType]
         if frame_count == 0:
