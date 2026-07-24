@@ -20,11 +20,15 @@ from benchmarks.metadata import (
     write_failure_json,
     write_run_json,
 )
+from benchmarks.reporting.ablation import generate_ablation_summary_files
 from benchmarks.reporting.figures import generate_all_figures
+from benchmarks.reporting.interference import generate_interference_summary_file
 from benchmarks.reporting.load import load_benchmark_artifact
 from benchmarks.reporting.summarize import generate_summary_csv
 from benchmarks.reporting.tables import generate_all_tables
+from benchmarks.runners.ablation import run_ablation_suite
 from benchmarks.runners.conformance import run_conformance_suite
+from benchmarks.runners.interference import run_interference_suite
 from benchmarks.runners.reconfiguration import run_reconfiguration_suite
 from benchmarks.runners.reconfiguration_stress import run_reconfiguration_stress_suite
 from benchmarks.runners.steady_state import run_steady_state_suite
@@ -38,7 +42,15 @@ from benchmarks.scenarios import (
     generate_layered_dag,
     make_reconfiguration_base_spec,
 )
-from benchmarks.storage import read_reconfiguration_rows
+from benchmarks.reporting.validation import (
+    validate_experiment_artifacts,
+    write_experiment_validation_json,
+)
+from benchmarks.storage import (
+    read_ablation_rows,
+    read_interference_rows,
+    read_reconfiguration_rows,
+)
 from benchmarks.system import collect_system_environment
 from nedo_vision_dag_engine.specification import specification_hash
 from tests.support.workflows import linear, tracker_only
@@ -75,15 +87,15 @@ def run_benchmarks(
     utc_start = datetime.datetime.now(datetime.timezone.utc).isoformat()
     start_time_ns = time.monotonic_ns()
 
-    valid_suite_names = {"steady-state", "reconfiguration", "reconfiguration-stress", "conformance"}
+    valid_suite_names = {"steady-state", "reconfiguration", "reconfiguration-stress", "conformance", "ablation", "interference"}
     if suite == "all":
-        selected_suites = ("steady-state", "reconfiguration", "conformance", "reconfiguration-stress")
+        selected_suites = ("steady-state", "reconfiguration", "conformance", "reconfiguration-stress", "ablation", "interference")
     else:
         parts = [s.strip() for s in suite.split(",") if s.strip()]
         for p in parts:
             if p not in valid_suite_names:
                 raise ValueError(
-                    f"Unknown benchmark suite {p!r}. Valid options: 'all', 'steady-state', 'reconfiguration', 'conformance' (or comma-separated combination)."
+                    f"Unknown benchmark suite {p!r}. Valid options: 'all', 'steady-state', 'reconfiguration', 'conformance', 'ablation', 'interference' (or comma-separated combination)."
                 )
         selected_suites = tuple(parts)
 
@@ -107,6 +119,16 @@ def run_benchmarks(
             "stress_delay0ms",
             "stress_delay20ms",
             "stress_delay50ms",
+        ])
+    if "ablation" in selected_suites:
+        selected_scenarios.extend(["ablation_remove_stateless_node", "ablation_compatible_edit_preserving_tracker"])
+    if "interference" in selected_suites:
+        selected_scenarios.extend([
+            "interference_no_candidate_preparation",
+            "interference_sleep_preparation_20ms",
+            "interference_sleep_preparation_50ms",
+            "interference_cpu_bound_preparation_20ms",
+            "interference_cpu_bound_preparation_50ms",
         ])
 
     repetition_count = 5 if profile == "smoke" else 30
@@ -217,6 +239,26 @@ def run_benchmarks(
             row_counts["conformance-results.csv"] = _count_csv_data_rows(conformance_csv)
             sha256_dict["conformance-results.csv"] = _calculate_file_sha256(conformance_csv)
 
+        if "ablation" in selected_suites:
+            ablation_csv = os.path.join(run_dir, "ablation-samples.csv")
+            run_ablation_suite(
+                output_dir=run_dir,
+                run_id=run_id,
+                repetitions=repetition_count,
+            )
+            row_counts["ablation-samples.csv"] = _count_csv_data_rows(ablation_csv)
+            sha256_dict["ablation-samples.csv"] = _calculate_file_sha256(ablation_csv)
+
+        if "interference" in selected_suites:
+            interference_csv = os.path.join(run_dir, "interference-samples.csv")
+            run_interference_suite(
+                run_id=run_id,
+                output_csv_path=interference_csv,
+                repetition_count=repetition_count,
+            )
+            row_counts["interference-samples.csv"] = _count_csv_data_rows(interference_csv)
+            sha256_dict["interference-samples.csv"] = _calculate_file_sha256(interference_csv)
+
         # Generate summary, tables, and figures for selected suite data
         summary_csv = os.path.join(run_dir, "summary.csv")
         tables_dir = os.path.join(run_dir, "tables")
@@ -268,6 +310,25 @@ def report_cmd(run_directory: str) -> None:
     generate_summary_csv(artifact_data, summary_csv)
     t_paths = generate_all_tables(artifact_data, tables_dir)
     f_paths = generate_all_figures(artifact_data, figures_dir)
+
+    ablation_csv = os.path.join(run_directory, "ablation-samples.csv")
+    if os.path.exists(ablation_csv):
+        generate_ablation_summary_files(ablation_csv, run_directory)
+
+    interference_csv = os.path.join(run_directory, "interference-samples.csv")
+    if os.path.exists(interference_csv):
+        interference_summary_csv = os.path.join(run_directory, "interference-summary.csv")
+        generate_interference_summary_file(interference_csv, interference_summary_csv)
+
+    ablation_rows = read_ablation_rows(ablation_csv) if os.path.exists(ablation_csv) else ()
+    interference_rows = read_interference_rows(interference_csv) if os.path.exists(interference_csv) else ()
+
+    if ablation_rows or interference_rows:
+        val_report = validate_experiment_artifacts(
+            ablation_rows=ablation_rows,
+            interference_rows=interference_rows,
+        )
+        write_experiment_validation_json(val_report, os.path.join(run_directory, "experiment-validation.json"))
 
     print(f"Report generated for {run_directory}:")
     print(f"  Tables: {len(t_paths)} files")

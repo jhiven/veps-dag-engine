@@ -7,15 +7,23 @@ from dataclasses import dataclass
 __all__ = [
     "SteadyStateSampleRow",
     "ReconfigurationSampleRow",
+    "AblationSampleRow",
+    "MemorySampleRow",
     "InterferenceSampleRow",
+    "InterferenceFrameSampleRow",
     "ConformanceResultRow",
     "STEADY_STATE_HEADERS",
     "RECONFIGURATION_HEADERS",
+    "ABLATION_HEADERS",
+    "MEMORY_HEADERS",
     "INTERFERENCE_HEADERS",
+    "INTERFERENCE_FRAME_HEADERS",
     "CONFORMANCE_HEADERS",
     "CriticalPathDecomposition",
     "compute_critical_path_decomposition",
     "validate_reconfiguration_sample",
+    "validate_ablation_sample",
+    "validate_memory_sample",
 ]
 
 
@@ -275,19 +283,230 @@ def validate_reconfiguration_sample(row: ReconfigurationSampleRow, tolerance_ns:
 
 
 @dataclass(frozen=True, slots=True)
+class AblationSampleRow:
+    run_id: str
+    scenario_id: str
+    block_id: str
+    block_seed: int
+    variant: str
+    variant_name: str
+    preparation_placement: str
+    retirement_policy: str
+    edit_type: str
+    repetition: int
+    variant_order_position: int
+    candidate_graph_fingerprint: str
+    preparation_workload_id: str
+    old_plan_version: int
+    new_plan_version: int
+    validation_ns: int | None = None
+    synchronous_preparation_ns: int | None = None
+    offpath_preparation_ns: int | None = None
+    boundary_wait_ns: int | None = None
+    publication_ns: int = 0
+    synchronous_retirement_ns: int | None = None
+    deferred_retirement_ns: int | None = None
+    first_effect_wait_ns: int | None = None
+    request_to_effect_ns: int = 0
+    transition_output_gap_ns: int = 0
+    total_synchronous_ns: int = 0
+    synchronous_accounting_residual_ns: int = 0
+    synchronous_accounting_valid: bool = True
+    synchronous_accounting_invalid_reason: str | None = None
+    preparation_phase_definition: str = (
+        "offpath_preparation_ns contains full off-path candidate preparation operation "
+        "including validation, compilation, processor construction, and any synthetic preparation work"
+    )
+    preparation_accounting_valid: bool = True
+    preparation_accounting_invalid_reason: str | None = None
+    retirement_duration_ns: int = 0
+    old_plan_frames_admitted_after_request_before_commit: int = 0
+    peak_live_processors: int = 0
+    random_seed: int | None = None
+    request_phase_offset_ns: int | None = None
+
+
+def validate_ablation_sample(row: AblationSampleRow) -> None:
+    valid_variants = {
+        "variant_a": ("sync_prepare_sync_retire", "synchronous", "synchronous"),
+        "variant_b": ("offpath_prepare_sync_retire", "off_path", "synchronous"),
+        "variant_c": ("sync_prepare_deferred_retire", "synchronous", "deferred"),
+        "variant_d": ("offpath_prepare_deferred_retire", "off_path", "deferred"),
+    }
+    if row.variant not in valid_variants:
+        raise ValueError(f"Unknown ablation variant {row.variant!r}")
+
+    exp_name, exp_prep, exp_ret = valid_variants[row.variant]
+    if row.variant_name != exp_name:
+        raise ValueError(f"Variant {row.variant} variant_name must be {exp_name!r}, got {row.variant_name!r}")
+    if row.preparation_placement != exp_prep:
+        raise ValueError(f"Variant {row.variant} preparation_placement must be {exp_prep!r}, got {row.preparation_placement!r}")
+    if row.retirement_policy != exp_ret:
+        raise ValueError(f"Variant {row.variant} retirement_policy must be {exp_ret!r}, got {row.retirement_policy!r}")
+
+    for name, val in (
+        ("request_to_effect_ns", row.request_to_effect_ns),
+        ("transition_output_gap_ns", row.transition_output_gap_ns),
+        ("total_synchronous_ns", row.total_synchronous_ns),
+        ("retirement_duration_ns", row.retirement_duration_ns),
+        ("old_plan_frames_admitted_after_request_before_commit", row.old_plan_frames_admitted_after_request_before_commit),
+        ("peak_live_processors", row.peak_live_processors),
+    ):
+        if val < 0:
+            raise ValueError(f"Ablation field {name} must be non-negative, got {val}")
+
+    # Synchronous accounting residual check
+    if row.variant == "variant_a":
+        expected_sync = (row.validation_ns or 0) + (row.synchronous_preparation_ns or 0) + row.publication_ns + (row.synchronous_retirement_ns or 0)
+    elif row.variant == "variant_b":
+        expected_sync = row.publication_ns + (row.synchronous_retirement_ns or 0)
+    elif row.variant == "variant_c":
+        expected_sync = (row.validation_ns or 0) + (row.synchronous_preparation_ns or 0) + row.publication_ns
+    else:  # variant_d
+        expected_sync = row.publication_ns
+
+    residual = row.total_synchronous_ns - expected_sync
+    if row.synchronous_accounting_residual_ns != residual:
+        raise ValueError(
+            f"synchronous_accounting_residual_ns ({row.synchronous_accounting_residual_ns}) does not match total_synchronous_ns - sum ({residual})"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class MemorySampleRow:
+    run_id: str
+    scenario_id: str
+    variant: str
+    repetition: int
+    rss_before_bytes: int
+    rss_after_candidate_prepare_bytes: int
+    rss_after_commit_bytes: int
+    rss_after_retirement_bytes: int
+    observed_peak_rss_bytes: int
+    peak_rss_delta_bytes: int
+    retained_rss_delta_bytes: int
+    peak_live_processors: int
+
+
+def validate_memory_sample(row: MemorySampleRow) -> None:
+    expected_peak = max(
+        row.rss_before_bytes,
+        row.rss_after_candidate_prepare_bytes,
+        row.rss_after_commit_bytes,
+        row.rss_after_retirement_bytes,
+    )
+    if row.observed_peak_rss_bytes != expected_peak:
+        raise ValueError(f"observed_peak_rss_bytes ({row.observed_peak_rss_bytes}) must equal max checkpoint ({expected_peak})")
+    if row.peak_rss_delta_bytes != (row.observed_peak_rss_bytes - row.rss_before_bytes):
+        raise ValueError("peak_rss_delta_bytes mismatch")
+    if row.retained_rss_delta_bytes != (row.rss_after_retirement_bytes - row.rss_before_bytes):
+        raise ValueError("retained_rss_delta_bytes mismatch")
+
+
+@dataclass(frozen=True, slots=True)
+class InterferenceFrameSampleRow:
+    run_id: str
+    scenario_id: str
+    preparation_category: str
+    target_window_ns: int
+    repetition: int
+    phase: str
+    frame_id: int
+    plan_version: int
+    admission_timestamp_ns: int
+    completion_timestamp_ns: int
+    frame_latency_ns: int
+    queue_occupancy: float
+    dropped: bool
+    duplicated: bool
+
+
+@dataclass(frozen=True, slots=True)
 class InterferenceSampleRow:
     run_id: str
     scenario_id: str
     preparation_category: str
+    target_window_ns: int
     repetition: int
-    frame_latency_before_median_ns: float
-    frame_latency_during_median_ns: float
-    frame_latency_during_p95_ns: float
-    frame_latency_after_median_ns: float
-    frames_completed_during_preparation: int
-    throughput_before_fps: float
-    throughput_during_fps: float
-    throughput_after_fps: float
+    execution_order_position: int
+    random_seed: int
+    configured_offered_rate_fps: float
+    before_window_start_ns: int
+    before_window_end_ns: int
+    during_window_start_ns: int
+    during_window_end_ns: int
+    after_window_start_ns: int
+    after_window_end_ns: int
+    measured_before_window_duration_ns: int
+    measured_during_window_duration_ns: int
+    measured_after_window_duration_ns: int
+    producer_attempted_frames_before: int
+    producer_attempted_frames_during: int
+    producer_attempted_frames_after: int
+    producer_emitted_frames_before: int
+    producer_emitted_frames_during: int
+    producer_emitted_frames_after: int
+    producer_skipped_deadlines_before: int
+    producer_skipped_deadlines_during: int
+    producer_skipped_deadlines_after: int
+    producer_schedule_lateness_median_ns_before: float
+    producer_schedule_lateness_p95_ns_before: float
+    producer_schedule_lateness_median_ns_during: float
+    producer_schedule_lateness_p95_ns_during: float
+    producer_schedule_lateness_median_ns_after: float
+    producer_schedule_lateness_p95_ns_after: float
+    admitted_frames_before: int
+    admitted_frames_during: int
+    admitted_frames_after: int
+    completed_frames_before: int
+    completed_frames_during: int
+    completed_frames_after: int
+    frame_latency_before_median_ns: float | None
+    frame_latency_before_p95_ns: float | None
+    frame_latency_during_median_ns: float | None
+    frame_latency_during_p95_ns: float | None
+    frame_latency_after_median_ns: float | None
+    frame_latency_after_p95_ns: float | None
+    p95_degradation_vs_before_pct: float | None
+    median_degradation_vs_before_pct: float | None
+    frames_completed_during_window: int
+    frames_completed_while_preparation_active: int | None
+    old_plan_frames_completed: int
+    admission_throughput_before_fps: float
+    admission_throughput_during_fps: float
+    admission_throughput_after_fps: float
+    completion_throughput_before_fps: float
+    completion_throughput_during_fps: float
+    completion_throughput_after_fps: float
+    admission_rate_ratio_vs_before: float | None
+    completion_rate_ratio_vs_before: float | None
+    latency_interpretation_confounded: bool
+    latency_interpretation_confounded_reason: str | None
+    within_run_admission_shift_flag: bool = False
+    within_run_admission_shift_reason: str | None = None
+    backlog_frames_at_during_start: int = 0
+    backlog_frames_at_during_end: int = 0
+    backlog_frames_drained_after_window: int = 0
+    frames_emitted_during_but_admitted_after: int = 0
+    frames_admitted_during_but_emitted_before: int = 0
+    flow_accounting_valid: bool = True
+    flow_accounting_residual_frames: int = 0
+    flow_accounting_invalid_reason: str | None = None
+    queue_occupancy_during_median: float = 0.0
+    queue_occupancy_during_p95: float = 0.0
+    dropped_frames: int = 0
+    duplicated_frames: int = 0
+    valid_for_tail_latency: bool = True
+    invalid_reason: str | None = None
+    target_preparation_duration_ns: int | None = None
+    actual_preparation_duration_ns: int = 0
+    preparation_checksum: int | None = None
+    duration_valid: bool = True
+    duration_relative_error: float = 0.0
+    raw_frame_count_matches_summary: bool = True
+    phase_timestamp_bounds_valid: bool = True
+    throughput_accounting_valid: bool = True
+    throughput_accounting_invalid_reason: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -378,19 +597,246 @@ RECONFIGURATION_HEADERS: tuple[str, ...] = (
     "instrumented_duration_outside_effect_window_ns",
 )
 
+ABLATION_HEADERS: tuple[str, ...] = (
+    "run_id",
+    "scenario_id",
+    "block_id",
+    "block_seed",
+    "variant",
+    "variant_name",
+    "preparation_placement",
+    "retirement_policy",
+    "edit_type",
+    "repetition",
+    "variant_order_position",
+    "candidate_graph_fingerprint",
+    "preparation_workload_id",
+    "old_plan_version",
+    "new_plan_version",
+    "validation_ns",
+    "synchronous_preparation_ns",
+    "offpath_preparation_ns",
+    "boundary_wait_ns",
+    "publication_ns",
+    "synchronous_retirement_ns",
+    "deferred_retirement_ns",
+    "first_effect_wait_ns",
+    "request_to_effect_ns",
+    "transition_output_gap_ns",
+    "total_synchronous_ns",
+    "synchronous_accounting_residual_ns",
+    "synchronous_accounting_valid",
+    "synchronous_accounting_invalid_reason",
+    "preparation_phase_definition",
+    "preparation_accounting_valid",
+    "preparation_accounting_invalid_reason",
+    "retirement_duration_ns",
+    "old_plan_frames_admitted_after_request_before_commit",
+    "peak_live_processors",
+    "random_seed",
+    "request_phase_offset_ns",
+)
+
+ABLATION_CONTRAST_HEADERS: tuple[str, ...] = (
+    "scenario_id",
+    "contrast",
+    "family",
+    "metric",
+    "pair_count",
+    "median_left",
+    "median_right",
+    "paired_median_difference",
+    "paired_median_ratio",
+    "paired_log_ratio_mean",
+    "paired_bootstrap_ci_95_lower",
+    "paired_bootstrap_ci_95_upper",
+    "raw_p_value",
+    "holm_adjusted_p_value",
+)
+
+ABLATION_STRATIFIED_HEADERS: tuple[str, ...] = (
+    "scenario_id",
+    "frame_group",
+    "count",
+    "request_to_effect_median_ns",
+    "request_to_effect_p95_ns",
+    "transition_output_gap_median_ns",
+    "transition_output_gap_p95_ns",
+    "total_synchronous_median_ns",
+    "total_synchronous_p95_ns",
+    "offpath_preparation_median_ns",
+    "offpath_preparation_p95_ns",
+    "deferred_retirement_median_ns",
+    "deferred_retirement_p95_ns",
+)
+
+MEMORY_HEADERS: tuple[str, ...] = (
+    "run_id",
+    "scenario_id",
+    "variant",
+    "repetition",
+    "rss_before_bytes",
+    "rss_after_candidate_prepare_bytes",
+    "rss_after_commit_bytes",
+    "rss_after_retirement_bytes",
+    "observed_peak_rss_bytes",
+    "peak_rss_delta_bytes",
+    "retained_rss_delta_bytes",
+    "peak_live_processors",
+)
+
+INTERFERENCE_FRAME_HEADERS: tuple[str, ...] = (
+    "run_id",
+    "scenario_id",
+    "preparation_category",
+    "target_window_ns",
+    "repetition",
+    "phase",
+    "frame_id",
+    "plan_version",
+    "admission_timestamp_ns",
+    "completion_timestamp_ns",
+    "frame_latency_ns",
+    "queue_occupancy",
+    "dropped",
+    "duplicated",
+)
+
 INTERFERENCE_HEADERS: tuple[str, ...] = (
     "run_id",
     "scenario_id",
     "preparation_category",
+    "target_window_ns",
     "repetition",
+    "execution_order_position",
+    "random_seed",
+    "configured_offered_rate_fps",
+    "before_window_start_ns",
+    "before_window_end_ns",
+    "during_window_start_ns",
+    "during_window_end_ns",
+    "after_window_start_ns",
+    "after_window_end_ns",
+    "measured_before_window_duration_ns",
+    "measured_during_window_duration_ns",
+    "measured_after_window_duration_ns",
+    "producer_attempted_frames_before",
+    "producer_attempted_frames_during",
+    "producer_attempted_frames_after",
+    "producer_emitted_frames_before",
+    "producer_emitted_frames_during",
+    "producer_emitted_frames_after",
+    "producer_skipped_deadlines_before",
+    "producer_skipped_deadlines_during",
+    "producer_skipped_deadlines_after",
+    "producer_schedule_lateness_median_ns_before",
+    "producer_schedule_lateness_p95_ns_before",
+    "producer_schedule_lateness_median_ns_during",
+    "producer_schedule_lateness_p95_ns_during",
+    "producer_schedule_lateness_median_ns_after",
+    "producer_schedule_lateness_p95_ns_after",
+    "admitted_frames_before",
+    "admitted_frames_during",
+    "admitted_frames_after",
+    "completed_frames_before",
+    "completed_frames_during",
+    "completed_frames_after",
     "frame_latency_before_median_ns",
+    "frame_latency_before_p95_ns",
     "frame_latency_during_median_ns",
     "frame_latency_during_p95_ns",
     "frame_latency_after_median_ns",
-    "frames_completed_during_preparation",
-    "throughput_before_fps",
-    "throughput_during_fps",
-    "throughput_after_fps",
+    "frame_latency_after_p95_ns",
+    "p95_degradation_vs_before_pct",
+    "median_degradation_vs_before_pct",
+    "frames_completed_during_window",
+    "frames_completed_while_preparation_active",
+    "old_plan_frames_completed",
+    "admission_throughput_before_fps",
+    "admission_throughput_during_fps",
+    "admission_throughput_after_fps",
+    "completion_throughput_before_fps",
+    "completion_throughput_during_fps",
+    "completion_throughput_after_fps",
+    "admission_rate_ratio_vs_before",
+    "completion_rate_ratio_vs_before",
+    "latency_interpretation_confounded",
+    "latency_interpretation_confounded_reason",
+    "within_run_admission_shift_flag",
+    "within_run_admission_shift_reason",
+    "backlog_frames_at_during_start",
+    "backlog_frames_at_during_end",
+    "backlog_frames_drained_after_window",
+    "frames_emitted_during_but_admitted_after",
+    "frames_admitted_during_but_emitted_before",
+    "flow_accounting_valid",
+    "flow_accounting_residual_frames",
+    "flow_accounting_invalid_reason",
+    "queue_occupancy_during_median",
+    "queue_occupancy_during_p95",
+    "dropped_frames",
+    "duplicated_frames",
+    "valid_for_tail_latency",
+    "invalid_reason",
+    "target_preparation_duration_ns",
+    "actual_preparation_duration_ns",
+    "preparation_checksum",
+    "duration_valid",
+    "duration_relative_error",
+    "raw_frame_count_matches_summary",
+    "phase_timestamp_bounds_valid",
+    "throughput_accounting_valid",
+    "throughput_accounting_invalid_reason",
+)
+
+INTERFERENCE_CONTRAST_HEADERS: tuple[str, ...] = (
+    "repetition",
+    "target_window_ns",
+    "treatment_category",
+    "control_category",
+    "treatment_execution_order_position",
+    "control_execution_order_position",
+    "treatment_during_median_ns",
+    "control_during_median_ns",
+    "paired_median_difference_ns",
+    "paired_median_ratio",
+    "treatment_during_p95_ns",
+    "control_during_p95_ns",
+    "paired_p95_difference_ns",
+    "paired_p95_ratio",
+    "treatment_admission_throughput_fps",
+    "control_admission_throughput_fps",
+    "paired_admission_throughput_ratio",
+    "treatment_completion_throughput_fps",
+    "control_completion_throughput_fps",
+    "paired_completion_throughput_ratio",
+    "treatment_dropped_frames",
+    "control_dropped_frames",
+    "treatment_queue_occupancy_p95",
+    "control_queue_occupancy_p95",
+    "within_run_admission_shift_flag",
+    "matched_control_confounded",
+    "matched_control_confounded_reason",
+)
+
+INTERFERENCE_AGGREGATE_CONTRAST_HEADERS: tuple[str, ...] = (
+    "treatment_category",
+    "target_window_ns",
+    "filter_scope",
+    "total_pair_count",
+    "confounded_pair_count",
+    "non_confounded_pair_count",
+    "included_pair_count",
+    "median_paired_p95_ratio",
+    "p95_paired_p95_ratio",
+    "bootstrap_ci_95_lower_p95_ratio",
+    "bootstrap_ci_95_upper_p95_ratio",
+    "median_paired_admission_throughput_ratio",
+    "bootstrap_ci_95_lower_admission_ratio",
+    "bootstrap_ci_95_upper_admission_ratio",
+    "median_paired_completion_throughput_ratio",
+    "bootstrap_ci_95_lower_completion_ratio",
+    "bootstrap_ci_95_upper_completion_ratio",
 )
 
 CONFORMANCE_HEADERS: tuple[str, ...] = (

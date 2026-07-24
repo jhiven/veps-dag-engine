@@ -330,9 +330,10 @@ def _run_stress_repetition(
             (t_reconstruct_start, t_reconstruct_end),
             (t_pub_start, t_pub_end),
             (t_restart_start, t_restart_end),
-            (t_restart_end, first_new_frame.admission_ns),
-            (first_new_frame.admission_ns, first_new_frame.completion_ns),
         ]
+        if first_new_frame.admission_ns >= t_restart_end:
+            phase_intervals.append((t_restart_end, first_new_frame.admission_ns))
+        phase_intervals.append((first_new_frame.admission_ns, first_new_frame.completion_ns))
         decomp = compute_critical_path_decomposition(
             t_request=t_request,
             t_effect=first_new_frame.completion_ns,
@@ -539,9 +540,10 @@ def _run_stress_repetition(
             (t_pub_start, t_pub_end),
             (t_ret_start, t_ret_end),
             (t_restart_start, t_restart_end),
-            (t_restart_end, first_new_frame.admission_ns),
-            (first_new_frame.admission_ns, first_new_frame.completion_ns),
         ]
+        if first_new_frame.admission_ns >= t_restart_end:
+            phase_intervals.append((t_restart_end, first_new_frame.admission_ns))
+        phase_intervals.append((first_new_frame.admission_ns, first_new_frame.completion_ns))
         decomp = compute_critical_path_decomposition(
             t_request=t_request,
             t_effect=first_new_frame.completion_ns,

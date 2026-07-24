@@ -18,7 +18,7 @@ build-backend = "uv_build"
 typeCheckingMode = "strict"
 
 [dependency-groups]
-benchmark = ["matplotlib>=3.11.1", "numpy>=2.5.1", "scipy>=1.18.0"]
+benchmark = ["matplotlib>=3.11.1", "numpy>=2.5.1", "psutil>=6.0.0", "scipy>=1.18.0"]
 dev = ["pytest>=9.1.1", "scipy-stubs>=1.18.0.1"]
 
 [tool.pytest.ini_options]

@@ -57,6 +57,8 @@ class SystemEnvironment:
     dirty_working_tree: bool
     python_implementation: str
     python_version: str
+    free_threaded_build: bool
+    gil_enabled: bool
     uv_lock_sha256: str
     operating_system: str
     kernel_version: str
@@ -207,6 +209,8 @@ def collect_system_environment(pin_cpus: tuple[int, ...] | None = None) -> Syste
         dirty_working_tree=_get_dirty_working_tree(),
         python_implementation=platform.python_implementation(),
         python_version=platform.python_version(),
+        free_threaded_build=is_free_threaded_build(),
+        gil_enabled=is_gil_enabled(),
         uv_lock_sha256=_get_uv_lock_sha256(),
         operating_system=sys.platform,
         kernel_version=platform.release(),
