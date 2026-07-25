@@ -5,8 +5,10 @@ from __future__ import annotations
 import time
 from typing import Any
 
+import numpy as np
+
 from usecases.video_analytics.config import RTDETRConfig
-from usecases.video_analytics.contracts import BoundingBox, Detection, DetectorBackend, FramePacket
+from usecases.video_analytics.contracts import BackendKind, BoundingBox, Detection, DetectorBackend, FramePacket
 
 __all__ = [
     "RTDETRDetectorBackend",
@@ -31,6 +33,10 @@ class RTDETRDetectorBackend(DetectorBackend):
         self.device_transfer_completed_ns: int = 0
         self.warmup_completed_ns: int = 0
         self.backend_ready_ns: int = 0
+
+    @property
+    def backend_kind(self) -> BackendKind:
+        return BackendKind.PRODUCTION
 
     @property
     def model_id(self) -> str:
@@ -81,7 +87,8 @@ class RTDETRDetectorBackend(DetectorBackend):
         elif self._config.dtype == "bfloat16":
             torch_dtype = torch.bfloat16  # pyright: ignore[reportUnknownMemberType,reportUnknownVariableType]
 
-        model.to(device=device, dtype=torch_dtype)  # pyright: ignore[reportUnknownMemberType]
+        to_fn: Any = getattr(model, "to")
+        to_fn(device, torch_dtype)
         self.device_transfer_completed_ns = time.monotonic_ns()
 
         self._model = model
@@ -115,11 +122,13 @@ class RTDETRDetectorBackend(DetectorBackend):
             raise RuntimeError("RTDETRDetectorBackend must be prepared before calling infer()")
 
         import torch  # type: ignore[import-not-found,import-untyped]
+        from PIL import Image  # type: ignore[import-not-found,import-untyped]
 
-        # Convert BGR image to RGB
-        image_rgb = frame.image_bgr[:, :, ::-1]
+        # Convert BGR image to RGB PIL Image
+        image_rgb: np.ndarray[Any, Any] = np.ascontiguousarray(frame.image_bgr[:, :, ::-1])
+        image_pil = Image.fromarray(image_rgb)
 
-        inputs = self._image_processor(images=image_rgb, return_tensors="pt")  # pyright: ignore[reportUnknownMemberType,reportUnknownVariableType]
+        inputs = self._image_processor(images=image_pil, return_tensors="pt")  # pyright: ignore[reportUnknownMemberType,reportUnknownVariableType]
         device = torch.device(self._config.device)  # pyright: ignore[reportUnknownMemberType,reportUnknownVariableType]
         inputs = {k: v.to(device) for k, v in inputs.items()}  # pyright: ignore[reportUnknownMemberType,reportUnknownVariableType]
 
@@ -183,6 +192,10 @@ class FakeDetectorBackend(DetectorBackend):
         self.is_closed: bool = False
 
     @property
+    def backend_kind(self) -> BackendKind:
+        return BackendKind.FAKE
+
+    @property
     def model_id(self) -> str:
         return self._model_id
 
@@ -196,3 +209,4 @@ class FakeDetectorBackend(DetectorBackend):
 
     def close(self) -> None:
         self.is_closed = True
+

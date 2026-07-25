@@ -87,6 +87,7 @@ class DetectorProcessor(Processor):
         batch = DetectionBatch(
             frame_id=frame_packet.frame_id,
             source_timestamp_ns=frame_packet.source_timestamp_ns,
+            admission_timestamp_ns=context.admitted_at_ns,
             detector_id=self.backend.model_id,
             plan_version=context.plan_version,
             detections=detections,

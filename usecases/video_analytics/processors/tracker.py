@@ -81,9 +81,11 @@ class TrackerProcessor(StatefulProcessor):
         res = TrackBatch(
             frame_id=batch.frame_id,
             source_timestamp_ns=batch.source_timestamp_ns,
+            admission_timestamp_ns=batch.admission_timestamp_ns,
             detector_id=batch.detector_id,
             tracker_instance_id=self.backend.instance_id,
             tracks=tracks,
+            plan_version=batch.plan_version,
         )
         return res
 

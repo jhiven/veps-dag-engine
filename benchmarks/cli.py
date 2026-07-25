@@ -261,13 +261,15 @@ def run_benchmarks(
 
         if "realworld-video" in selected_suites:
             from benchmarks.runners.realworld_video import run_realworld_video_suite
+            from usecases.video_analytics.contracts import ExecutionMode
 
             rw_video_csv = os.path.join(run_dir, "realworld-video-samples.csv")
             run_realworld_video_suite(
                 run_id=run_id,
                 output_csv_path=rw_video_csv,
                 repetition_count=repetition_count,
-                use_fake_backends=True,
+                use_fake_backends=(profile == "smoke"),
+                execution_mode=ExecutionMode.SMOKE if profile == "smoke" else ExecutionMode.PUBLICATION,
             )
             row_counts["realworld-video-samples.csv"] = _count_csv_data_rows(rw_video_csv)
             sha256_dict["realworld-video-samples.csv"] = _calculate_file_sha256(rw_video_csv)

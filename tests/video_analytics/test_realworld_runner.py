@@ -19,7 +19,7 @@ def test_realworld_video_runner_smoke() -> None:
             video_path="fake_video.mp4",
             repetition_count=2,
             update_frame_id=5,
-            total_frames=15,
+            total_frames=30,
             use_fake_backends=True,
         )
 

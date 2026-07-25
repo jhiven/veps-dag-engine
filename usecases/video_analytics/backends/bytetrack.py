@@ -10,6 +10,7 @@ from scipy.optimize import linear_sum_assignment
 
 from usecases.video_analytics.config import ByteTrackConfig
 from usecases.video_analytics.contracts import (
+    BackendKind,
     BoundingBox,
     Detection,
     Track,
@@ -63,6 +64,10 @@ class ByteTrackerBackend(TrackerBackend):
         self._next_track_id: int = 1
         self._tracks: dict[int, _ActiveTrackState] = {}
         self._is_closed: bool = False
+
+    @property
+    def backend_kind(self) -> BackendKind:
+        return BackendKind.PRODUCTION
 
     @property
     def instance_id(self) -> str:
@@ -214,6 +219,10 @@ class FakeTrackerBackend(TrackerBackend):
         self._reset_count: int = 0
         self._processed_frame_count: int = 0
         self.is_closed: bool = False
+
+    @property
+    def backend_kind(self) -> BackendKind:
+        return BackendKind.FAKE
 
     @property
     def instance_id(self) -> str:

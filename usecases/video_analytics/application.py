@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import logging
 import time
+from dataclasses import dataclass
 from types import TracebackType
 from typing import Literal
+
+import numpy as np
 
 from nedo_vision_dag_engine.compiler import CompilationFailure, StateDirective, WorkflowCompiler
 from nedo_vision_dag_engine.executor import PipelineExecutor
@@ -18,7 +21,10 @@ from nedo_vision_dag_engine.reconfiguration import (
 
 from usecases.video_analytics.config import RTDETRConfig, VideoAnalyticsConfig
 from usecases.video_analytics.contracts import (
+    BackendKind,
     DetectorBackend,
+    ExecutionMode,
+    FramePacket,
     FrameSource,
     ResultSink,
     TrackerBackend,
@@ -36,7 +42,16 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "VideoAnalyticsApplication",
+    "SwapTiming",
 ]
+
+
+@dataclass(frozen=True, slots=True)
+class SwapTiming:
+    request_timestamp_ns: int
+    candidate_prep_start_ns: int
+    candidate_prep_end_ns: int
+    publication_timestamp_ns: int
 
 
 class VideoAnalyticsApplication:
@@ -50,8 +65,10 @@ class VideoAnalyticsApplication:
         initial_detector_backend: DetectorBackend | None = None,
         candidate_detector_backend: DetectorBackend | None = None,
         tracker_backend: TrackerBackend | None = None,
+        execution_mode: ExecutionMode = ExecutionMode.SMOKE,
     ) -> None:
         self.config: VideoAnalyticsConfig = config
+        self.execution_mode: ExecutionMode = execution_mode
         self._source: FrameSource | None = source
         self._sink: ResultSink | None = sink
         self._initial_detector_backend: DetectorBackend | None = initial_detector_backend
@@ -67,6 +84,35 @@ class VideoAnalyticsApplication:
         self._is_opened: bool = False
         self._is_closed: bool = False
         self._processed_frames: int = 0
+        self._last_swap_timing: SwapTiming | None = None
+
+    def validate_publication_mode(self) -> None:
+        """Validate that all injected/constructed components satisfy publication contracts."""
+        if self.execution_mode is not ExecutionMode.PUBLICATION:
+            return
+
+        if self.config.initial_detector.device.startswith("cuda") or self.config.candidate_detector.device.startswith("cuda"):
+            import torch  # type: ignore[import-not-found,import-untyped]
+
+            if not torch.cuda.is_available():  # pyright: ignore[reportUnknownMemberType]
+                raise RuntimeError(
+                    f"CUDA device {self.config.initial_detector.device!r} was requested in publication mode, but CUDA is not available."
+                )
+
+        if self._source is not None and getattr(self._source, "backend_kind", None) is not BackendKind.PRODUCTION:
+            raise ValueError("Publication mode rejects fake or synthetic FrameSource.")
+
+        if self._initial_detector_backend is not None and getattr(self._initial_detector_backend, "backend_kind", None) is not BackendKind.PRODUCTION:
+            raise ValueError("Publication mode rejects fake initial DetectorBackend.")
+
+        if self._candidate_detector_backend is not None and getattr(self._candidate_detector_backend, "backend_kind", None) is not BackendKind.PRODUCTION:
+            raise ValueError("Publication mode rejects fake candidate DetectorBackend.")
+
+        if self._tracker_backend is not None and getattr(self._tracker_backend, "backend_kind", None) is not BackendKind.PRODUCTION:
+            raise ValueError("Publication mode rejects fake TrackerBackend.")
+
+        if self._sink is not None and getattr(self._sink, "backend_kind", None) is not BackendKind.PRODUCTION:
+            raise ValueError("Publication mode rejects fake ResultSink.")
 
     def open(self) -> VideoMetadata:
         """Open video source, construct initial DAG, and initialize execution pipeline."""
@@ -74,15 +120,10 @@ class VideoAnalyticsApplication:
             raise RuntimeError("Application is already opened or closed")
 
         if self._source is None:
-            self._source = FileVideoSource(self.config.source)
-        self._metadata = self._source.open()
-
-        if self.config.total_frames_to_process is not None:
-            verify_video_length(self._metadata, self.config.total_frames_to_process)
-
-        if self._sink is None:
-            self._sink = NullSink(self.config.sink)
-        self._sink.open(self._metadata)
+            self._source = FileVideoSource(
+                self.config.source,
+                require_production=(self.execution_mode is ExecutionMode.PUBLICATION),
+            )
 
         # Initialize detector backend if not injected
         if self._initial_detector_backend is None:
@@ -95,6 +136,18 @@ class VideoAnalyticsApplication:
             from usecases.video_analytics.backends.bytetrack import ByteTrackerBackend
 
             self._tracker_backend = ByteTrackerBackend(self.config.tracker)
+
+        if self._sink is None:
+            self._sink = NullSink(self.config.sink)
+
+        self.validate_publication_mode()
+
+        self._metadata = self._source.open()
+
+        if self.config.total_frames_to_process is not None:
+            verify_video_length(self._metadata, self.config.total_frames_to_process)
+
+        self._sink.open(self._metadata)
 
         # Build initial specification & registry
         spec = build_video_analytics_specification(
@@ -154,7 +207,7 @@ class VideoAnalyticsApplication:
         new_detector_config: RTDETRConfig | None = None,
         mechanism: Literal["VEPS", "Pause", "Stop"] = "VEPS",
         candidate_backend: DetectorBackend | None = None,
-    ) -> None:
+    ) -> SwapTiming:
         """Perform live or offline detector replacement using configured mechanism."""
         if not self._is_opened or self._is_closed:
             raise RuntimeError("Application must be opened before requesting detector swap")
@@ -170,6 +223,8 @@ class VideoAnalyticsApplication:
 
             cand_backend = RTDETRDetectorBackend(det_config)
             self._candidate_detector_backend = cand_backend
+
+        self.validate_publication_mode()
 
         assert self._source is not None
         assert self._sink is not None
@@ -195,6 +250,8 @@ class VideoAnalyticsApplication:
             tracker_config=self.config.tracker,
         )
 
+        t_req = time.monotonic_ns()
+
         if mechanism == "VEPS":
             req_id = f"swap_to_{det_config.model_id}_{time.monotonic_ns()}"
             reconfig_req = ReconfigurationRequest(
@@ -202,7 +259,7 @@ class VideoAnalyticsApplication:
                 base_version=self._executor.active_plan.version,
                 target_specification=candidate_spec,
                 state_directive=StateDirective(),
-                submitted_at_ns=time.monotonic_ns(),
+                submitted_at_ns=t_req,
             )
             self._controller.update_registry(candidate_registry)
             self._controller.submit(reconfig_req)
@@ -226,15 +283,25 @@ class VideoAnalyticsApplication:
                 if res.status is not FrameStatus.COMPLETED:
                     break
                 self._processed_frames += 1
+                time.sleep(0.001)
 
             rec_ready = self._controller.wait_for_status(
                 req_id,
                 statuses=frozenset({ReconfigurationStatus.READY, ReconfigurationStatus.COMMITTED}),
-                timeout_seconds=5.0,
+                timeout_seconds=60.0,
             )
-            if rec_ready is not None and rec_ready.status is ReconfigurationStatus.READY:
+            if rec_ready is None or rec_ready.status not in (ReconfigurationStatus.READY, ReconfigurationStatus.COMMITTED):
+                fail_reason = rec_ready.failure_reason if rec_ready else "Timeout waiting for READY/COMMITTED"
+                raise RuntimeError(f"VEPS candidate preparation failed: {fail_reason}")
+
+            if rec_ready.status is ReconfigurationStatus.READY:
                 self._controller.commit_ready()
-                self._current_plan_version += 1
+            rec_committed = self._controller.record(req_id)
+            self._current_plan_version += 1
+
+            t_prep_start = rec_committed.preparation_started_ns or t_req
+            t_prep_end = rec_committed.preparation_completed_ns or rec_committed.ready_ns or t_prep_start
+            t_pub = rec_committed.commit_ns or rec_committed.ready_ns or t_prep_end
 
         elif mechanism == "Pause":
             req_id = f"pause_swap_{det_config.model_id}_{time.monotonic_ns()}"
@@ -243,23 +310,48 @@ class VideoAnalyticsApplication:
                 base_version=self._executor.active_plan.version,
                 target_specification=candidate_spec,
                 state_directive=StateDirective(),
-                submitted_at_ns=time.monotonic_ns(),
+                submitted_at_ns=t_req,
             )
             self._controller.update_registry(candidate_registry)
             self._controller.submit(reconfig_req)
             rec_ready = self._controller.wait_for_status(
                 req_id,
                 statuses=frozenset({ReconfigurationStatus.READY, ReconfigurationStatus.COMMITTED}),
-                timeout_seconds=10.0,
+                timeout_seconds=60.0,
             )
-            if rec_ready is not None and rec_ready.status is ReconfigurationStatus.READY:
+            if rec_ready is None or rec_ready.status not in (ReconfigurationStatus.READY, ReconfigurationStatus.COMMITTED):
+                fail_reason = rec_ready.failure_reason if rec_ready else "Timeout waiting for READY/COMMITTED"
+                raise RuntimeError(f"Pause candidate preparation failed: {fail_reason}")
+
+            if rec_ready.status is ReconfigurationStatus.READY:
                 self._controller.commit_ready()
-                self._current_plan_version += 1
+            rec_committed = self._controller.record(req_id)
+            self._current_plan_version += 1
+
+            t_prep_start = rec_committed.preparation_started_ns or t_req
+            t_prep_end = rec_committed.preparation_completed_ns or rec_committed.ready_ns or t_prep_start
+            t_pub = rec_committed.commit_ns or rec_committed.ready_ns or t_prep_end
 
         elif mechanism == "Stop":
+            t_prep_start = time.monotonic_ns()
+            dummy_bgr = np.zeros((480, 640, 3), dtype=np.uint8)
+            sample_packet = FramePacket(
+                frame_id=1,
+                source_timestamp_ns=0,
+                image_bgr=dummy_bgr,
+                width=640,
+                height=480,
+            )
+            cand_backend.prepare(sample_packet)
+            t_prep_end = time.monotonic_ns()
+
+            old_plan = self._executor.active_plan
             self._controller.close()
-            self._compiler = WorkflowCompiler("0.1.0")
-            cand_res = self._compiler.compile(candidate_spec, registry=candidate_registry)
+            cand_res = self._compiler.compile(
+                candidate_spec,
+                registry=candidate_registry,
+                previous_plan=old_plan,
+            )
             if isinstance(cand_res, CompilationFailure):
                 raise RuntimeError(f"Stop-rebuild compilation failed: {cand_res.reason}")
 
@@ -271,6 +363,16 @@ class VideoAnalyticsApplication:
                 compiler=self._compiler,
                 registry=candidate_registry,
             )
+            t_pub = time.monotonic_ns()
+
+        timing = SwapTiming(
+            request_timestamp_ns=t_req,
+            candidate_prep_start_ns=t_prep_start,
+            candidate_prep_end_ns=t_prep_end,
+            publication_timestamp_ns=t_pub,
+        )
+        self._last_swap_timing = timing
+        return timing
 
     def process_remaining(self) -> int:
         """Process all remaining frames in the video source."""

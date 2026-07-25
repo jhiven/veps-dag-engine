@@ -8,7 +8,11 @@ from typing import Protocol, runtime_checkable
 import numpy as np
 import numpy.typing as npt
 
+from enum import Enum
+
 __all__ = [
+    "ExecutionMode",
+    "BackendKind",
     "VideoMetadata",
     "FramePacket",
     "BoundingBox",
@@ -23,6 +27,20 @@ __all__ = [
     "DetectorBackend",
     "TrackerBackend",
 ]
+
+
+class ExecutionMode(str, Enum):
+    """Execution profile mode for video analytics benchmark."""
+
+    SMOKE = "smoke"
+    PUBLICATION = "publication"
+
+
+class BackendKind(str, Enum):
+    """Backend implementation kind indicating fake or production status."""
+
+    FAKE = "fake"
+    PRODUCTION = "production"
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,6 +106,7 @@ class DetectionBatch:
     detector_id: str
     plan_version: int | None
     detections: tuple[Detection, ...]
+    admission_timestamp_ns: int = 0
 
     @property
     def output(self) -> DetectionBatch:
@@ -115,6 +134,8 @@ class TrackBatch:
     detector_id: str
     tracker_instance_id: str
     tracks: tuple[Track, ...]
+    admission_timestamp_ns: int = 0
+    plan_version: int | None = None
 
     @property
     def output(self) -> TrackBatch:
@@ -146,6 +167,8 @@ class TrackerStateSnapshot:
 class FrameSource(Protocol):
     """Protocol for frame sources."""
 
+    @property
+    def backend_kind(self) -> BackendKind: ...
     def open(self) -> VideoMetadata: ...
     def read(self) -> FramePacket | None: ...
     def close(self) -> None: ...
@@ -155,6 +178,8 @@ class FrameSource(Protocol):
 class ResultSink(Protocol):
     """Protocol for result sinks."""
 
+    @property
+    def backend_kind(self) -> BackendKind: ...
     def open(self, metadata: VideoMetadata) -> None: ...
     def consume(self, result: TrackBatch) -> None: ...
     def close(self) -> None: ...
@@ -164,6 +189,8 @@ class ResultSink(Protocol):
 class DetectorBackend(Protocol):
     """Protocol for detection backends."""
 
+    @property
+    def backend_kind(self) -> BackendKind: ...
     @property
     def model_id(self) -> str: ...
     def prepare(self, sample_frame: FramePacket) -> None: ...
@@ -175,6 +202,8 @@ class DetectorBackend(Protocol):
 class TrackerBackend(Protocol):
     """Protocol for tracking backends."""
 
+    @property
+    def backend_kind(self) -> BackendKind: ...
     @property
     def instance_id(self) -> str: ...
     @property
@@ -189,3 +218,4 @@ class TrackerBackend(Protocol):
     ) -> tuple[Track, ...]: ...
     def snapshot(self) -> TrackerStateSnapshot: ...
     def close(self) -> None: ...
+
