@@ -27,6 +27,7 @@ from usecases.video_analytics.gpu_memory import PyTorchCUDAMemorySampler
 from usecases.video_analytics.ingress import BoundedIngressQueue, RTSPCaptureIngress
 from usecases.video_analytics.metrics import FlowMetricsSummary, calculate_flow_metrics
 from usecases.video_analytics.publisher import FFmpegRTSPPublisher
+from usecases.video_analytics.source import FileVideoSource, RTSPVideoSource
 
 __all__ = [
     "VideoAnalyticsApplication",
@@ -49,6 +50,8 @@ __all__ = [
     "FFmpegRTSPPublisher",
     "BoundedIngressQueue",
     "RTSPCaptureIngress",
+    "FileVideoSource",
+    "RTSPVideoSource",
     "PyTorchCUDAMemorySampler",
     "FlowMetricsSummary",
     "calculate_flow_metrics",

@@ -1,18 +1,24 @@
-"""File-based video source abstraction using torchvision.io with synthetic fallback for testing."""
+"""File-based and RTSP-based live video source abstractions using ffmpeg / torchvision with background capture ingress."""
 
 from __future__ import annotations
 
+import json
 import os
-from typing import Any
+import subprocess
+import threading
+import time
+from typing import Any, Callable
 
 import numpy as np
 
 from usecases.video_analytics.config import FileVideoSourceConfig
-from usecases.video_analytics.contracts import BackendKind, FramePacket, FrameSource, VideoMetadata
+from usecases.video_analytics.contracts import BackendKind, DropReason, FramePacket, FrameSource, VideoMetadata
+from usecases.video_analytics.ingress import RTSPCaptureIngress
 from usecases.video_analytics.pacing import Clock, FramePacer
 
 __all__ = [
     "FileVideoSource",
+    "RTSPVideoSource",
     "verify_video_length",
 ]
 
@@ -159,9 +165,6 @@ class FileVideoSource(FrameSource):
 
     def _decode_ffmpeg(self, video_path: str) -> tuple[np.ndarray[Any, Any], float]:
         """Decode video file into BGR uint8 numpy array using ffmpeg/ffprobe CLI."""
-        import json
-        import subprocess
-
         probe_cmd = [
             "ffprobe",
             "-v",
@@ -200,93 +203,247 @@ class FileVideoSource(FrameSource):
             "-",
         ]
         proc = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        frame_size = h * w * 3
-        frames: list[np.ndarray[Any, Any]] = []
-        assert proc.stdout is not None
+        frame_bytes = w * h * 3
+        frames_list: list[np.ndarray[Any, Any]] = []
+
         while True:
-            raw_frame = proc.stdout.read(frame_size)
-            if len(raw_frame) < frame_size:
+            assert proc.stdout is not None
+            raw_frame = proc.stdout.read(frame_bytes)
+            if len(raw_frame) < frame_bytes:
                 break
-            frame = np.frombuffer(raw_frame, dtype=np.uint8).reshape((h, w, 3))
-            frames.append(frame)
+            frame_arr = np.frombuffer(raw_frame, dtype=np.uint8).reshape((h, w, 3))
+            frames_list.append(frame_arr)
+
         proc.wait()
+        if not frames_list:
+            raise RuntimeError(f"FFmpeg failed to decode any frames from {video_path}")
 
-        if not frames:
-            raise ValueError(f"No frames decoded from {video_path} via ffmpeg")
-
-        vframes_bgr = np.stack(frames, axis=0)
-        return vframes_bgr, fps
+        vframes = np.stack(frames_list, axis=0)
+        return vframes, fps
 
     def read(self) -> FramePacket | None:
-        """Read the next video frame packet from the stream."""
+        """Read the next video frame synchronously."""
         if self._is_closed or self._metadata is None:
             raise RuntimeError("FileVideoSource must be opened before reading")
 
-        if self._is_synthetic:
-            self._current_frame_id += 1
-            frame_id = self._current_frame_id
-            if self._metadata.frame_count is not None and frame_id > self._metadata.frame_count:
+        if self._is_synthetic or self._vframes is None:
+            if self._current_frame_id >= 1000:
                 return None
+            self._current_frame_id += 1
             if self._pacer is not None:
-                self._pacer.pace_frame(frame_id)
+                self._pacer.pace_frame(self._current_frame_id)
 
-            dummy_bgr = np.zeros((self._metadata.height, self._metadata.width, 3), dtype=np.uint8)
-            source_timestamp_ns = int(round((frame_id - 1) * (1e9 / self._metadata.fps)))
+            h, w = self._metadata.height, self._metadata.width
+            img = np.zeros((h, w, 3), dtype=np.uint8)
+
+            now_ns = time.monotonic_ns()
             return FramePacket(
-                frame_id=frame_id,
-                source_timestamp_ns=source_timestamp_ns,
-                image_bgr=dummy_bgr,
-                width=self._metadata.width,
-                height=self._metadata.height,
+                frame_id=self._current_frame_id,
+                source_timestamp_ns=now_ns,
+                image_bgr=img,
+                width=w,
+                height=h,
             )
 
-        if self._vframes is None:
-            raise RuntimeError("FileVideoSource is not open")
-
-        total_frames = int(getattr(self._vframes, "shape", [0])[0])
-        if self._current_frame_id >= total_frames:
+        if self._current_frame_id >= self._metadata.frame_count:  # type: ignore[operator]
             return None
 
-        frame_raw: Any = self._vframes[self._current_frame_id]
         self._current_frame_id += 1
-        frame_id = self._current_frame_id
-
         if self._pacer is not None:
-            self._pacer.pace_frame(frame_id)
+            self._pacer.pace_frame(self._current_frame_id)
 
-        source_timestamp_ns = int(round((frame_id - 1) * (1e9 / self._metadata.fps)))
+        idx = self._current_frame_id - 1
+        img = self._vframes[idx]  # pyright: ignore[reportUnknownVariableType,reportAttributeAccessIssue,reportIndexIssue]
 
-        if isinstance(frame_raw, np.ndarray):
-            image_bgr: np.ndarray[Any, np.dtype[np.uint8]] = np.asarray(frame_raw, dtype=np.uint8)  # pyright: ignore[reportUnknownArgumentType,reportUnknownVariableType]
-        else:
-            # Convert RGB tensor to BGR uint8 numpy array
-            frame_rgb_np = frame_raw.numpy()  # pyright: ignore[reportUnknownMemberType,reportUnknownVariableType]
-            frame_bgr_np = np.ascontiguousarray(frame_rgb_np[:, :, ::-1])  # pyright: ignore[reportUnknownVariableType]
-            image_bgr = np.asarray(frame_bgr_np, dtype=np.uint8)
-
+        now_ns = time.monotonic_ns()
         return FramePacket(
-            frame_id=frame_id,
-            source_timestamp_ns=source_timestamp_ns,
-            image_bgr=image_bgr,
+            frame_id=self._current_frame_id,
+            source_timestamp_ns=now_ns,
+            image_bgr=img,  # pyright: ignore[reportArgumentType]
             width=self._metadata.width,
             height=self._metadata.height,
         )
 
     def close(self) -> None:
-        """Release VideoCapture resources."""
-        if self._is_closed:
-            return
+        """Close the video source."""
         self._is_closed = True
         self._vframes = None
 
+
+class RTSPVideoSource(FrameSource):
+    """Production RTSP live-stream frame source backed by independent RTSPCaptureIngress background thread."""
+
+    def __init__(
+        self,
+        rtsp_url: str,
+        video_path: str = "sample_video.mp4",
+        queue_capacity: int = 4,
+        on_drop_callback: Callable[[FramePacket, DropReason], None] | None = None,
+        fallback_fps: float = 30.0,
+    ) -> None:
+        self._rtsp_url: str = rtsp_url
+        self._video_path: str = video_path
+        self._queue_capacity: int = queue_capacity
+        self._on_drop_callback: Callable[[FramePacket, DropReason], None] | None = on_drop_callback
+        self._fallback_fps: float = fallback_fps
+
+        self._metadata: VideoMetadata | None = None
+        self._ingress: RTSPCaptureIngress | None = None
+        self._decoder_proc: subprocess.Popen[bytes] | None = None
+        self._current_frame_id: int = 0
+        self._is_closed: bool = False
+        self._lock: threading.Lock = threading.Lock()
+
     @property
-    def metadata(self) -> VideoMetadata | None:
+    def backend_kind(self) -> BackendKind:
+        return BackendKind.PRODUCTION
+
+    @property
+    def rtsp_url(self) -> str:
+        return self._rtsp_url
+
+    @property
+    def ingress(self) -> RTSPCaptureIngress | None:
+        return self._ingress
+
+    def open(self) -> VideoMetadata:
+        """Probe RTSP metadata and launch independent background RTSPCaptureIngress thread."""
+        if self._is_closed:
+            raise RuntimeError("Cannot open a closed RTSPVideoSource")
+
+        width, height, fps = self._probe_metadata()
+        self._metadata = VideoMetadata(
+            width=width,
+            height=height,
+            fps=fps,
+            frame_count=None,
+            duration_ns=None,
+        )
+
+        frame_bytes = width * height * 3
+        ffmpeg_cmd = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-rtsp_transport",
+            "tcp",
+            "-i",
+            self._rtsp_url,
+            "-f",
+            "image2pipe",
+            "-pix_fmt",
+            "bgr24",
+            "-vcodec",
+            "rawvideo",
+            "-",
+        ]
+
+        try:
+            self._decoder_proc = subprocess.Popen(
+                ffmpeg_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                bufsize=10 * frame_bytes,
+            )
+        except Exception as err:
+            raise RuntimeError(f"Failed to launch FFmpeg RTSP decoder process for {self._rtsp_url}: {err}") from err
+
+        proc = self._decoder_proc
+
+        def frame_decoder() -> FramePacket | None:
+            if proc.poll() is not None or proc.stdout is None:
+                return None
+            try:
+                raw_data = proc.stdout.read(frame_bytes)
+                if len(raw_data) < frame_bytes:
+                    return None
+
+                with self._lock:
+                    self._current_frame_id += 1
+                    fid = self._current_frame_id
+
+                img_np = np.frombuffer(raw_data, dtype=np.uint8).reshape((height, width, 3))
+                now_ns = time.monotonic_ns()
+
+                return FramePacket(
+                    frame_id=fid,
+                    source_timestamp_ns=now_ns,
+                    image_bgr=img_np,
+                    width=width,
+                    height=height,
+                )
+            except Exception:
+                return None
+
+        self._ingress = RTSPCaptureIngress(
+            frame_decoder=frame_decoder,
+            queue_capacity=self._queue_capacity,
+            on_drop_callback=self._on_drop_callback,
+        )
+        self._ingress.start()
+
         return self._metadata
+
+    def read(self) -> FramePacket | None:
+        """Pop the latest frame non-blockingly from the bounded drop-oldest ingress queue."""
+        if self._is_closed or self._ingress is None:
+            raise RuntimeError("RTSPVideoSource must be opened before reading")
+        return self._ingress.read()
+
+    def close(self) -> None:
+        """Stop capture thread and terminate decoder process."""
+        if self._is_closed:
+            return
+        self._is_closed = True
+
+        if self._ingress is not None:
+            self._ingress.stop()
+            self._ingress = None
+
+        if self._decoder_proc is not None:
+            if self._decoder_proc.poll() is None:
+                self._decoder_proc.terminate()
+                try:
+                    self._decoder_proc.wait(timeout=2.0)
+                except subprocess.TimeoutExpired:
+                    self._decoder_proc.kill()
+            self._decoder_proc = None
+
+    def _probe_metadata(self) -> tuple[int, int, float]:
+        target_path = self._video_path if os.path.exists(self._video_path) else self._rtsp_url
+        try:
+            probe_cmd = [
+                "ffprobe",
+                "-v",
+                "quiet",
+                "-print_format",
+                "json",
+                "-show_streams",
+                target_path,
+            ]
+            output = subprocess.check_output(probe_cmd, timeout=5.0).decode("utf-8")
+            info: dict[str, Any] = json.loads(output)
+            streams: list[dict[str, Any]] = info.get("streams", [])
+            v_stream = next((s for s in streams if s.get("codec_type") == "video"), None)
+            if v_stream is not None:
+                w = int(v_stream.get("width", 640))
+                h = int(v_stream.get("height", 480))
+                fps_str = str(v_stream.get("r_frame_rate", "30/1"))
+                if "/" in fps_str:
+                    n_str, d_str = fps_str.split("/")
+                    fps = float(n_str) / float(d_str) if float(d_str) != 0 else 30.0
+                else:
+                    fps = float(fps_str)
+                return w, h, fps
+        except Exception:
+            pass
+        return 640, 480, self._fallback_fps
 
 
 def verify_video_length(metadata: VideoMetadata, required_frames: int) -> None:
     """Verify that a video is long enough for the required number of frames before an experiment."""
     if metadata.frame_count is not None and metadata.frame_count < required_frames:
         raise ValueError(
-            f"Source video contains {metadata.frame_count} frames, but experiment requires at least {required_frames} frames."
+            f"Video file contains {metadata.frame_count} frames, but experiment requires at least {required_frames}"
         )

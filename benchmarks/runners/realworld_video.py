@@ -27,6 +27,8 @@ from usecases.video_analytics.contracts import (
     DetectorBackend,
     DropReason,
     ExecutionMode,
+    FramePacket,
+    FrameSource,
     RTSPPublisherProtocol,
     TerminalStatus,
     TrackBatch,
@@ -37,6 +39,7 @@ from usecases.video_analytics.lifecycle import cleanup_repetition_resources
 from usecases.video_analytics.metrics import calculate_flow_metrics
 from usecases.video_analytics.publisher import FFmpegRTSPPublisher, FakeRTSPPublisher
 from usecases.video_analytics.sink import NullSink
+from usecases.video_analytics.source import FileVideoSource, RTSPVideoSource
 
 __all__ = [
     "RealworldVideoSampleRow",
@@ -315,7 +318,49 @@ def run_realworld_video_suite(
                 rep_frame_rows: list[RealworldVideoFrameSampleRow] = []
                 seen_frame_ids: set[int] = set()
                 dup_count: int = 0
-                completed_frame_tuples: list[tuple[int, TerminalStatus, DropReason, bool, bool]] = []
+                frame_tuples: list[tuple[int, TerminalStatus, DropReason, bool, bool]] = []
+
+                def on_drop_callback(packet: FramePacket, reason: DropReason) -> None:
+                    status = (
+                        TerminalStatus.DROPPED_INGRESS_OVERFLOW
+                        if reason is DropReason.INGRESS_OVERFLOW
+                        else TerminalStatus.CANCELLED_ON_STOP
+                    )
+                    fr_row = RealworldVideoFrameSampleRow(
+                        run_id=run_id,
+                        repetition=rep,
+                        mechanism=mech,
+                        frame_id=packet.frame_id,
+                        source_timestamp_ns=packet.source_timestamp_ns,
+                        admission_timestamp_ns=None,
+                        completion_timestamp_ns=None,
+                        plan_version=None,
+                        detector_id="",
+                        tracker_instance_id="",
+                        queue_occupancy=0.0,
+                        terminal_status=status.value,
+                        drop_reason=reason.value,
+                        dropped=True,
+                        duplicated=False,
+                    )
+                    rep_frame_rows.append(fr_row)
+                    frame_tuples.append(
+                        (packet.frame_id, status, reason, False, False)
+                    )
+
+                source_obj: FrameSource
+                source_path_val: str
+                if mode is ExecutionMode.PUBLICATION:
+                    source_obj = RTSPVideoSource(
+                        rtsp_url=publisher.rtsp_url,
+                        video_path=video_path,
+                        queue_capacity=queue_capacity,
+                        on_drop_callback=on_drop_callback,
+                    )
+                    source_path_val = publisher.rtsp_url
+                else:
+                    source_obj = FileVideoSource(cfg.source)
+                    source_path_val = video_path
 
                 def sink_observer(batch: TrackBatch, completion_ns: int) -> None:
                     nonlocal dup_count
@@ -343,7 +388,7 @@ def run_realworld_video_suite(
                         duplicated=is_dup,
                     )
                     rep_frame_rows.append(fr_row)
-                    completed_frame_tuples.append(
+                    frame_tuples.append(
                         (batch.frame_id, TerminalStatus.COMPLETED, DropReason.NONE, True, is_dup)
                     )
 
@@ -351,6 +396,7 @@ def run_realworld_video_suite(
 
                 app = VideoAnalyticsApplication(
                     config=cfg,
+                    source=source_obj,
                     sink=sink_obj,
                     initial_detector_backend=init_backend,
                     candidate_detector_backend=cand_backend,
@@ -443,7 +489,7 @@ def run_realworld_video_suite(
                         )
 
                     # Calculate Flow Accounting Metrics
-                    flow_summary = calculate_flow_metrics(completed_frame_tuples)
+                    flow_summary = calculate_flow_metrics(frame_tuples)
 
                     # Measured peak live processor count
                     processor_peak_count = 5 if mech in ("VEPS", "Pause") else 5
@@ -453,7 +499,7 @@ def run_realworld_video_suite(
                         repetition=rep,
                         execution_order_position=pos,
                         mechanism=mech,
-                        source_path=video_path,
+                        source_path=source_path_val,
                         source_file_hash=source_hash,
                         video_fps=meta.fps,
                         resolution=f"{meta.width}x{meta.height}",
@@ -547,7 +593,6 @@ def run_realworld_video_suite(
                     r.tracker_reset_count_before,
                     r.tracker_reset_count_after,
                     r.processor_peak_count,
-                    # Allocator snapshot metrics (4 stages)
                     gb.allocated_bytes if gb.allocated_bytes is not None else "",
                     gb.reserved_bytes if gb.reserved_bytes is not None else "",
                     gb.peak_allocated_bytes if gb.peak_allocated_bytes is not None else "",
@@ -564,13 +609,11 @@ def run_realworld_video_suite(
                     gr.reserved_bytes if gr.reserved_bytes is not None else "",
                     gr.peak_allocated_bytes if gr.peak_allocated_bytes is not None else "",
                     gr.peak_reserved_bytes if gr.peak_reserved_bytes is not None else "",
-                    # Legacy generic columns preserved for compatibility
                     gb.allocated_bytes if gb.allocated_bytes is not None else "",
                     gc.allocated_bytes if gc.allocated_bytes is not None else "",
                     gp.allocated_bytes if gp.allocated_bytes is not None else "",
                     gr.allocated_bytes if gr.allocated_bytes is not None else "",
                 ])
-            f.flush()
 
         with open(frame_csv_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
@@ -587,12 +630,11 @@ def run_realworld_video_suite(
                     fr.plan_version if fr.plan_version is not None else "",
                     fr.detector_id,
                     fr.tracker_instance_id,
-                    f"{fr.queue_occupancy:.2f}",
+                    f"{fr.queue_occupancy:.4f}",
                     fr.terminal_status,
                     fr.drop_reason,
-                    str(fr.dropped),
-                    str(fr.duplicated),
+                    1 if fr.dropped else 0,
+                    1 if fr.duplicated else 0,
                 ])
-            f.flush()
 
     return sample_rows, frame_rows

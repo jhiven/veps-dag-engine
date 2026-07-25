@@ -96,8 +96,9 @@ def run_benchmarks(
         output_dir = base_output_dir
 
     start_time_ns = time.monotonic_ns()
-    utc_start = datetime.datetime.now(datetime.timezone.utc).isoformat()
-    run_id = f"run_{utc_start.replace(':', '-').replace('.', '-')}_{seed}"
+    now = datetime.datetime.now(datetime.timezone.utc)
+    utc_start = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    run_id = f"run_{now.strftime('%Y-%m-%dT%H-%M-%S')}_{seed}"
 
     run_dir = os.path.join(output_dir, run_id)
     os.makedirs(run_dir, exist_ok=True)
