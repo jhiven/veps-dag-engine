@@ -3,16 +3,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 from typing import Protocol, runtime_checkable
 
 import numpy as np
 import numpy.typing as npt
 
-from enum import Enum
-
 __all__ = [
     "ExecutionMode",
     "BackendKind",
+    "TerminalStatus",
+    "DropReason",
     "VideoMetadata",
     "FramePacket",
     "BoundingBox",
@@ -22,10 +23,13 @@ __all__ = [
     "TrackBatch",
     "ModelIdentity",
     "TrackerStateSnapshot",
+    "CUDAMemorySnapshot",
     "FrameSource",
     "ResultSink",
     "DetectorBackend",
     "TrackerBackend",
+    "RTSPPublisherProtocol",
+    "CUDAMemorySamplerProtocol",
 ]
 
 
@@ -41,6 +45,25 @@ class BackendKind(str, Enum):
 
     FAKE = "fake"
     PRODUCTION = "production"
+
+
+class TerminalStatus(str, Enum):
+    """Terminal accounting status for a source frame."""
+
+    COMPLETED = "completed"
+    DROPPED_INGRESS_OVERFLOW = "dropped_ingress_overflow"
+    DROPPED_ADMISSION_REJECTED = "dropped_admission_rejected"
+    CANCELLED_ON_STOP = "cancelled_on_stop"
+    IN_FLIGHT_AT_WINDOW_END = "in_flight_at_window_end"
+
+
+class DropReason(str, Enum):
+    """Reason why a frame was dropped or cancelled."""
+
+    NONE = "none"
+    INGRESS_OVERFLOW = "ingress_overflow"
+    ADMISSION_REJECTED = "admission_rejected"
+    CANCELLED_ON_STOP = "cancelled_on_stop"
 
 
 @dataclass(frozen=True, slots=True)
@@ -163,6 +186,16 @@ class TrackerStateSnapshot:
     live_track_ids: tuple[int, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class CUDAMemorySnapshot:
+    """Snapshot of PyTorch CUDA allocator memory metrics."""
+
+    allocated_bytes: int | None
+    reserved_bytes: int | None
+    peak_allocated_bytes: int | None
+    peak_reserved_bytes: int | None
+
+
 @runtime_checkable
 class FrameSource(Protocol):
     """Protocol for frame sources."""
@@ -219,3 +252,23 @@ class TrackerBackend(Protocol):
     def snapshot(self) -> TrackerStateSnapshot: ...
     def close(self) -> None: ...
 
+
+@runtime_checkable
+class RTSPPublisherProtocol(Protocol):
+    """Protocol for RTSP video stream publishers."""
+
+    @property
+    def rtsp_url(self) -> str: ...
+    def start(self) -> None: ...
+    def wait_until_ready(self, timeout_seconds: float = 5.0) -> None: ...
+    def stop(self) -> None: ...
+
+
+@runtime_checkable
+class CUDAMemorySamplerProtocol(Protocol):
+    """Protocol for sampling PyTorch CUDA memory allocator metrics."""
+
+    def initialize(self) -> None: ...
+    def reset_peak_stats(self) -> None: ...
+    def synchronize(self) -> None: ...
+    def sample(self) -> CUDAMemorySnapshot: ...

@@ -4,9 +4,15 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
+import torch
+from transformers import (
+    RTDetrConfig as HFRTDetrConfig,
+    RTDetrForObjectDetection,
+    RTDetrImageProcessor,
+)
 
 from usecases.video_analytics.config import RTDETRConfig
 from usecases.video_analytics.contracts import BackendKind, BoundingBox, Detection, DetectorBackend, FramePacket
@@ -20,9 +26,9 @@ __all__ = [
 
 @dataclass(frozen=True, slots=True)
 class _RAMModelCacheEntry:
-    image_processor: Any
-    config: Any
-    state_dict: dict[str, Any]
+    image_processor: RTDetrImageProcessor
+    config: HFRTDetrConfig
+    state_dict: dict[str, torch.Tensor]
 
 
 _RAM_MODEL_CACHE: dict[str, _RAMModelCacheEntry] = {}
@@ -31,32 +37,26 @@ _RAM_MODEL_CACHE: dict[str, _RAMModelCacheEntry] = {}
 def preload_rtdetr_models_to_ram(model_ids: list[str]) -> None:
     """Pre-load model weights and configs from disk into an in-memory CPU RAM state_dict cache ONCE."""
     try:
-        from transformers import (
-            RTDetrForObjectDetection,
-            RTDetrImageProcessor,
-        )
-        import huggingface_hub
+        from huggingface_hub.utils.tqdm import disable_progress_bars
 
-        disable_fn: Any = getattr(huggingface_hub, "disable_progress_bars", None)
-        if callable(disable_fn):
-            disable_fn()
+        disable_progress_bars()
     except Exception:
-        return
+        pass
 
     for mid in model_ids:
         if mid in _RAM_MODEL_CACHE:
             continue
 
         try:
-            image_processor = RTDetrImageProcessor.from_pretrained(mid) # pyright: ignore[reportUnknownMemberType]
-            cpu_model = RTDetrForObjectDetection.from_pretrained(mid) # pyright: ignore[reportUnknownMemberType]
+            image_processor = RTDetrImageProcessor.from_pretrained(mid)  # pyright: ignore[reportUnknownMemberType]
+            cpu_model = RTDetrForObjectDetection.from_pretrained(mid)  # pyright: ignore[reportUnknownMemberType]
             cpu_model.eval()
 
-            raw_state_dict: dict[str, Any] = cpu_model.state_dict()
-            state_dict: dict[str, Any] = {
+            raw_state_dict: dict[str, torch.Tensor] = cpu_model.state_dict()
+            state_dict: dict[str, torch.Tensor] = {
                 k: v.detach().cpu().clone() for k, v in raw_state_dict.items()
             }
-            config: Any = getattr(cpu_model, "config")
+            config: HFRTDetrConfig = cpu_model.config
 
             _RAM_MODEL_CACHE[mid] = _RAMModelCacheEntry(
                 image_processor=image_processor,
@@ -72,8 +72,8 @@ class RTDETRDetectorBackend(DetectorBackend):
 
     def __init__(self, config: RTDETRConfig) -> None:
         self._config: RTDETRConfig = config
-        self._model: Any = None
-        self._image_processor: Any = None
+        self._model: RTDetrForObjectDetection | None = None
+        self._image_processor: RTDetrImageProcessor | None = None
         self._person_class_id: int | None = None
         self._is_prepared: bool = False
         self._is_closed: bool = False
@@ -100,18 +100,6 @@ class RTDETRDetectorBackend(DetectorBackend):
 
         self.model_construction_start_ns = time.monotonic_ns()
 
-        try:
-            import torch
-            from transformers import (
-                RTDetrForObjectDetection,
-                RTDetrImageProcessor,
-            )
-        except ImportError as err:
-            raise RuntimeError(
-                "PyTorch and Hugging Face Transformers are required for RTDETRDetectorBackend. "
-                "Install with: uv sync --group realworld-video"
-            ) from err
-
         if self._config.device.startswith("cuda"):
             if not torch.cuda.is_available():
                 raise RuntimeError(
@@ -119,25 +107,22 @@ class RTDETRDetectorBackend(DetectorBackend):
                 )
 
         cache_entry = _RAM_MODEL_CACHE.get(self._config.model_id)
-        model: Any = None
-        image_processor: Any = None
+        model: RTDetrForObjectDetection
+        image_processor: RTDetrImageProcessor
 
         if cache_entry is not None:
             # 1. Instantiate a brand NEW model instance from cached config (in RAM)
             model = RTDetrForObjectDetection(cache_entry.config)
             # 2. Populate weights from RAM state_dict cache (zero disk I/O!)
-            ram_state_dict: dict[str, Any] = {k: v.clone() for k, v in cache_entry.state_dict.items()}
+            ram_state_dict: dict[str, torch.Tensor] = {k: v.clone() for k, v in cache_entry.state_dict.items()}
             model.load_state_dict(ram_state_dict, strict=True)
             image_processor = cache_entry.image_processor
         else:
-            from_pretrained_processor: Any = getattr(RTDetrImageProcessor, "from_pretrained")
-            from_pretrained_model: Any = getattr(RTDetrForObjectDetection, "from_pretrained")
-
-            image_processor = from_pretrained_processor(
+            image_processor = RTDetrImageProcessor.from_pretrained(  # pyright: ignore[reportUnknownMemberType]
                 self._config.model_id,
                 local_files_only=self._config.local_files_only,
             )
-            model = from_pretrained_model(
+            model = RTDetrForObjectDetection.from_pretrained(  # pyright: ignore[reportUnknownMemberType]
                 self._config.model_id,
                 local_files_only=self._config.local_files_only,
             )
@@ -145,23 +130,24 @@ class RTDETRDetectorBackend(DetectorBackend):
         self.weights_loaded_ns = time.monotonic_ns()
 
         model.eval()
-        device: Any = torch.device(self._config.device)
+        device = torch.device(self._config.device)
 
-        torch_dtype: Any = torch.float32
+        torch_dtype = torch.float32
         if self._config.dtype == "float16":
             torch_dtype = torch.float16
         elif self._config.dtype == "bfloat16":
             torch_dtype = torch.bfloat16
 
-        model.to(device, torch_dtype)
+        model.to(device, torch_dtype)  # pyright: ignore[reportUnknownMemberType,reportArgumentType,reportCallIssue]
         self.device_transfer_completed_ns = time.monotonic_ns()
 
         self._model = model
         self._image_processor = image_processor
 
         # Resolve person class ID from id2label
-        config_obj: Any = getattr(model, "config", None)
-        id2label: dict[int, str] | dict[str, str] = getattr(config_obj, "id2label", {}) if config_obj is not None else {}
+        config_obj: HFRTDetrConfig = model.config
+        id2label_raw: Any = getattr(config_obj, "id2label", None)
+        id2label: dict[int, str] | dict[str, str] = id2label_raw or {}
         person_id: int | None = None
         for cid, name in id2label.items():
             if str(name).lower() == self._config.person_class_name.lower():
@@ -185,47 +171,49 @@ class RTDETRDetectorBackend(DetectorBackend):
         if self._model is None or self._image_processor is None:
             raise RuntimeError("RTDETRDetectorBackend must be prepared before calling infer()")
 
-        import torch
+        model = self._model
+        image_processor = self._image_processor
+
         from PIL import Image
 
         # Convert BGR image to RGB PIL Image
-        image_rgb: np.ndarray[Any, Any] = np.ascontiguousarray(frame.image_bgr[:, :, ::-1])
-        image_pil: Any = Image.fromarray(image_rgb)
+        image_rgb = np.ascontiguousarray(frame.image_bgr[:, :, ::-1])
+        image_pil = Image.fromarray(image_rgb)  # pyright: ignore[reportUnknownMemberType]
 
-        inputs: Any = self._image_processor(images=image_pil, return_tensors="pt")
+        inputs = image_processor(images=image_pil, return_tensors="pt")  # pyright: ignore[reportUnknownMemberType]
 
-        device: Any = torch.device(self._config.device)
-        torch_dtype: Any = torch.float32
+        device = torch.device(self._config.device)
+        torch_dtype = torch.float32
         if self._config.dtype == "float16":
             torch_dtype = torch.float16
         elif self._config.dtype == "bfloat16":
             torch_dtype = torch.bfloat16
 
-        pixel_values: Any = inputs["pixel_values"].to(device, dtype=torch_dtype)
+        pixel_values: torch.Tensor = inputs["pixel_values"].to(device, dtype=torch_dtype)
 
         with torch.no_grad():
-            outputs: Any = self._model(pixel_values=pixel_values)
+            outputs: Any = model(pixel_values=pixel_values)
 
-        target_sizes: Any = torch.tensor([[frame.height, frame.width]], device=device)
-        results: Any = self._image_processor.post_process_object_detection(
+        results_raw = image_processor.post_process_object_detection(  # pyright: ignore[reportUnknownMemberType,reportUnknownVariableType]
             outputs,
             threshold=self._config.confidence_threshold,
-            target_sizes=target_sizes,
+            target_sizes=[(frame.height, frame.width)],
         )
+        results = cast("list[dict[str, torch.Tensor]]", results_raw)
 
         detections: list[Detection] = []
         if len(results) > 0:
-            result: Any = results[0]
-            boxes: Any = result["boxes"].cpu().numpy()
-            scores: Any = result["scores"].cpu().numpy()
-            labels: Any = result["labels"].cpu().numpy()
+            result = results[0]
+            boxes = result["boxes"].detach().cpu().numpy()
+            scores = result["scores"].detach().cpu().numpy()
+            labels = result["labels"].detach().cpu().numpy()
 
             for box, score, label in zip(boxes, scores, labels):
                 label_id = int(label)
                 if self._person_class_id is not None and label_id != self._person_class_id:
                     continue
 
-                x1, y1, x2, y2 = [float(v) for v in box]
+                x1, y1, x2, y2 = float(box[0]), float(box[1]), float(box[2]), float(box[3])
                 detections.append(
                     Detection(
                         box=BoundingBox(x1=x1, y1=y1, x2=x2, y2=y2),

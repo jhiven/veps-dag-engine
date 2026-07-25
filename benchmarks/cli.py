@@ -1,14 +1,15 @@
-"""Command line interface for benchmark suite execution, report generation, and artifact verification."""
+# pyright: reportUnknownVariableType=false, reportUnknownMemberType=false, reportUnknownArgumentType=false
+"""Command line interface for running DAG engine benchmark suites."""
 
 from __future__ import annotations
 
 import argparse
 import datetime
-import hashlib
 import os
+import shutil
 import sys
 import time
-import uuid
+from typing import Any
 
 from benchmarks.metadata import (
     CompletionMetadata,
@@ -26,9 +27,11 @@ from benchmarks.reporting.interference import generate_interference_summary_file
 from benchmarks.reporting.load import load_benchmark_artifact
 from benchmarks.reporting.summarize import generate_summary_csv
 from benchmarks.reporting.tables import generate_all_tables
+from benchmarks.reporting.validation import validate_experiment_artifacts, write_experiment_validation_json
 from benchmarks.runners.ablation import run_ablation_suite
 from benchmarks.runners.conformance import run_conformance_suite
 from benchmarks.runners.interference import run_interference_suite
+from benchmarks.runners.realworld_video import run_realworld_video_suite
 from benchmarks.runners.reconfiguration import run_reconfiguration_suite
 from benchmarks.runners.reconfiguration_stress import run_reconfiguration_stress_suite
 from benchmarks.runners.steady_state import run_steady_state_suite
@@ -42,11 +45,8 @@ from benchmarks.scenarios import (
     generate_layered_dag,
     make_reconfiguration_base_spec,
 )
-from benchmarks.reporting.validation import (
-    validate_experiment_artifacts,
-    write_experiment_validation_json,
-)
 from benchmarks.storage import (
+    ReconfigurationSampleRow,
     read_ablation_rows,
     read_interference_rows,
     read_reconfiguration_rows,
@@ -55,49 +55,92 @@ from benchmarks.system import collect_system_environment
 from nedo_vision_dag_engine.specification import specification_hash
 from tests.support.workflows import linear, tracker_only
 
-__all__ = [
-    "run_benchmarks",
-    "report_cmd",
-    "verify_cmd",
-    "main",
-]
+__all__ = ["run_benchmarks", "main"]
 
 
-def _calculate_file_sha256(path: str) -> str:
-    with open(path, "rb") as file:
-        return hashlib.sha256(file.read()).hexdigest()
+def _count_csv_data_rows(filepath: str) -> int:
+    if not os.path.exists(filepath):
+        return 0
+    with open(filepath, "r", encoding="utf-8") as f:
+        lines = [line.strip() for line in f if line.strip()]
+        return max(0, len(lines) - 1)
 
 
-def _count_csv_data_rows(path: str) -> int:
-    with open(path, "r", encoding="utf-8") as file:
-        lines = [line for line in file if line.strip()]
-    return max(0, len(lines) - 1)
+def _calculate_file_sha256(filepath: str) -> str:
+    import hashlib
+
+    if not os.path.exists(filepath):
+        return ""
+    h = hashlib.sha256()
+    with open(filepath, "rb") as f:
+        while chunk := f.read(65536):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def run_benchmarks(
     suite: str,
-    profile: str,
-    base_output_dir: str = "benchmark-results",
+    profile: str = "smoke",
+    output_dir: str = "benchmark_runs",
+    base_output_dir: str | None = None,
     seed: int = 42,
+    source_video: str = "sample_video.mp4",
+    rtsp_base_url: str = "rtsp://127.0.0.1:8554",
+    queue_capacity: int = 4,
+    warmup_frames: int = 60,
+    measurement_frames: int = 180,
+    device: str = "auto",
 ) -> str:
-    run_id = f"run_{datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
-    run_dir = os.path.join(base_output_dir, run_id)
+    """Execute selected benchmark suite(s) and save structured artifact run directory."""
+    if base_output_dir is not None:
+        output_dir = base_output_dir
+
+    start_time_ns = time.monotonic_ns()
+    utc_start = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    run_id = f"run_{utc_start.replace(':', '-').replace('.', '-')}_{seed}"
+
+    run_dir = os.path.join(output_dir, run_id)
     os.makedirs(run_dir, exist_ok=True)
 
-    utc_start = datetime.datetime.now(datetime.timezone.utc).isoformat()
-    start_time_ns = time.monotonic_ns()
-
-    valid_suite_names = {"steady-state", "reconfiguration", "reconfiguration-stress", "conformance", "ablation", "interference", "realworld-video"}
-    if suite == "all":
-        selected_suites = ("steady-state", "reconfiguration", "conformance", "reconfiguration-stress", "ablation", "interference", "realworld-video")
+    suite_list = [s.strip() for s in suite.split(",") if s.strip()]
+    if "all" in suite_list:
+        selected_suites = (
+            "steady-state",
+            "reconfiguration",
+            "conformance",
+            "reconfiguration-stress",
+            "ablation",
+            "interference",
+            "realworld-video",
+        )
     else:
-        parts = [s.strip() for s in suite.split(",") if s.strip()]
-        for p in parts:
-            if p not in valid_suite_names:
-                raise ValueError(
-                    f"Unknown benchmark suite {p!r}. Valid options: 'all', 'steady-state', 'reconfiguration', 'conformance', 'ablation', 'interference', 'realworld-video' (or comma-separated combination)."
-                )
+        parts: list[str] = []
+        for s in suite_list:
+            if s in (
+                "steady-state",
+                "reconfiguration",
+                "conformance",
+                "reconfiguration-stress",
+                "ablation",
+                "interference",
+                "realworld-video",
+            ):
+                parts.append(s)
+            else:
+                raise ValueError(f"Unknown benchmark suite: {s}")
         selected_suites = tuple(parts)
+
+    # Validations for realworld-video suite
+    if "realworld-video" in selected_suites:
+        if queue_capacity <= 0:
+            raise ValueError(f"Queue capacity must be positive, got {queue_capacity}")
+        if not rtsp_base_url.startswith("rtsp://"):
+            raise ValueError(f"Invalid RTSP URL: {rtsp_base_url!r}. Must start with 'rtsp://'")
+        if profile == "publication":
+            if not os.path.exists(source_video):
+                raise FileNotFoundError(f"Source video file not found: {source_video}")
+            if not shutil.which("ffmpeg"):
+                raise RuntimeError("ffmpeg executable not found in PATH for RTSP publication benchmark.")
 
     pin_cpus = (0,) if selected_suites == ("steady-state",) else (0, 2)
     env = collect_system_environment(pin_cpus=pin_cpus)
@@ -130,6 +173,8 @@ def run_benchmarks(
             "interference_cpu_bound_preparation_20ms",
             "interference_cpu_bound_preparation_50ms",
         ])
+    if "realworld-video" in selected_suites:
+        selected_scenarios.extend(["realworld_video_rtsp_reconfiguration"])
 
     repetition_count = 5 if profile == "smoke" else 30
     warmup_count = 5 if profile == "smoke" else 50
@@ -260,15 +305,19 @@ def run_benchmarks(
             sha256_dict["interference-samples.csv"] = _calculate_file_sha256(interference_csv)
 
         if "realworld-video" in selected_suites:
-            from benchmarks.runners.realworld_video import run_realworld_video_suite
             from usecases.video_analytics.contracts import ExecutionMode
 
             rw_video_csv = os.path.join(run_dir, "realworld-video-samples.csv")
             run_realworld_video_suite(
                 run_id=run_id,
                 output_csv_path=rw_video_csv,
-                device="auto",
+                video_path=source_video,
+                rtsp_base_url=rtsp_base_url,
+                device=device,
                 repetition_count=repetition_count,
+                update_frame_id=warmup_frames,
+                total_frames=measurement_frames,
+                queue_capacity=queue_capacity,
                 use_fake_backends=(profile == "smoke"),
                 execution_mode=ExecutionMode.SMOKE if profile == "smoke" else ExecutionMode.PUBLICATION,
             )
@@ -280,10 +329,12 @@ def run_benchmarks(
         tables_dir = os.path.join(run_dir, "tables")
         figures_dir = os.path.join(run_dir, "figures")
 
-        artifact_data = load_benchmark_artifact(run_dir)
+        artifact_data: Any = load_benchmark_artifact(run_dir)
         generate_summary_csv(artifact_data, summary_csv)
-        table_paths = generate_all_tables(artifact_data, tables_dir)
-        figure_paths = generate_all_figures(artifact_data, figures_dir)
+        t_paths_raw: Any = generate_all_tables(artifact_data, tables_dir)
+        f_paths_raw: Any = generate_all_figures(artifact_data, figures_dir)
+        t_paths: list[str] = [str(p) for p in t_paths_raw]
+        f_paths: list[str] = [str(p) for p in f_paths_raw]
 
         duration_sec = (time.monotonic_ns() - start_time_ns) / 1e9
         utc_comp = datetime.datetime.now(datetime.timezone.utc).isoformat()
@@ -295,8 +346,8 @@ def run_benchmarks(
             total_duration_seconds=duration_sec,
             raw_file_row_counts=row_counts,
             raw_file_sha256=sha256_dict,
-            generated_table_paths=tuple(table_paths),
-            generated_figure_paths=tuple(figure_paths),
+            generated_table_paths=tuple(t_paths),
+            generated_figure_paths=tuple(f_paths),
         )
 
         completion_json_path = os.path.join(run_dir, "completion.json")
@@ -318,14 +369,16 @@ def run_benchmarks(
 
 
 def report_cmd(run_directory: str) -> None:
-    artifact_data = load_benchmark_artifact(run_directory)
+    artifact_data: Any = load_benchmark_artifact(run_directory)
     summary_csv = os.path.join(run_directory, "summary.csv")
     tables_dir = os.path.join(run_directory, "tables")
     figures_dir = os.path.join(run_directory, "figures")
 
     generate_summary_csv(artifact_data, summary_csv)
-    t_paths = generate_all_tables(artifact_data, tables_dir)
-    f_paths = generate_all_figures(artifact_data, figures_dir)
+    t_paths_raw: Any = generate_all_tables(artifact_data, tables_dir)
+    f_paths_raw: Any = generate_all_figures(artifact_data, figures_dir)
+    t_paths: list[str] = [str(p) for p in t_paths_raw]
+    f_paths: list[str] = [str(p) for p in f_paths_raw]
 
     ablation_csv = os.path.join(run_directory, "ablation-samples.csv")
     if os.path.exists(ablation_csv):
@@ -336,11 +389,11 @@ def report_cmd(run_directory: str) -> None:
         interference_summary_csv = os.path.join(run_directory, "interference-summary.csv")
         generate_interference_summary_file(interference_csv, interference_summary_csv)
 
-    ablation_rows = read_ablation_rows(ablation_csv) if os.path.exists(ablation_csv) else ()
-    interference_rows = read_interference_rows(interference_csv) if os.path.exists(interference_csv) else ()
+    ablation_rows: Any = read_ablation_rows(ablation_csv) if os.path.exists(ablation_csv) else ()
+    interference_rows: Any = read_interference_rows(interference_csv) if os.path.exists(interference_csv) else ()
 
     if ablation_rows or interference_rows:
-        val_report = validate_experiment_artifacts(
+        val_report: Any = validate_experiment_artifacts(
             ablation_rows=ablation_rows,
             interference_rows=interference_rows,
         )
@@ -364,31 +417,34 @@ def verify_cmd(run_directory: str) -> None:
     if not os.path.exists(comp_json):
         raise ValueError(f"Missing completion.json in {run_directory}")
 
-    run_meta = load_run_json(run_json)
-    comp_meta = load_completion_json(comp_json)
+    run_meta: RunMetadata = load_run_json(run_json)
+    comp_meta: CompletionMetadata = load_completion_json(comp_json)
 
     if run_meta.run_id != comp_meta.run_id:
         raise ValueError(f"Run ID mismatch: run.json has {run_meta.run_id}, completion.json has {comp_meta.run_id}")
 
-    for fname in comp_meta.raw_file_row_counts.keys():
+    raw_counts: dict[str, int] = comp_meta.raw_file_row_counts
+    raw_shas: dict[str, str] = comp_meta.raw_file_sha256
+
+    for fname in list(raw_counts.keys()):
         fpath = os.path.join(run_directory, fname)
         if not os.path.exists(fpath):
             raise ValueError(f"Missing expected raw CSV file: {fname}")
 
-        expected_count = comp_meta.raw_file_row_counts.get(fname)
+        expected_count = raw_counts.get(fname)
         actual_count = _count_csv_data_rows(fpath)
         if expected_count is not None and actual_count != expected_count:
             raise ValueError(f"Row count mismatch for {fname}: expected {expected_count}, got {actual_count}")
 
-        expected_sha = comp_meta.raw_file_sha256.get(fname)
+        expected_sha = raw_shas.get(fname)
         actual_sha = _calculate_file_sha256(fpath)
         if expected_sha is not None and actual_sha != expected_sha:
             raise ValueError(f"SHA-256 mismatch for {fname}: expected {expected_sha}, got {actual_sha}")
 
-    # Check non-negative intervals and interval relationships in reconfiguration samples
     reconfig_csv = os.path.join(run_directory, "reconfiguration-samples.csv")
     if os.path.exists(reconfig_csv):
-        reconfig_samples = read_reconfiguration_rows(reconfig_csv)
+        reconfig_samples_raw: Any = read_reconfiguration_rows(reconfig_csv)
+        reconfig_samples: list[ReconfigurationSampleRow] = list(reconfig_samples_raw)
         for s in reconfig_samples:
             for val in (s.validation_ns, s.preparation_ns, s.request_to_ready_ns, s.boundary_wait_ns, s.commit_ns, s.request_to_effect_ns, s.retirement_queue_delay_ns, s.retirement_duration_ns, s.commit_to_retirement_complete_ns, s.maximum_output_gap_ns):
                 if val is not None and val < 0:
@@ -402,11 +458,15 @@ def verify_cmd(run_directory: str) -> None:
                 if s.request_to_effect_ns < s.request_to_ready_ns:
                     raise ValueError(f"Invalid interval relationship: request_to_effect_ns ({s.request_to_effect_ns}) < request_to_ready_ns ({s.request_to_ready_ns})")
 
-    # Check generated tables and figures exist
-    for t_path in comp_meta.generated_table_paths:
+    table_paths_raw: Any = comp_meta.generated_table_paths
+    figure_paths_raw: Any = comp_meta.generated_figure_paths
+    table_paths: list[str] = [str(p) for p in table_paths_raw]
+    figure_paths: list[str] = [str(p) for p in figure_paths_raw]
+
+    for t_path in table_paths:
         if not os.path.exists(t_path):
             raise ValueError(f"Missing generated table file: {t_path}")
-    for f_path in comp_meta.generated_figure_paths:
+    for f_path in figure_paths:
         if not os.path.exists(f_path):
             raise ValueError(f"Missing generated figure file: {f_path}")
 
@@ -422,11 +482,19 @@ def main() -> None:
     run_parser.add_argument(
         "suite",
         type=str,
-        help="Benchmark suite(s) to run ('all', 'steady-state', 'reconfiguration', 'conformance', or comma-separated list e.g. 'reconfiguration,conformance')",
+        help="Benchmark suite(s) to run ('all', 'steady-state', 'reconfiguration', 'conformance', 'realworld-video', or comma-separated list)",
     )
     profile_group = run_parser.add_mutually_exclusive_group(required=True)
     profile_group.add_argument("--smoke", action="store_true", help="Run smoke profile for CI/validation")
     profile_group.add_argument("--publication", action="store_true", help="Run publication profile")
+
+    # Real-world video specific optional arguments
+    run_parser.add_argument("--source", type=str, default="sample_video.mp4", help="Source video file path")
+    run_parser.add_argument("--rtsp-base-url", type=str, default="rtsp://127.0.0.1:8554", help="MediaMTX RTSP base URL")
+    run_parser.add_argument("--queue-capacity", type=int, default=4, help="Bounded ingress queue capacity")
+    run_parser.add_argument("--warmup-frames", type=int, default=60, help="Warmup frame boundary")
+    run_parser.add_argument("--measurement-frames", type=int, default=180, help="Measurement frame boundary")
+    run_parser.add_argument("--device", type=str, default="auto", help="Device target ('auto', 'cuda:0', 'cpu')")
 
     # report subcommand
     report_parser = subparsers.add_parser("report")
@@ -440,7 +508,16 @@ def main() -> None:
 
     if args.subcommand == "run":
         profile = "smoke" if args.smoke else "publication"
-        run_benchmarks(suite=args.suite, profile=profile)
+        run_benchmarks(
+            suite=args.suite,
+            profile=profile,
+            source_video=args.source,
+            rtsp_base_url=args.rtsp_base_url,
+            queue_capacity=args.queue_capacity,
+            warmup_frames=args.warmup_frames,
+            measurement_frames=args.measurement_frames,
+            device=args.device,
+        )
     elif args.subcommand == "report":
         report_cmd(args.run_directory)
     elif args.subcommand == "verify":

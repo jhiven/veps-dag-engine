@@ -1,0 +1,11 @@
+{
+  "include": ["src", "usecases", "benchmarks", "tests"],
+  "executionEnvironments": [
+    {
+      "root": ".",
+      "extraPaths": ["src", "."]
+    }
+  ],
+  "typeCheckingMode": "strict",
+  "reportMissingTypeStubs": false
+}

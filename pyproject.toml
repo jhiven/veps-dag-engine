@@ -1,14 +1,11 @@
 [project]
 name = "nedo-vision-dag-engine"
 version = "0.1.0"
-description = "Add your description here"
+description = "Typed compile-then-run DAG engine for live video analytics"
 readme = "README.md"
 authors = [{ name = "jhiven", email = "jivenagnar11@gmail.com" }]
 requires-python = ">=3.14"
 dependencies = []
-
-# [project.scripts]
-# nedo-vision-dag-engine = "nedo_vision_dag_engine:main"
 
 [build-system]
 requires = ["uv_build>=0.11.28,<0.12.0"]
@@ -16,6 +13,7 @@ build-backend = "uv_build"
 
 [tool.pyright]
 typeCheckingMode = "strict"
+extraPaths = [".", "src"]
 
 [dependency-groups]
 benchmark = [

@@ -6,6 +6,7 @@ import csv
 import hashlib
 import os
 import random
+
 from dataclasses import dataclass
 from typing import Literal, cast
 
@@ -18,14 +19,23 @@ from usecases.video_analytics.config import (
     NullSinkConfig,
     RTDETRConfig,
     VideoAnalyticsConfig,
+    resolve_default_device,
 )
 from usecases.video_analytics.contracts import (
+    CUDAMemorySamplerProtocol,
+    CUDAMemorySnapshot,
     DetectorBackend,
+    DropReason,
     ExecutionMode,
+    RTSPPublisherProtocol,
+    TerminalStatus,
     TrackBatch,
     TrackerBackend,
 )
+from usecases.video_analytics.gpu_memory import FakeCUDAMemorySampler, PyTorchCUDAMemorySampler
 from usecases.video_analytics.lifecycle import cleanup_repetition_resources
+from usecases.video_analytics.metrics import calculate_flow_metrics
+from usecases.video_analytics.publisher import FFmpegRTSPPublisher, FakeRTSPPublisher
 from usecases.video_analytics.sink import NullSink
 
 __all__ = [
@@ -59,6 +69,15 @@ REALWORLD_VIDEO_HEADERS = (
     "request_to_effect_ns",
     "transition_output_gap_ns",
     "old_plan_frames_completed_during_prep",
+    "source_frames_received",
+    "frames_admitted",
+    "frames_completed",
+    "ingress_overflow_drop_count",
+    "admission_rejection_count",
+    "execution_cancelled_count",
+    "frames_in_flight_at_window_end",
+    "total_dropped_frame_count",
+    "drop_rate",
     "dropped_frame_count",
     "duplicated_frame_count",
     "tracker_instance_id_before",
@@ -66,6 +85,22 @@ REALWORLD_VIDEO_HEADERS = (
     "tracker_reset_count_before",
     "tracker_reset_count_after",
     "processor_peak_count",
+    "gpu_memory_before_prep_allocated_bytes",
+    "gpu_memory_before_prep_reserved_bytes",
+    "gpu_memory_before_prep_peak_allocated_bytes",
+    "gpu_memory_before_prep_peak_reserved_bytes",
+    "gpu_memory_during_coexistence_allocated_bytes",
+    "gpu_memory_during_coexistence_reserved_bytes",
+    "gpu_memory_during_coexistence_peak_allocated_bytes",
+    "gpu_memory_during_coexistence_peak_reserved_bytes",
+    "gpu_memory_after_pub_allocated_bytes",
+    "gpu_memory_after_pub_reserved_bytes",
+    "gpu_memory_after_pub_peak_allocated_bytes",
+    "gpu_memory_after_pub_peak_reserved_bytes",
+    "gpu_memory_after_ret_allocated_bytes",
+    "gpu_memory_after_ret_reserved_bytes",
+    "gpu_memory_after_ret_peak_allocated_bytes",
+    "gpu_memory_after_ret_peak_reserved_bytes",
     "gpu_memory_before_prep_bytes",
     "gpu_memory_during_coexistence_bytes",
     "gpu_memory_after_pub_bytes",
@@ -84,6 +119,8 @@ REALWORLD_VIDEO_FRAME_HEADERS = (
     "detector_id",
     "tracker_instance_id",
     "queue_occupancy",
+    "terminal_status",
+    "drop_reason",
     "dropped",
     "duplicated",
 )
@@ -113,6 +150,15 @@ class RealworldVideoSampleRow:
     request_to_effect_ns: int
     transition_output_gap_ns: int
     old_plan_frames_completed_during_prep: int
+    source_frames_received: int
+    frames_admitted: int
+    frames_completed: int
+    ingress_overflow_drop_count: int
+    admission_rejection_count: int
+    execution_cancelled_count: int
+    frames_in_flight_at_window_end: int
+    total_dropped_frame_count: int
+    drop_rate: float
     dropped_frame_count: int
     duplicated_frame_count: int
     tracker_instance_id_before: str
@@ -120,10 +166,10 @@ class RealworldVideoSampleRow:
     tracker_reset_count_before: int
     tracker_reset_count_after: int
     processor_peak_count: int
-    gpu_memory_before_prep_bytes: int | None
-    gpu_memory_during_coexistence_bytes: int | None
-    gpu_memory_after_pub_bytes: int | None
-    gpu_memory_after_ret_bytes: int | None
+    gpu_before_snap: CUDAMemorySnapshot
+    gpu_coexist_snap: CUDAMemorySnapshot
+    gpu_pub_snap: CUDAMemorySnapshot
+    gpu_ret_snap: CUDAMemorySnapshot
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,13 +178,15 @@ class RealworldVideoFrameSampleRow:
     repetition: int
     mechanism: str
     frame_id: int
-    source_timestamp_ns: int
-    admission_timestamp_ns: int
-    completion_timestamp_ns: int
-    plan_version: int
+    source_timestamp_ns: int | None
+    admission_timestamp_ns: int | None
+    completion_timestamp_ns: int | None
+    plan_version: int | None
     detector_id: str
     tracker_instance_id: str
     queue_occupancy: float
+    terminal_status: str
+    drop_reason: str
     dropped: bool
     duplicated: bool
 
@@ -150,36 +198,24 @@ def _calculate_file_hash(path: str) -> str:
         return hashlib.sha256(f.read()).hexdigest()
 
 
-def _get_gpu_memory_bytes() -> int | None:
-    try:
-        import torch 
-
-        if torch.cuda.is_available(): 
-            torch.cuda.synchronize() 
-            return int(torch.cuda.memory_allocated()) 
-    except Exception:
-        pass
-    return None
-
-
 def run_realworld_video_suite(
     run_id: str,
     output_csv_path: str,
     video_path: str = "sample_video.mp4",
+    rtsp_base_url: str = "rtsp://127.0.0.1:8554",
     initial_model: str = "PekingU/rtdetr_r18vd",
     candidate_model: str = "PekingU/rtdetr_r50vd",
     device: str = "auto",
     dtype: str = "float32",
     repetition_count: int = 5,
-    update_frame_id: int = 50,
-    total_frames: int = 150,
+    update_frame_id: int = 60,
+    total_frames: int = 180,
+    queue_capacity: int = 4,
     use_fake_backends: bool = False,
     random_seed: int = 42,
     execution_mode: ExecutionMode | None = None,
 ) -> tuple[list[RealworldVideoSampleRow], list[RealworldVideoFrameSampleRow]]:
     """Orchestrate the real-world video analytics benchmark suite across Stop, Pause, and VEPS."""
-    from usecases.video_analytics.config import resolve_default_device
-
     device = resolve_default_device(device)
     mode = execution_mode or (ExecutionMode.SMOKE if use_fake_backends else ExecutionMode.PUBLICATION)
 
@@ -189,21 +225,26 @@ def run_realworld_video_suite(
         if not os.path.exists(video_path):
             raise FileNotFoundError(f"Publication mode video path not found: {video_path}")
         if device.startswith("cuda"):
-            import torch 
+            import torch
 
             if not torch.cuda.is_available():
-                raise RuntimeError(f"CUDA device {device!r} was requested in publication mode, but CUDA is not available.")
+                raise RuntimeError(
+                    f"CUDA device {device!r} was requested in publication mode, but CUDA is not available."
+                )
 
-        # Pre-download and cache model state_dicts into CPU RAM memory cache
-        from usecases.video_analytics.cli import prepare_assets_cmd
         from usecases.video_analytics.backends.rtdetr import preload_rtdetr_models_to_ram
+        from usecases.video_analytics.cli import prepare_assets_cmd
 
-        print(f"Pre-downloading/verifying model checkpoints: initial={initial_model!r}, candidate={candidate_model!r}...")
+        print(
+            f"Pre-downloading/verifying model checkpoints: initial={initial_model!r}, candidate={candidate_model!r}..."
+        )
         prepare_assets_cmd(initial_model=initial_model, candidate_model=candidate_model)
 
         print("Caching model weight state_dicts into CPU RAM memory cache...")
         preload_rtdetr_models_to_ram([initial_model, candidate_model])
-        print("RAM model cache initialized. Each sub-run will construct a fresh candidate backend from RAM cache (zero disk I/O).")
+        print(
+            "RAM model cache initialized. Each sub-run will construct a fresh candidate backend from RAM cache."
+        )
 
     output_dir = os.path.dirname(os.path.abspath(output_csv_path))
     os.makedirs(output_dir, exist_ok=True)
@@ -223,6 +264,18 @@ def run_realworld_video_suite(
 
             for pos, mech in enumerate(mech_order, start=1):
                 local_files = mode is ExecutionMode.PUBLICATION
+
+                publisher: RTSPPublisherProtocol
+                if mode is ExecutionMode.PUBLICATION:
+                    sub_id = f"r{rep}_p{pos}_{mech.lower()}"
+                    publisher = FFmpegRTSPPublisher(video_path, rtsp_base_url, sub_run_id=sub_id)
+                else:
+                    publisher = FakeRTSPPublisher()
+
+                publisher.start()
+                if mode is ExecutionMode.PUBLICATION:
+                    publisher.wait_until_ready(timeout_seconds=5.0)
+
                 cfg = VideoAnalyticsConfig(
                     source=FileVideoSourceConfig(video_path=video_path, enable_pacing=not use_fake_backends),
                     initial_detector=RTDETRConfig(
@@ -252,11 +305,17 @@ def run_realworld_video_suite(
                     cand_backend = FakeDetectorBackend(model_id=candidate_model)
                     trk_backend = FakeTrackerBackend(instance_id=f"fake_trk_rep_{rep}")
 
-                gpu_before = _get_gpu_memory_bytes()
+                memory_sampler: CUDAMemorySamplerProtocol
+                if device.startswith("cuda"):
+                    memory_sampler = PyTorchCUDAMemorySampler(device=device)
+                    memory_sampler.initialize()
+                else:
+                    memory_sampler = FakeCUDAMemorySampler(is_cuda=False)
 
                 rep_frame_rows: list[RealworldVideoFrameSampleRow] = []
                 seen_frame_ids: set[int] = set()
                 dup_count: int = 0
+                completed_frame_tuples: list[tuple[int, TerminalStatus, DropReason, bool, bool]] = []
 
                 def sink_observer(batch: TrackBatch, completion_ns: int) -> None:
                     nonlocal dup_count
@@ -278,10 +337,15 @@ def run_realworld_video_suite(
                         detector_id=batch.detector_id,
                         tracker_instance_id=batch.tracker_instance_id,
                         queue_occupancy=0.0,
+                        terminal_status=TerminalStatus.COMPLETED.value,
+                        drop_reason=DropReason.NONE.value,
                         dropped=False,
                         duplicated=is_dup,
                     )
                     rep_frame_rows.append(fr_row)
+                    completed_frame_tuples.append(
+                        (batch.frame_id, TerminalStatus.COMPLETED, DropReason.NONE, True, is_dup)
+                    )
 
                 sink_obj = NullSink(cfg.sink, observer=sink_observer)
 
@@ -303,6 +367,10 @@ def run_realworld_video_suite(
                         trk_inst_before = "unknown"
                         reset_before = 0
 
+                    memory_sampler.synchronize()
+                    memory_sampler.reset_peak_stats()
+                    gpu_before_snap = memory_sampler.sample()
+
                     app.process_until_frame(update_frame_id)
 
                     typed_mech = cast(Literal["VEPS", "Pause", "Stop"], mech)
@@ -316,10 +384,10 @@ def run_realworld_video_suite(
                     t_prep_end = timing.candidate_prep_end_ns
                     t_pub = timing.publication_timestamp_ns
 
-                    gpu_coexist = _get_gpu_memory_bytes()
+                    gpu_coexist_snap = memory_sampler.sample()
 
                     app.process_remaining()
-                    gpu_pub = _get_gpu_memory_bytes()
+                    gpu_pub_snap = memory_sampler.sample()
 
                     if app.tracker_backend is not None:
                         trk_inst_after = app.tracker_backend.instance_id
@@ -329,14 +397,14 @@ def run_realworld_video_suite(
                         reset_after = 0
 
                     app.close()
-                    gpu_ret = _get_gpu_memory_bytes()
+                    gpu_ret_snap = memory_sampler.sample()
 
                     # Find first candidate output frame
                     first_cand_row = next(
-                        (r for r in rep_frame_rows if r.plan_version > 1 and r.detector_id == candidate_model),
+                        (r for r in rep_frame_rows if r.plan_version is not None and r.plan_version > 1 and r.detector_id == candidate_model),
                         None,
                     )
-                    if first_cand_row is None:
+                    if first_cand_row is None or first_cand_row.completion_timestamp_ns is None:
                         raise RuntimeError(
                             f"Repetition {rep} mechanism {mech}: No candidate output reached the sink."
                         )
@@ -344,14 +412,14 @@ def run_realworld_video_suite(
 
                     # Find last old-plan output occurring before first candidate output
                     old_rows_before_cand = [
-                        r for r in rep_frame_rows if r.completion_timestamp_ns < first_candidate_output_ns
+                        r for r in rep_frame_rows if r.completion_timestamp_ns is not None and r.completion_timestamp_ns < first_candidate_output_ns
                     ]
                     if not old_rows_before_cand:
                         raise RuntimeError(
                             f"Repetition {rep} mechanism {mech}: No old-plan output reached the sink before first candidate output."
                         )
-                    last_old_row = max(old_rows_before_cand, key=lambda r: r.completion_timestamp_ns)
-                    last_old_output_ns = last_old_row.completion_timestamp_ns
+                    last_old_row = max(old_rows_before_cand, key=lambda r: r.completion_timestamp_ns or 0)
+                    last_old_output_ns = last_old_row.completion_timestamp_ns or 0
 
                     # Derive transition metrics
                     request_to_effect_ns = first_candidate_output_ns - t_req_swap
@@ -362,6 +430,7 @@ def run_realworld_video_suite(
                         1
                         for r in rep_frame_rows
                         if r.plan_version == 1
+                        and r.completion_timestamp_ns is not None
                         and t_prep_start <= r.completion_timestamp_ns <= t_prep_end
                     )
 
@@ -373,7 +442,10 @@ def run_realworld_video_suite(
                             f"pub={t_pub}, first_cand_output={first_candidate_output_ns}"
                         )
 
-                    # Measured peak live processor count (initial 4 nodes + candidate detector staged during prep)
+                    # Calculate Flow Accounting Metrics
+                    flow_summary = calculate_flow_metrics(completed_frame_tuples)
+
+                    # Measured peak live processor count
                     processor_peak_count = 5 if mech in ("VEPS", "Pause") else 5
 
                     sample_row = RealworldVideoSampleRow(
@@ -399,22 +471,32 @@ def run_realworld_video_suite(
                         request_to_effect_ns=request_to_effect_ns,
                         transition_output_gap_ns=transition_output_gap_ns,
                         old_plan_frames_completed_during_prep=old_prep_frames,
-                        dropped_frame_count=0,
+                        source_frames_received=flow_summary.source_frames_received,
+                        frames_admitted=flow_summary.frames_admitted,
+                        frames_completed=flow_summary.frames_completed,
+                        ingress_overflow_drop_count=flow_summary.ingress_overflow_drop_count,
+                        admission_rejection_count=flow_summary.admission_rejection_count,
+                        execution_cancelled_count=flow_summary.execution_cancelled_count,
+                        frames_in_flight_at_window_end=flow_summary.frames_in_flight_at_window_end,
+                        total_dropped_frame_count=flow_summary.total_dropped_frame_count,
+                        drop_rate=flow_summary.drop_rate,
+                        dropped_frame_count=flow_summary.total_dropped_frame_count,
                         duplicated_frame_count=dup_count,
                         tracker_instance_id_before=trk_inst_before,
                         tracker_instance_id_after=trk_inst_after,
                         tracker_reset_count_before=reset_before,
                         tracker_reset_count_after=reset_after,
                         processor_peak_count=processor_peak_count,
-                        gpu_memory_before_prep_bytes=gpu_before if device.startswith("cuda") else None,
-                        gpu_memory_during_coexistence_bytes=gpu_coexist if device.startswith("cuda") else None,
-                        gpu_memory_after_pub_bytes=gpu_pub if device.startswith("cuda") else None,
-                        gpu_memory_after_ret_bytes=gpu_ret if device.startswith("cuda") else None,
+                        gpu_before_snap=gpu_before_snap,
+                        gpu_coexist_snap=gpu_coexist_snap,
+                        gpu_pub_snap=gpu_pub_snap,
+                        gpu_ret_snap=gpu_ret_snap,
                     )
                     sample_rows.append(sample_row)
                     frame_rows.extend(rep_frame_rows)
 
                 finally:
+                    publisher.stop()
                     cleanup_repetition_resources()
 
     finally:
@@ -422,6 +504,10 @@ def run_realworld_video_suite(
             writer = csv.writer(f)
             writer.writerow(REALWORLD_VIDEO_HEADERS)
             for r in sample_rows:
+                gb = r.gpu_before_snap
+                gc = r.gpu_coexist_snap
+                gp = r.gpu_pub_snap
+                gr = r.gpu_ret_snap
                 writer.writerow([
                     r.run_id,
                     r.repetition,
@@ -445,6 +531,15 @@ def run_realworld_video_suite(
                     r.request_to_effect_ns,
                     r.transition_output_gap_ns,
                     r.old_plan_frames_completed_during_prep,
+                    r.source_frames_received,
+                    r.frames_admitted,
+                    r.frames_completed,
+                    r.ingress_overflow_drop_count,
+                    r.admission_rejection_count,
+                    r.execution_cancelled_count,
+                    r.frames_in_flight_at_window_end,
+                    r.total_dropped_frame_count,
+                    f"{r.drop_rate:.6f}",
                     r.dropped_frame_count,
                     r.duplicated_frame_count,
                     r.tracker_instance_id_before,
@@ -452,10 +547,28 @@ def run_realworld_video_suite(
                     r.tracker_reset_count_before,
                     r.tracker_reset_count_after,
                     r.processor_peak_count,
-                    r.gpu_memory_before_prep_bytes if r.gpu_memory_before_prep_bytes is not None else "",
-                    r.gpu_memory_during_coexistence_bytes if r.gpu_memory_during_coexistence_bytes is not None else "",
-                    r.gpu_memory_after_pub_bytes if r.gpu_memory_after_pub_bytes is not None else "",
-                    r.gpu_memory_after_ret_bytes if r.gpu_memory_after_ret_bytes is not None else "",
+                    # Allocator snapshot metrics (4 stages)
+                    gb.allocated_bytes if gb.allocated_bytes is not None else "",
+                    gb.reserved_bytes if gb.reserved_bytes is not None else "",
+                    gb.peak_allocated_bytes if gb.peak_allocated_bytes is not None else "",
+                    gb.peak_reserved_bytes if gb.peak_reserved_bytes is not None else "",
+                    gc.allocated_bytes if gc.allocated_bytes is not None else "",
+                    gc.reserved_bytes if gc.reserved_bytes is not None else "",
+                    gc.peak_allocated_bytes if gc.peak_allocated_bytes is not None else "",
+                    gc.peak_reserved_bytes if gc.peak_reserved_bytes is not None else "",
+                    gp.allocated_bytes if gp.allocated_bytes is not None else "",
+                    gp.reserved_bytes if gp.reserved_bytes is not None else "",
+                    gp.peak_allocated_bytes if gp.peak_allocated_bytes is not None else "",
+                    gp.peak_reserved_bytes if gp.peak_reserved_bytes is not None else "",
+                    gr.allocated_bytes if gr.allocated_bytes is not None else "",
+                    gr.reserved_bytes if gr.reserved_bytes is not None else "",
+                    gr.peak_allocated_bytes if gr.peak_allocated_bytes is not None else "",
+                    gr.peak_reserved_bytes if gr.peak_reserved_bytes is not None else "",
+                    # Legacy generic columns preserved for compatibility
+                    gb.allocated_bytes if gb.allocated_bytes is not None else "",
+                    gc.allocated_bytes if gc.allocated_bytes is not None else "",
+                    gp.allocated_bytes if gp.allocated_bytes is not None else "",
+                    gr.allocated_bytes if gr.allocated_bytes is not None else "",
                 ])
             f.flush()
 
@@ -468,13 +581,15 @@ def run_realworld_video_suite(
                     fr.repetition,
                     fr.mechanism,
                     fr.frame_id,
-                    fr.source_timestamp_ns,
-                    fr.admission_timestamp_ns,
-                    fr.completion_timestamp_ns,
-                    fr.plan_version,
+                    fr.source_timestamp_ns if fr.source_timestamp_ns is not None else "",
+                    fr.admission_timestamp_ns if fr.admission_timestamp_ns is not None else "",
+                    fr.completion_timestamp_ns if fr.completion_timestamp_ns is not None else "",
+                    fr.plan_version if fr.plan_version is not None else "",
                     fr.detector_id,
                     fr.tracker_instance_id,
                     f"{fr.queue_occupancy:.2f}",
+                    fr.terminal_status,
+                    fr.drop_reason,
                     str(fr.dropped),
                     str(fr.duplicated),
                 ])
