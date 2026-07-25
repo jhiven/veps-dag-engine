@@ -168,7 +168,7 @@ def run_realworld_video_suite(
     video_path: str = "sample_video.mp4",
     initial_model: str = "PekingU/rtdetr_r18vd",
     candidate_model: str = "PekingU/rtdetr_r50vd",
-    device: str = "cpu",
+    device: str = "auto",
     dtype: str = "float32",
     repetition_count: int = 5,
     update_frame_id: int = 50,
@@ -178,6 +178,9 @@ def run_realworld_video_suite(
     execution_mode: ExecutionMode | None = None,
 ) -> tuple[list[RealworldVideoSampleRow], list[RealworldVideoFrameSampleRow]]:
     """Orchestrate the real-world video analytics benchmark suite across Stop, Pause, and VEPS."""
+    from usecases.video_analytics.config import resolve_default_device
+
+    device = resolve_default_device(device)
     mode = execution_mode or (ExecutionMode.SMOKE if use_fake_backends else ExecutionMode.PUBLICATION)
 
     if mode is ExecutionMode.PUBLICATION:
@@ -191,11 +194,16 @@ def run_realworld_video_suite(
             if not torch.cuda.is_available():
                 raise RuntimeError(f"CUDA device {device!r} was requested in publication mode, but CUDA is not available.")
 
-        # Pre-download and pre-warm model checkpoints before measured execution
+        # Pre-download and cache model state_dicts into CPU RAM memory cache
         from usecases.video_analytics.cli import prepare_assets_cmd
+        from usecases.video_analytics.backends.rtdetr import preload_rtdetr_models_to_ram
 
         print(f"Pre-downloading/verifying model checkpoints: initial={initial_model!r}, candidate={candidate_model!r}...")
         prepare_assets_cmd(initial_model=initial_model, candidate_model=candidate_model)
+
+        print("Caching model weight state_dicts into CPU RAM memory cache...")
+        preload_rtdetr_models_to_ram([initial_model, candidate_model])
+        print("RAM model cache initialized. Each sub-run will construct a fresh candidate backend from RAM cache (zero disk I/O).")
 
     output_dir = os.path.dirname(os.path.abspath(output_csv_path))
     os.makedirs(output_dir, exist_ok=True)

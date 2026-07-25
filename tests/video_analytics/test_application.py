@@ -48,6 +48,7 @@ def test_application_lifecycle_and_swap_with_fakes() -> None:
         initial_detector=RTDETRConfig(model_id="r18"),
         candidate_detector=RTDETRConfig(model_id="r50"),
         update_frame_id=10,
+        total_frames_to_process=30,
     )
 
     source = FakeSource(frame_count=30)

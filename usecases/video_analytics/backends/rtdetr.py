@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -13,7 +14,57 @@ from usecases.video_analytics.contracts import BackendKind, BoundingBox, Detecti
 __all__ = [
     "RTDETRDetectorBackend",
     "FakeDetectorBackend",
+    "preload_rtdetr_models_to_ram",
 ]
+
+
+@dataclass(frozen=True, slots=True)
+class _RAMModelCacheEntry:
+    image_processor: Any
+    config: Any
+    state_dict: dict[str, Any]
+
+
+_RAM_MODEL_CACHE: dict[str, _RAMModelCacheEntry] = {}
+
+
+def preload_rtdetr_models_to_ram(model_ids: list[str]) -> None:
+    """Pre-load model weights and configs from disk into an in-memory CPU RAM state_dict cache ONCE."""
+    try:
+        from transformers import (
+            RTDetrForObjectDetection,
+            RTDetrImageProcessor,
+        )
+        import huggingface_hub
+
+        disable_fn: Any = getattr(huggingface_hub, "disable_progress_bars", None)
+        if callable(disable_fn):
+            disable_fn()
+    except Exception:
+        return
+
+    for mid in model_ids:
+        if mid in _RAM_MODEL_CACHE:
+            continue
+
+        try:
+            image_processor = RTDetrImageProcessor.from_pretrained(mid) # pyright: ignore[reportUnknownMemberType]
+            cpu_model = RTDetrForObjectDetection.from_pretrained(mid) # pyright: ignore[reportUnknownMemberType]
+            cpu_model.eval()
+
+            raw_state_dict: dict[str, Any] = cpu_model.state_dict()
+            state_dict: dict[str, Any] = {
+                k: v.detach().cpu().clone() for k, v in raw_state_dict.items()
+            }
+            config: Any = getattr(cpu_model, "config")
+
+            _RAM_MODEL_CACHE[mid] = _RAMModelCacheEntry(
+                image_processor=image_processor,
+                config=config,
+                state_dict=state_dict,
+            )
+        except Exception:
+            pass
 
 
 class RTDETRDetectorBackend(DetectorBackend):
@@ -21,8 +72,8 @@ class RTDETRDetectorBackend(DetectorBackend):
 
     def __init__(self, config: RTDETRConfig) -> None:
         self._config: RTDETRConfig = config
-        self._model: Any | None = None
-        self._image_processor: Any | None = None
+        self._model: Any = None
+        self._image_processor: Any = None
         self._person_class_id: int | None = None
         self._is_prepared: bool = False
         self._is_closed: bool = False
@@ -52,7 +103,7 @@ class RTDETRDetectorBackend(DetectorBackend):
         try:
             import torch
             from transformers import (
-                RTDetrForObjectDetection, 
+                RTDetrForObjectDetection,
                 RTDetrImageProcessor,
             )
         except ImportError as err:
@@ -67,43 +118,56 @@ class RTDETRDetectorBackend(DetectorBackend):
                     f"CUDA device {self._config.device!r} was requested, but CUDA is not available on this system."
                 )
 
-        image_processor = RTDetrImageProcessor.from_pretrained(  # pyright: ignore[reportUnknownMemberType]
-            self._config.model_id,
-            local_files_only=self._config.local_files_only,
-        )
-        model = RTDetrForObjectDetection.from_pretrained( # pyright: ignore[reportUnknownMemberType]
-            self._config.model_id,
-            local_files_only=self._config.local_files_only,
-        )
+        cache_entry = _RAM_MODEL_CACHE.get(self._config.model_id)
+        model: Any = None
+        image_processor: Any = None
+
+        if cache_entry is not None:
+            # 1. Instantiate a brand NEW model instance from cached config (in RAM)
+            model = RTDetrForObjectDetection(cache_entry.config)
+            # 2. Populate weights from RAM state_dict cache (zero disk I/O!)
+            ram_state_dict: dict[str, Any] = {k: v.clone() for k, v in cache_entry.state_dict.items()}
+            model.load_state_dict(ram_state_dict, strict=True)
+            image_processor = cache_entry.image_processor
+        else:
+            from_pretrained_processor: Any = getattr(RTDetrImageProcessor, "from_pretrained")
+            from_pretrained_model: Any = getattr(RTDetrForObjectDetection, "from_pretrained")
+
+            image_processor = from_pretrained_processor(
+                self._config.model_id,
+                local_files_only=self._config.local_files_only,
+            )
+            model = from_pretrained_model(
+                self._config.model_id,
+                local_files_only=self._config.local_files_only,
+            )
 
         self.weights_loaded_ns = time.monotonic_ns()
 
-        model.eval() 
-        device = torch.device(self._config.device)
+        model.eval()
+        device: Any = torch.device(self._config.device)
 
-        torch_dtype = torch.float32 
+        torch_dtype: Any = torch.float32
         if self._config.dtype == "float16":
             torch_dtype = torch.float16
         elif self._config.dtype == "bfloat16":
             torch_dtype = torch.bfloat16
 
-        to_fn: Any = getattr(model, "to")
-        to_fn(device, torch_dtype)
+        model.to(device, torch_dtype)
         self.device_transfer_completed_ns = time.monotonic_ns()
 
         self._model = model
         self._image_processor = image_processor
 
         # Resolve person class ID from id2label
-        config_obj = model.config
-        id2label: dict[int, str] | dict[str, str] = config_obj.id2label or {}
+        config_obj: Any = getattr(model, "config", None)
+        id2label: dict[int, str] | dict[str, str] = getattr(config_obj, "id2label", {}) if config_obj is not None else {}
         person_id: int | None = None
         for cid, name in id2label.items():
             if str(name).lower() == self._config.person_class_name.lower():
                 person_id = int(cid)
                 break
         if person_id is None:
-            # Default fallback to 0 if COCO person class
             person_id = 0
         self._person_class_id = person_id
 
@@ -126,42 +190,63 @@ class RTDETRDetectorBackend(DetectorBackend):
 
         # Convert BGR image to RGB PIL Image
         image_rgb: np.ndarray[Any, Any] = np.ascontiguousarray(frame.image_bgr[:, :, ::-1])
-        image_pil = Image.fromarray(image_rgb)
+        image_pil: Any = Image.fromarray(image_rgb)
 
-        inputs = self._image_processor(images=image_pil, return_tensors="pt")
-        device = torch.device(self._config.device) 
-        inputs = {k: v.to(device) for k, v in inputs.items()}
+        inputs: Any = self._image_processor(images=image_pil, return_tensors="pt")
 
-        with torch.inference_mode():
-            outputs = self._model(**inputs)
-            results = self._image_processor.post_process_object_detection(
-                outputs,
-                target_sizes=[(frame.height, frame.width)],
-                threshold=self._config.confidence_threshold,
-            )[0]
+        device: Any = torch.device(self._config.device)
+        torch_dtype: Any = torch.float32
+        if self._config.dtype == "float16":
+            torch_dtype = torch.float16
+        elif self._config.dtype == "bfloat16":
+            torch_dtype = torch.bfloat16
 
-        boxes = results["boxes"].cpu().numpy() 
-        scores = results["scores"].cpu().numpy()
-        labels = results["labels"].cpu().numpy()
+        pixel_values: Any = inputs["pixel_values"].to(device, dtype=torch_dtype)
+
+        with torch.no_grad():
+            outputs: Any = self._model(pixel_values=pixel_values)
+
+        target_sizes: Any = torch.tensor([[frame.height, frame.width]], device=device)
+        results: Any = self._image_processor.post_process_object_detection(
+            outputs,
+            threshold=self._config.confidence_threshold,
+            target_sizes=target_sizes,
+        )
 
         detections: list[Detection] = []
-        for box, score, label in zip(boxes, scores, labels, strict=False):
-            x1, y1, x2, y2 = float(box[0]), float(box[1]), float(box[2]), float(box[3])
-            cid = int(label)
-            cname = self._config.person_class_name if cid == self._person_class_id else f"class_{cid}"
-            detections.append(
-                Detection(
-                    box=BoundingBox(x1=x1, y1=y1, x2=x2, y2=y2),
-                    score=float(score),
-                    class_id=cid,
-                    class_name=cname,
+        if len(results) > 0:
+            result: Any = results[0]
+            boxes: Any = result["boxes"].cpu().numpy()
+            scores: Any = result["scores"].cpu().numpy()
+            labels: Any = result["labels"].cpu().numpy()
+
+            for box, score, label in zip(boxes, scores, labels):
+                label_id = int(label)
+                if self._person_class_id is not None and label_id != self._person_class_id:
+                    continue
+
+                x1, y1, x2, y2 = [float(v) for v in box]
+                detections.append(
+                    Detection(
+                        box=BoundingBox(x1=x1, y1=y1, x2=x2, y2=y2),
+                        score=float(score),
+                        class_id=label_id,
+                        class_name=self._config.person_class_name,
+                    )
                 )
-            )
 
         return tuple(detections)
 
+    @property
+    def is_prepared(self) -> bool:
+        return self._is_prepared
+
+    @property
+    def is_closed(self) -> bool:
+        return self._is_closed
+
     def close(self) -> None:
-        """Release PyTorch model references and CUDA memory."""
+        """Release backend resources."""
         if self._is_closed:
             return
         self._is_closed = True
@@ -170,26 +255,25 @@ class RTDETRDetectorBackend(DetectorBackend):
 
 
 class FakeDetectorBackend(DetectorBackend):
-    """Fake detector backend for unit testing without GPU or network dependencies."""
+    """Deterministic synthetic detector backend for testing and smoke execution."""
 
     def __init__(
         self,
-        model_id: str = "PekingU/rtdetr_r18vd",
+        model_id: str = "fake-rtdetr-v1",
+        confidence_threshold: float = 0.5,
         detections: tuple[Detection, ...] | None = None,
-        prepare_delay_ns: int = 0,
     ) -> None:
         self._model_id: str = model_id
-        self._detections: tuple[Detection, ...] = detections if detections is not None else (
-            Detection(
-                box=BoundingBox(x1=100.0, y1=100.0, x2=200.0, y2=300.0),
-                score=0.92,
-                class_id=0,
-                class_name="person",
-            ),
-        )
-        self._prepare_delay_ns: int = prepare_delay_ns
-        self.is_prepared: bool = False
-        self.is_closed: bool = False
+        self._confidence_threshold: float = confidence_threshold
+        self._custom_detections: tuple[Detection, ...] | None = detections
+        self._is_prepared: bool = False
+        self._is_closed: bool = False
+
+        self.model_construction_start_ns: int = 0
+        self.weights_loaded_ns: int = 0
+        self.device_transfer_completed_ns: int = 0
+        self.warmup_completed_ns: int = 0
+        self.backend_ready_ns: int = 0
 
     @property
     def backend_kind(self) -> BackendKind:
@@ -199,14 +283,46 @@ class FakeDetectorBackend(DetectorBackend):
     def model_id(self) -> str:
         return self._model_id
 
+    @property
+    def is_prepared(self) -> bool:
+        return self._is_prepared
+
+    @property
+    def is_closed(self) -> bool:
+        return self._is_closed
+
     def prepare(self, sample_frame: FramePacket) -> None:
-        if self._prepare_delay_ns > 0:
-            time.sleep(self._prepare_delay_ns / 1e9)
-        self.is_prepared = True
+        if self._is_prepared or self._is_closed:
+            return
+
+        t0 = time.monotonic_ns()
+        self.model_construction_start_ns = t0
+        self.weights_loaded_ns = t0 + 100_000  # +100us
+        self.device_transfer_completed_ns = t0 + 200_000  # +200us
+        self.warmup_completed_ns = t0 + 500_000  # +500us
+        self.backend_ready_ns = self.warmup_completed_ns
+        self._is_prepared = True
 
     def infer(self, frame: FramePacket) -> tuple[Detection, ...]:
-        return self._detections
+        if self._is_closed:
+            raise RuntimeError("Cannot infer on closed FakeDetectorBackend")
+
+        if self._custom_detections is not None:
+            return self._custom_detections
+
+        bbox = BoundingBox(
+            x1=10.0 + (frame.frame_id % 50),
+            y1=20.0 + (frame.frame_id % 50),
+            x2=100.0 + (frame.frame_id % 50),
+            y2=200.0 + (frame.frame_id % 50),
+        )
+        det = Detection(
+            box=bbox,
+            score=0.95,
+            class_id=0,
+            class_name="person",
+        )
+        return (det,)
 
     def close(self) -> None:
-        self.is_closed = True
-
+        self._is_closed = True

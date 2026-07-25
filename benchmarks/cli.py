@@ -267,6 +267,7 @@ def run_benchmarks(
             run_realworld_video_suite(
                 run_id=run_id,
                 output_csv_path=rw_video_csv,
+                device="auto",
                 repetition_count=repetition_count,
                 use_fake_backends=(profile == "smoke"),
                 execution_mode=ExecutionMode.SMOKE if profile == "smoke" else ExecutionMode.PUBLICATION,

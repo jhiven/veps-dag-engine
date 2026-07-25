@@ -144,8 +144,7 @@ class VideoAnalyticsApplication:
 
         self._metadata = self._source.open()
 
-        if self.config.total_frames_to_process is not None:
-            verify_video_length(self._metadata, self.config.total_frames_to_process)
+        verify_video_length(self._metadata, self.config.total_frames_to_process)
 
         self._sink.open(self._metadata)
 
@@ -383,7 +382,7 @@ class VideoAnalyticsApplication:
 
         processed = 0
         while True:
-            if self.config.total_frames_to_process is not None and self._processed_frames >= self.config.total_frames_to_process:
+            if self._processed_frames >= self.config.total_frames_to_process:
                 break
             now_ns = time.monotonic_ns()
             res = self._controller.admit_frame(

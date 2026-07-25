@@ -76,7 +76,7 @@ def run_cmd(
         ),
         sink=NullSinkConfig(),
         update_frame_id=update_frame_id,
-        total_frames_to_process=total_frames,
+        total_frames_to_process=total_frames if total_frames is not None else 150,
     )
     validate_config(cfg)
 
