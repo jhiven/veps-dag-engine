@@ -28,6 +28,7 @@ from usecases.video_analytics.ingress import BoundedIngressQueue, RTSPCaptureIng
 from usecases.video_analytics.metrics import FlowMetricsSummary, calculate_flow_metrics
 from usecases.video_analytics.publisher import FFmpegRTSPPublisher
 from usecases.video_analytics.source import FileVideoSource, RTSPVideoSource
+from usecases.video_analytics.lifecycle import CoexistenceTracker
 
 __all__ = [
     "VideoAnalyticsApplication",
@@ -55,4 +56,5 @@ __all__ = [
     "PyTorchCUDAMemorySampler",
     "FlowMetricsSummary",
     "calculate_flow_metrics",
+    "CoexistenceTracker",
 ]

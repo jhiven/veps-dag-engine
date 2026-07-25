@@ -92,6 +92,10 @@ class FramePacket:
     image_bgr: npt.NDArray[np.uint8]
     width: int
     height: int
+    inside_measurement_window: bool = False
+    queue_occupancy_before_enqueue: int | None = None
+    queue_occupancy_after_enqueue: int | None = None
+    queue_capacity: int | None = None
 
     def __post_init__(self) -> None:
         if self.frame_id <= 0:
@@ -129,7 +133,11 @@ class DetectionBatch:
     detector_id: str
     plan_version: int | None
     detections: tuple[Detection, ...]
-    admission_timestamp_ns: int = 0
+    admission_timestamp_ns: int | None = None
+    inside_measurement_window: bool = False
+    queue_occupancy_before_enqueue: int | None = None
+    queue_occupancy_after_enqueue: int | None = None
+    queue_capacity: int | None = None
 
     @property
     def output(self) -> DetectionBatch:
@@ -157,8 +165,12 @@ class TrackBatch:
     detector_id: str
     tracker_instance_id: str
     tracks: tuple[Track, ...]
-    admission_timestamp_ns: int = 0
+    admission_timestamp_ns: int | None = None
     plan_version: int | None = None
+    inside_measurement_window: bool = False
+    queue_occupancy_before_enqueue: int | None = None
+    queue_occupancy_after_enqueue: int | None = None
+    queue_capacity: int | None = None
 
     @property
     def output(self) -> TrackBatch:

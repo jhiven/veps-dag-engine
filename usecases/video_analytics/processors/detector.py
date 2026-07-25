@@ -91,6 +91,10 @@ class DetectorProcessor(Processor):
             detector_id=self.backend.model_id,
             plan_version=context.plan_version,
             detections=detections,
+            inside_measurement_window=frame_packet.inside_measurement_window,
+            queue_occupancy_before_enqueue=frame_packet.queue_occupancy_before_enqueue,
+            queue_occupancy_after_enqueue=frame_packet.queue_occupancy_after_enqueue,
+            queue_capacity=frame_packet.queue_capacity,
         )
         return batch
 

@@ -86,6 +86,10 @@ class TrackerProcessor(StatefulProcessor):
             tracker_instance_id=self.backend.instance_id,
             tracks=tracks,
             plan_version=batch.plan_version,
+            inside_measurement_window=batch.inside_measurement_window,
+            queue_occupancy_before_enqueue=batch.queue_occupancy_before_enqueue,
+            queue_occupancy_after_enqueue=batch.queue_occupancy_after_enqueue,
+            queue_capacity=batch.queue_capacity,
         )
         return res
 

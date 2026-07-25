@@ -27,7 +27,7 @@ class FlowMetricsSummary:
     execution_cancelled_count: int
     frames_in_flight_at_window_end: int
     total_dropped_frame_count: int
-    drop_rate: float
+    drop_rate: float | None
     duplicated_frame_count: int
 
 
@@ -44,7 +44,7 @@ class ReconfigurationMetricsSummary:
 def calculate_flow_metrics(
     frame_records: Sequence[tuple[int, TerminalStatus, DropReason, bool, bool]],
 ) -> FlowMetricsSummary:
-    """Calculate aggregate flow accounting metrics and enforce the flow accounting invariant.
+    """Calculate aggregate flow accounting metrics and enforce the flow accounting invariants.
 
     Each record in frame_records is a tuple of:
     (frame_id, terminal_status, drop_reason, is_admitted, is_duplicated)
@@ -76,14 +76,21 @@ def calculate_flow_metrics(
             in_flight_end += 1
 
     total_dropped = ingress_overflow_drops + admission_rejection_drops + execution_cancelled_drops
-    drop_rate = (total_dropped / source_frames_received) if source_frames_received > 0 else 0.0
+    drop_rate = (total_dropped / source_frames_received) if source_frames_received > 0 else None
 
-    # Invariant Check: source_frames_received = frames_completed + total_dropped + in_flight_end
-    expected_sum = frames_completed + total_dropped + in_flight_end
-    if source_frames_received != expected_sum:
+    # Invariant Check 1: source_frames_received == frames_admitted + ingress_overflow_drop_count
+    if source_frames_received != (frames_admitted + ingress_overflow_drops):
         raise ValueError(
             f"Flow accounting invariant violated: source_frames_received ({source_frames_received}) != "
-            f"completed ({frames_completed}) + dropped ({total_dropped}) + in_flight ({in_flight_end}) [sum={expected_sum}]"
+            f"admitted ({frames_admitted}) + ingress_overflow ({ingress_overflow_drops})"
+        )
+
+    # Invariant Check 2: frames_admitted == frames_completed + admission_rejection_count + execution_cancelled_count + frames_in_flight_at_window_end
+    expected_admitted_sum = frames_completed + admission_rejection_drops + execution_cancelled_drops + in_flight_end
+    if frames_admitted != expected_admitted_sum:
+        raise ValueError(
+            f"Flow accounting invariant violated: frames_admitted ({frames_admitted}) != "
+            f"completed ({frames_completed}) + rejected ({admission_rejection_drops}) + cancelled ({execution_cancelled_drops}) + in_flight ({in_flight_end}) [sum={expected_admitted_sum}]"
         )
 
     return FlowMetricsSummary(

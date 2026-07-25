@@ -42,6 +42,41 @@ class FileVideoSource(FrameSource):
         self._is_synthetic: bool = False
         self._require_production: bool = require_production
 
+        self._inside_measurement_window: bool = False
+        self._measurement_source_frame_target: int = 180
+        self._measurement_source_frames_received: int = 0
+        self._measurement_start_timestamp_ns: int | None = None
+        self._measurement_end_timestamp_ns: int | None = None
+        self._lock: threading.Lock = threading.Lock()
+
+    def start_measurement_window(self, target_frames: int) -> None:
+        with self._lock:
+            self._inside_measurement_window = True
+            self._measurement_source_frame_target = target_frames
+            self._measurement_source_frames_received = 0
+            self._measurement_start_timestamp_ns = time.monotonic_ns()
+            self._measurement_end_timestamp_ns = None
+
+    @property
+    def inside_measurement_window(self) -> bool:
+        with self._lock:
+            return self._inside_measurement_window
+
+    @property
+    def measurement_source_frames_received(self) -> int:
+        with self._lock:
+            return self._measurement_source_frames_received
+
+    @property
+    def measurement_start_timestamp_ns(self) -> int | None:
+        with self._lock:
+            return self._measurement_start_timestamp_ns
+
+    @property
+    def measurement_end_timestamp_ns(self) -> int | None:
+        with self._lock:
+            return self._measurement_end_timestamp_ns
+
     @property
     def backend_kind(self) -> BackendKind:
         if (
@@ -226,6 +261,15 @@ class FileVideoSource(FrameSource):
         if self._is_closed or self._metadata is None:
             raise RuntimeError("FileVideoSource must be opened before reading")
 
+        with self._lock:
+            is_measured = self._inside_measurement_window
+            if is_measured:
+                if self._measurement_source_frames_received >= self._measurement_source_frame_target:
+                    return None
+                self._measurement_source_frames_received += 1
+                if self._measurement_source_frames_received == self._measurement_source_frame_target:
+                    self._measurement_end_timestamp_ns = time.monotonic_ns()
+
         if self._is_synthetic or self._vframes is None:
             if self._current_frame_id >= 1000:
                 return None
@@ -243,6 +287,7 @@ class FileVideoSource(FrameSource):
                 image_bgr=img,
                 width=w,
                 height=h,
+                inside_measurement_window=is_measured,
             )
 
         if self._current_frame_id >= self._metadata.frame_count:  # type: ignore[operator]
@@ -262,6 +307,7 @@ class FileVideoSource(FrameSource):
             image_bgr=img,  # pyright: ignore[reportArgumentType]
             width=self._metadata.width,
             height=self._metadata.height,
+            inside_measurement_window=is_measured,
         )
 
     def close(self) -> None:
@@ -293,6 +339,42 @@ class RTSPVideoSource(FrameSource):
         self._current_frame_id: int = 0
         self._is_closed: bool = False
         self._lock: threading.Lock = threading.Lock()
+
+        self._inside_measurement_window: bool = False
+        self._measurement_source_frame_target: int = 180
+        self._measurement_source_frames_received: int = 0
+        self._measurement_start_timestamp_ns: int | None = None
+        self._measurement_end_timestamp_ns: int | None = None
+
+    def start_measurement_window(self, target_frames: int) -> None:
+        with self._lock:
+            self._inside_measurement_window = True
+            self._measurement_source_frame_target = target_frames
+            self._measurement_source_frames_received = 0
+            self._measurement_start_timestamp_ns = time.monotonic_ns()
+            self._measurement_end_timestamp_ns = None
+            if self._ingress is not None:
+                self._ingress.queue.clear_and_cancel_all()
+
+    @property
+    def inside_measurement_window(self) -> bool:
+        with self._lock:
+            return self._inside_measurement_window
+
+    @property
+    def measurement_source_frames_received(self) -> int:
+        with self._lock:
+            return self._measurement_source_frames_received
+
+    @property
+    def measurement_start_timestamp_ns(self) -> int | None:
+        with self._lock:
+            return self._measurement_start_timestamp_ns
+
+    @property
+    def measurement_end_timestamp_ns(self) -> int | None:
+        with self._lock:
+            return self._measurement_end_timestamp_ns
 
     @property
     def backend_kind(self) -> BackendKind:
@@ -363,6 +445,14 @@ class RTSPVideoSource(FrameSource):
                     self._current_frame_id += 1
                     fid = self._current_frame_id
 
+                    is_measured = self._inside_measurement_window
+                    if is_measured:
+                        if self._measurement_source_frames_received >= self._measurement_source_frame_target:
+                            return None
+                        self._measurement_source_frames_received += 1
+                        if self._measurement_source_frames_received == self._measurement_source_frame_target:
+                            self._measurement_end_timestamp_ns = time.monotonic_ns()
+
                 img_np = np.frombuffer(raw_data, dtype=np.uint8).reshape((height, width, 3))
                 now_ns = time.monotonic_ns()
 
@@ -372,6 +462,7 @@ class RTSPVideoSource(FrameSource):
                     image_bgr=img_np,
                     width=width,
                     height=height,
+                    inside_measurement_window=is_measured,
                 )
             except Exception:
                 return None

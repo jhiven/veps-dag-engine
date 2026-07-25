@@ -155,6 +155,11 @@ def test_first_candidate_output_and_metrics_derivation() -> None:
         )
 
         for s in samples:
+            assert s.first_candidate_output_ns is not None
+            assert s.request_to_effect_ns is not None
+            assert s.transition_output_gap_ns is not None
+            assert s.request_timestamp_ns is not None
+
             assert s.first_candidate_output_ns > 0
             assert s.request_to_effect_ns > 0
             assert s.transition_output_gap_ns > 0
@@ -199,5 +204,5 @@ def test_frame_level_count_agrees_with_run_level() -> None:
 
         assert len(samples) == 3
         for s in samples:
-            m_frames = [f for f in frame_rows if f.mechanism == s.mechanism and f.repetition == s.repetition]
+            m_frames = [f for f in frame_rows if f.mechanism == s.mechanism and f.repetition == s.repetition and f.inside_measurement_window]
             assert len(m_frames) == 10

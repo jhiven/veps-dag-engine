@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from nedo_vision_dag_engine.processor import (
     FrameContext,
@@ -61,13 +61,7 @@ class PersonFilterProcessor(Processor):
         filtered = tuple(
             d for d in batch.detections if d.class_name.lower() == self.config.target_class_name.lower()
         )
-        res = DetectionBatch(
-            frame_id=batch.frame_id,
-            source_timestamp_ns=batch.source_timestamp_ns,
-            detector_id=batch.detector_id,
-            plan_version=batch.plan_version,
-            detections=filtered,
-        )
+        res = replace(batch, detections=filtered)
         return res
 
     def healthcheck(self) -> None:

@@ -85,6 +85,9 @@ class RTDETRDetectorBackend(DetectorBackend):
         self.warmup_completed_ns: int = 0
         self.backend_ready_ns: int = 0
 
+        from usecases.video_analytics.lifecycle import CoexistenceTracker
+        CoexistenceTracker.detector_created(id(self))
+
     @property
     def backend_kind(self) -> BackendKind:
         return BackendKind.PRODUCTION
@@ -240,6 +243,8 @@ class RTDETRDetectorBackend(DetectorBackend):
         self._is_closed = True
         self._model = None
         self._image_processor = None
+        from usecases.video_analytics.lifecycle import CoexistenceTracker
+        CoexistenceTracker.detector_closed(id(self))
 
 
 class FakeDetectorBackend(DetectorBackend):
@@ -262,6 +267,9 @@ class FakeDetectorBackend(DetectorBackend):
         self.device_transfer_completed_ns: int = 0
         self.warmup_completed_ns: int = 0
         self.backend_ready_ns: int = 0
+
+        from usecases.video_analytics.lifecycle import CoexistenceTracker
+        CoexistenceTracker.detector_created(id(self))
 
     @property
     def backend_kind(self) -> BackendKind:
@@ -314,3 +322,5 @@ class FakeDetectorBackend(DetectorBackend):
 
     def close(self) -> None:
         self._is_closed = True
+        from usecases.video_analytics.lifecycle import CoexistenceTracker
+        CoexistenceTracker.detector_closed(id(self))

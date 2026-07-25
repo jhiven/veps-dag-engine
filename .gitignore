@@ -12,3 +12,4 @@ wheels/
 benchmark-results/
 
 *.md
+*.csv

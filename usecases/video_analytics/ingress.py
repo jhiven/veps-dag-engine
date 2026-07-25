@@ -54,12 +54,38 @@ class BoundedIngressQueue(Generic[T]):
 
     def put(self, item: T) -> None:
         """Push an item into the queue. If full, evict the oldest item first (drop-oldest)."""
+        import dataclasses
+        from typing import Any, cast
         dropped_item: T | None = None
         with self._lock:
-            if len(self._queue) >= self._capacity:
-                dropped_item = self._queue.popleft()
+            occ_before = len(self._queue)
+            if occ_before >= self._capacity:
+                raw_dropped = self._queue.popleft()
                 self._overflow_drop_count += 1
-            self._queue.append(item)
+                occ_after = self._capacity
+                
+                if raw_dropped is not None and hasattr(raw_dropped, "queue_occupancy_before_enqueue"):
+                    dropped_item = cast(T, dataclasses.replace(
+                        cast(Any, raw_dropped),
+                        queue_occupancy_before_enqueue=self._capacity,
+                        queue_occupancy_after_enqueue=self._capacity,
+                        queue_capacity=self._capacity
+                    ))
+                else:
+                    dropped_item = raw_dropped
+            else:
+                occ_after = occ_before + 1
+            
+            if hasattr(item, "queue_occupancy_before_enqueue"):
+                updated_item = cast(T, dataclasses.replace(
+                    cast(Any, item),
+                    queue_occupancy_before_enqueue=occ_before,
+                    queue_occupancy_after_enqueue=occ_after,
+                    queue_capacity=self._capacity
+                ))
+            else:
+                updated_item = item
+            self._queue.append(updated_item)
 
         if dropped_item is not None and self._on_drop_callback is not None:
             self._on_drop_callback(dropped_item, DropReason.INGRESS_OVERFLOW)
