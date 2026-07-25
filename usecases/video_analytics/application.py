@@ -92,9 +92,9 @@ class VideoAnalyticsApplication:
             return
 
         if self.config.initial_detector.device.startswith("cuda") or self.config.candidate_detector.device.startswith("cuda"):
-            import torch  # type: ignore[import-not-found,import-untyped]
+            import torch 
 
-            if not torch.cuda.is_available():  # pyright: ignore[reportUnknownMemberType]
+            if not torch.cuda.is_available():
                 raise RuntimeError(
                     f"CUDA device {self.config.initial_detector.device!r} was requested in publication mode, but CUDA is not available."
                 )

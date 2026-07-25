@@ -64,7 +64,7 @@ class DetectorProcessor(Processor):
         if isinstance(inputs, FramePacket):
             frame_packet = inputs
         elif isinstance(inputs, dict):
-            inp_dict: dict[str, object] = inputs  # type: ignore[assignment]
+            inp_dict: dict[str, object] = inputs # pyright: ignore[reportUnknownVariableType]
             val = inp_dict.get("input")
             if isinstance(val, FramePacket):
                 frame_packet = val

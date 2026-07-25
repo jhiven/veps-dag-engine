@@ -23,11 +23,11 @@ def cleanup_gpu_memory() -> None:
     """
     gc.collect()
     try:
-        import torch  # type: ignore[import-not-found,import-untyped]
+        import torch
 
-        if torch.cuda.is_available():  # pyright: ignore[reportUnknownMemberType]
-            torch.cuda.empty_cache()  # pyright: ignore[reportUnknownMemberType]
-            torch.cuda.synchronize()  # pyright: ignore[reportUnknownMemberType]
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
     except (ImportError, Exception) as err:
         logger.debug("GPU cleanup skipped: %s", err)
 

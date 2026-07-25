@@ -30,9 +30,9 @@ def prepare_assets_cmd(
     print(f"Preparing assets for initial model {initial_model!r} and candidate model {candidate_model!r}...")
 
     try:
-        from transformers import (  # type: ignore[import-not-found,import-untyped]  # pyright: ignore[reportUnknownVariableType]
-            RTDetrForObjectDetection,  # pyright: ignore[reportUnknownVariableType]
-            RTDetrImageProcessor,  # pyright: ignore[reportUnknownVariableType]
+        from transformers import (
+            RTDetrForObjectDetection,
+            RTDetrImageProcessor,
         )
     except ImportError:
         print("Error: PyTorch and Transformers are required for asset preparation.", file=sys.stderr)
@@ -41,7 +41,7 @@ def prepare_assets_cmd(
 
     for mid in (initial_model, candidate_model):
         print(f"  Downloading/verifying checkpoint: {mid}")
-        RTDetrImageProcessor.from_pretrained(mid)  # pyright: ignore[reportUnknownMemberType]
+        RTDetrImageProcessor.from_pretrained(mid) # pyright: ignore[reportUnknownMemberType]
         RTDetrForObjectDetection.from_pretrained(mid)  # pyright: ignore[reportUnknownMemberType]
 
     print("All model assets successfully prepared and verified.")
@@ -57,17 +57,22 @@ def run_cmd(
     total_frames: int | None = None,
 ) -> None:
     """Run standalone video analytics execution with a detector swap."""
+    # Ensure model checkpoints are pre-downloaded and verified before starting pipeline
+    prepare_assets_cmd(initial_model=initial_model, candidate_model=candidate_model)
+
     cfg = VideoAnalyticsConfig(
         source=FileVideoSourceConfig(video_path=video_path),
         initial_detector=RTDETRConfig(
             model_id=initial_model,
             device=device,
             confidence_threshold=confidence_threshold,
+            local_files_only=True,
         ),
         candidate_detector=RTDETRConfig(
             model_id=candidate_model,
             device=device,
             confidence_threshold=confidence_threshold,
+            local_files_only=True,
         ),
         sink=NullSinkConfig(),
         update_frame_id=update_frame_id,

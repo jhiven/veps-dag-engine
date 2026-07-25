@@ -152,11 +152,11 @@ def _calculate_file_hash(path: str) -> str:
 
 def _get_gpu_memory_bytes() -> int | None:
     try:
-        import torch  # type: ignore[import-not-found,import-untyped]
+        import torch 
 
-        if torch.cuda.is_available():  # pyright: ignore[reportUnknownMemberType]
-            torch.cuda.synchronize()  # pyright: ignore[reportUnknownMemberType]
-            return int(torch.cuda.memory_allocated())  # pyright: ignore[reportUnknownMemberType,reportUnknownArgumentType]
+        if torch.cuda.is_available(): 
+            torch.cuda.synchronize() 
+            return int(torch.cuda.memory_allocated()) 
     except Exception:
         pass
     return None
@@ -186,10 +186,16 @@ def run_realworld_video_suite(
         if not os.path.exists(video_path):
             raise FileNotFoundError(f"Publication mode video path not found: {video_path}")
         if device.startswith("cuda"):
-            import torch  # type: ignore[import-not-found,import-untyped]
+            import torch 
 
-            if not torch.cuda.is_available():  # pyright: ignore[reportUnknownMemberType]
+            if not torch.cuda.is_available():
                 raise RuntimeError(f"CUDA device {device!r} was requested in publication mode, but CUDA is not available.")
+
+        # Pre-download and pre-warm model checkpoints before measured execution
+        from usecases.video_analytics.cli import prepare_assets_cmd
+
+        print(f"Pre-downloading/verifying model checkpoints: initial={initial_model!r}, candidate={candidate_model!r}...")
+        prepare_assets_cmd(initial_model=initial_model, candidate_model=candidate_model)
 
     output_dir = os.path.dirname(os.path.abspath(output_csv_path))
     os.makedirs(output_dir, exist_ok=True)
@@ -208,10 +214,21 @@ def run_realworld_video_suite(
             rng.shuffle(mech_order)
 
             for pos, mech in enumerate(mech_order, start=1):
+                local_files = mode is ExecutionMode.PUBLICATION
                 cfg = VideoAnalyticsConfig(
                     source=FileVideoSourceConfig(video_path=video_path, enable_pacing=not use_fake_backends),
-                    initial_detector=RTDETRConfig(model_id=initial_model, device=device, dtype=dtype),
-                    candidate_detector=RTDETRConfig(model_id=candidate_model, device=device, dtype=dtype),
+                    initial_detector=RTDETRConfig(
+                        model_id=initial_model,
+                        device=device,
+                        dtype=dtype,
+                        local_files_only=local_files,
+                    ),
+                    candidate_detector=RTDETRConfig(
+                        model_id=candidate_model,
+                        device=device,
+                        dtype=dtype,
+                        local_files_only=local_files,
+                    ),
                     tracker=ByteTrackConfig(),
                     sink=NullSinkConfig(),
                     update_frame_id=update_frame_id,

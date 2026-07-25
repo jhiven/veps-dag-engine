@@ -50,10 +50,10 @@ class RTDETRDetectorBackend(DetectorBackend):
         self.model_construction_start_ns = time.monotonic_ns()
 
         try:
-            import torch  # type: ignore[import-not-found,import-untyped]
-            from transformers import (  # type: ignore[import-not-found,import-untyped]  # pyright: ignore[reportUnknownVariableType]
-                RTDetrForObjectDetection,  # pyright: ignore[reportUnknownVariableType]
-                RTDetrImageProcessor,  # pyright: ignore[reportUnknownVariableType]
+            import torch
+            from transformers import (
+                RTDetrForObjectDetection, 
+                RTDetrImageProcessor,
             )
         except ImportError as err:
             raise RuntimeError(
@@ -62,30 +62,30 @@ class RTDETRDetectorBackend(DetectorBackend):
             ) from err
 
         if self._config.device.startswith("cuda"):
-            if not torch.cuda.is_available():  # pyright: ignore[reportUnknownMemberType]
+            if not torch.cuda.is_available():
                 raise RuntimeError(
                     f"CUDA device {self._config.device!r} was requested, but CUDA is not available on this system."
                 )
 
-        image_processor = RTDetrImageProcessor.from_pretrained(  # pyright: ignore[reportUnknownMemberType,reportUnknownVariableType]
+        image_processor = RTDetrImageProcessor.from_pretrained(  # pyright: ignore[reportUnknownMemberType]
             self._config.model_id,
             local_files_only=self._config.local_files_only,
         )
-        model = RTDetrForObjectDetection.from_pretrained(  # pyright: ignore[reportUnknownMemberType,reportUnknownVariableType]
+        model = RTDetrForObjectDetection.from_pretrained( # pyright: ignore[reportUnknownMemberType]
             self._config.model_id,
             local_files_only=self._config.local_files_only,
         )
 
         self.weights_loaded_ns = time.monotonic_ns()
 
-        model.eval()  # pyright: ignore[reportUnknownMemberType]
-        device = torch.device(self._config.device)  # pyright: ignore[reportUnknownMemberType,reportUnknownVariableType]
+        model.eval() 
+        device = torch.device(self._config.device)
 
-        torch_dtype = torch.float32  # pyright: ignore[reportUnknownMemberType,reportUnknownVariableType]
+        torch_dtype = torch.float32 
         if self._config.dtype == "float16":
-            torch_dtype = torch.float16  # pyright: ignore[reportUnknownMemberType,reportUnknownVariableType]
+            torch_dtype = torch.float16
         elif self._config.dtype == "bfloat16":
-            torch_dtype = torch.bfloat16  # pyright: ignore[reportUnknownMemberType,reportUnknownVariableType]
+            torch_dtype = torch.bfloat16
 
         to_fn: Any = getattr(model, "to")
         to_fn(device, torch_dtype)
@@ -95,8 +95,8 @@ class RTDETRDetectorBackend(DetectorBackend):
         self._image_processor = image_processor
 
         # Resolve person class ID from id2label
-        config_obj: Any = getattr(model, "config", None)  # pyright: ignore[reportUnknownArgumentType]
-        id2label: dict[int, str] = getattr(config_obj, "id2label", {})  # pyright: ignore[reportUnknownMemberType,reportUnknownArgumentType]
+        config_obj = model.config
+        id2label: dict[int, str] | dict[str, str] = config_obj.id2label or {}
         person_id: int | None = None
         for cid, name in id2label.items():
             if str(name).lower() == self._config.person_class_name.lower():
@@ -110,7 +110,7 @@ class RTDETRDetectorBackend(DetectorBackend):
         # Warmup inference
         self.infer(sample_frame)
         if self._config.device.startswith("cuda"):
-            torch.cuda.synchronize()  # pyright: ignore[reportUnknownMemberType]
+            torch.cuda.synchronize()
 
         self.warmup_completed_ns = time.monotonic_ns()
         self.backend_ready_ns = self.warmup_completed_ns
@@ -121,28 +121,28 @@ class RTDETRDetectorBackend(DetectorBackend):
         if self._model is None or self._image_processor is None:
             raise RuntimeError("RTDETRDetectorBackend must be prepared before calling infer()")
 
-        import torch  # type: ignore[import-not-found,import-untyped]
-        from PIL import Image  # type: ignore[import-not-found,import-untyped]
+        import torch
+        from PIL import Image
 
         # Convert BGR image to RGB PIL Image
         image_rgb: np.ndarray[Any, Any] = np.ascontiguousarray(frame.image_bgr[:, :, ::-1])
         image_pil = Image.fromarray(image_rgb)
 
-        inputs = self._image_processor(images=image_pil, return_tensors="pt")  # pyright: ignore[reportUnknownMemberType,reportUnknownVariableType]
-        device = torch.device(self._config.device)  # pyright: ignore[reportUnknownMemberType,reportUnknownVariableType]
-        inputs = {k: v.to(device) for k, v in inputs.items()}  # pyright: ignore[reportUnknownMemberType,reportUnknownVariableType]
+        inputs = self._image_processor(images=image_pil, return_tensors="pt")
+        device = torch.device(self._config.device) 
+        inputs = {k: v.to(device) for k, v in inputs.items()}
 
-        with torch.inference_mode():  # pyright: ignore[reportUnknownMemberType]
-            outputs = self._model(**inputs)  # pyright: ignore[reportUnknownMemberType,reportUnknownVariableType]
-            results = self._image_processor.post_process_object_detection(  # pyright: ignore[reportUnknownMemberType,reportUnknownVariableType]
+        with torch.inference_mode():
+            outputs = self._model(**inputs)
+            results = self._image_processor.post_process_object_detection(
                 outputs,
                 target_sizes=[(frame.height, frame.width)],
                 threshold=self._config.confidence_threshold,
             )[0]
 
-        boxes = results["boxes"].cpu().numpy()  # pyright: ignore[reportUnknownMemberType,reportUnknownVariableType]
-        scores = results["scores"].cpu().numpy()  # pyright: ignore[reportUnknownMemberType,reportUnknownVariableType]
-        labels = results["labels"].cpu().numpy()  # pyright: ignore[reportUnknownMemberType,reportUnknownVariableType]
+        boxes = results["boxes"].cpu().numpy() 
+        scores = results["scores"].cpu().numpy()
+        labels = results["labels"].cpu().numpy()
 
         detections: list[Detection] = []
         for box, score, label in zip(boxes, scores, labels, strict=False):

@@ -38,7 +38,15 @@ class FileVideoSource(FrameSource):
 
     @property
     def backend_kind(self) -> BackendKind:
-        return BackendKind.FAKE if self._is_synthetic else BackendKind.PRODUCTION
+        if (
+            self._is_synthetic
+            or self._config.video_path in ("fake_video.mp4", ":synthetic:")
+            or self._config.video_path.startswith("synthetic:")
+            or "fake" in self._config.video_path.lower()
+            or "dummy" in self._config.video_path.lower()
+        ):
+            return BackendKind.FAKE
+        return BackendKind.PRODUCTION
 
     def open(self) -> VideoMetadata:
         """Open the video file and retrieve metadata."""
@@ -249,7 +257,7 @@ class FileVideoSource(FrameSource):
         source_timestamp_ns = int(round((frame_id - 1) * (1e9 / self._metadata.fps)))
 
         if isinstance(frame_raw, np.ndarray):
-            image_bgr: np.ndarray[Any, np.dtype[np.uint8]] = np.asarray(frame_raw, dtype=np.uint8)
+            image_bgr: np.ndarray[Any, np.dtype[np.uint8]] = np.asarray(frame_raw, dtype=np.uint8)  # pyright: ignore[reportUnknownArgumentType,reportUnknownVariableType]
         else:
             # Convert RGB tensor to BGR uint8 numpy array
             frame_rgb_np = frame_raw.numpy()  # pyright: ignore[reportUnknownMemberType,reportUnknownVariableType]

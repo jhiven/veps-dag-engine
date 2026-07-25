@@ -96,9 +96,9 @@ def test_explicit_cpu_publication_mode_allowed() -> None:
 def test_cuda_publication_fails_when_cuda_unavailable() -> None:
     """6. CUDA publication mode fails clearly when CUDA is unavailable."""
     try:
-        import torch  # type: ignore[import-not-found,import-untyped]
+        import torch 
 
-        cuda_available = torch.cuda.is_available()  # pyright: ignore[reportUnknownMemberType]
+        cuda_available = torch.cuda.is_available()
     except Exception:
         cuda_available = False
 

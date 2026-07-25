@@ -64,7 +64,7 @@ class TrackerProcessor(StatefulProcessor):
         if isinstance(inputs, DetectionBatch):
             batch = inputs
         elif isinstance(inputs, dict):
-            inp_dict: dict[str, object] = inputs  # type: ignore[assignment]
+            inp_dict: dict[str, object] = inputs # pyright: ignore[reportUnknownVariableType]
             val = inp_dict.get("input")
             if isinstance(val, DetectionBatch):
                 batch = val
