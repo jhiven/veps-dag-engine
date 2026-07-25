@@ -195,7 +195,18 @@ class VideoAnalyticsApplication:
                 frame_id=self._processed_frames + 1,
             )
             if res.status is not FrameStatus.COMPLETED:
-                break
+                retried = False
+                for _ in range(5):
+                    time.sleep(0.01)
+                    retry_res = self._controller.admit_frame(
+                        admitted_at_ns=time.monotonic_ns(),
+                        frame_id=self._processed_frames + 1,
+                    )
+                    if retry_res.status is FrameStatus.COMPLETED:
+                        retried = True
+                        break
+                if not retried:
+                    break
             self._processed_frames += 1
             processed += 1
 
@@ -390,7 +401,18 @@ class VideoAnalyticsApplication:
                 frame_id=self._processed_frames + 1,
             )
             if res.status is not FrameStatus.COMPLETED:
-                break
+                retried = False
+                for _ in range(5):
+                    time.sleep(0.01)
+                    retry_res = self._controller.admit_frame(
+                        admitted_at_ns=time.monotonic_ns(),
+                        frame_id=self._processed_frames + 1,
+                    )
+                    if retry_res.status is FrameStatus.COMPLETED:
+                        retried = True
+                        break
+                if not retried:
+                    break
             self._processed_frames += 1
             processed += 1
 

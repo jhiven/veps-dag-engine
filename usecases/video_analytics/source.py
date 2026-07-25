@@ -383,13 +383,33 @@ class RTSPVideoSource(FrameSource):
         )
         self._ingress.start()
 
+        # Wait until the background RTSP capture thread has established connection and received the first frame
+        start_t = time.monotonic()
+        while time.monotonic() - start_t < 5.0:
+            if self._ingress.source_frames_received > 0 or self._ingress.queue.size() > 0:
+                break
+            time.sleep(0.01)
+
         return self._metadata
 
     def read(self) -> FramePacket | None:
         """Pop the latest frame non-blockingly from the bounded drop-oldest ingress queue."""
         if self._is_closed or self._ingress is None:
             raise RuntimeError("RTSPVideoSource must be opened before reading")
-        return self._ingress.read()
+
+        pkt = self._ingress.read()
+        if pkt is not None:
+            return pkt
+
+        # If queue is momentarily empty due to RTSP handshake/thread timing, wait up to 50ms
+        start_t = time.monotonic()
+        while time.monotonic() - start_t < 0.050:
+            time.sleep(0.002)
+            pkt = self._ingress.read()
+            if pkt is not None:
+                return pkt
+
+        return None
 
     def close(self) -> None:
         """Stop capture thread and terminate decoder process."""
