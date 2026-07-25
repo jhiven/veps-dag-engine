@@ -96,6 +96,12 @@ class FramePacket:
     queue_occupancy_before_enqueue: int | None = None
     queue_occupancy_after_enqueue: int | None = None
     queue_capacity: int | None = None
+    media_pts_ns: int | None = None
+    receiver_ingress_timestamp_ns: int | None = None
+    enqueue_decision_timestamp_ns: int | None = None
+    drop_decision_timestamp_ns: int | None = None
+    media_frame_index: int | None = None
+
 
     def __post_init__(self) -> None:
         if self.frame_id <= 0:
@@ -138,6 +144,12 @@ class DetectionBatch:
     queue_occupancy_before_enqueue: int | None = None
     queue_occupancy_after_enqueue: int | None = None
     queue_capacity: int | None = None
+    media_pts_ns: int | None = None
+    receiver_ingress_timestamp_ns: int | None = None
+    enqueue_decision_timestamp_ns: int | None = None
+    drop_decision_timestamp_ns: int | None = None
+    media_frame_index: int | None = None
+
 
     @property
     def output(self) -> DetectionBatch:
@@ -171,6 +183,13 @@ class TrackBatch:
     queue_occupancy_before_enqueue: int | None = None
     queue_occupancy_after_enqueue: int | None = None
     queue_capacity: int | None = None
+    media_pts_ns: int | None = None
+    receiver_ingress_timestamp_ns: int | None = None
+    enqueue_decision_timestamp_ns: int | None = None
+    drop_decision_timestamp_ns: int | None = None
+    media_frame_index: int | None = None
+    completion_timestamp_ns: int | None = None
+
 
     @property
     def output(self) -> TrackBatch:

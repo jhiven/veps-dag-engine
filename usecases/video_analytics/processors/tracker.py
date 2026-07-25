@@ -90,6 +90,11 @@ class TrackerProcessor(StatefulProcessor):
             queue_occupancy_before_enqueue=batch.queue_occupancy_before_enqueue,
             queue_occupancy_after_enqueue=batch.queue_occupancy_after_enqueue,
             queue_capacity=batch.queue_capacity,
+            media_pts_ns=batch.media_pts_ns,
+            receiver_ingress_timestamp_ns=batch.receiver_ingress_timestamp_ns,
+            enqueue_decision_timestamp_ns=batch.enqueue_decision_timestamp_ns,
+            drop_decision_timestamp_ns=batch.drop_decision_timestamp_ns,
+            media_frame_index=batch.media_frame_index,
         )
         return res
 

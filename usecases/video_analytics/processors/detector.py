@@ -95,6 +95,11 @@ class DetectorProcessor(Processor):
             queue_occupancy_before_enqueue=frame_packet.queue_occupancy_before_enqueue,
             queue_occupancy_after_enqueue=frame_packet.queue_occupancy_after_enqueue,
             queue_capacity=frame_packet.queue_capacity,
+            media_pts_ns=frame_packet.media_pts_ns,
+            receiver_ingress_timestamp_ns=frame_packet.receiver_ingress_timestamp_ns,
+            enqueue_decision_timestamp_ns=frame_packet.enqueue_decision_timestamp_ns,
+            drop_decision_timestamp_ns=frame_packet.drop_decision_timestamp_ns,
+            media_frame_index=frame_packet.media_frame_index,
         )
         return batch
 

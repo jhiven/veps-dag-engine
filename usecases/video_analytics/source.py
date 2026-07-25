@@ -49,13 +49,31 @@ class FileVideoSource(FrameSource):
         self._measurement_end_timestamp_ns: int | None = None
         self._lock: threading.Lock = threading.Lock()
 
-    def start_measurement_window(self, target_frames: int) -> None:
+        # Phase-normalized measurement state
+        self._pre_request_source_frames_received: int = 0
+        self._transition_source_frames_received: int = 0
+        self._post_effect_source_frames_received: int = 0
+        self._first_candidate_output_completed: bool = False
+        self._measurement_stopped: bool = False
+        self._pre_request_target: int = 60
+        self._post_effect_target: int = 60
+
+    def start_measurement_window(self, target_frames: int = 180) -> None:
         with self._lock:
             self._inside_measurement_window = True
             self._measurement_source_frame_target = target_frames
+            self._pre_request_source_frames_received = 0
+            self._transition_source_frames_received = 0
+            self._post_effect_source_frames_received = 0
+            self._first_candidate_output_completed = False
+            self._measurement_stopped = False
             self._measurement_source_frames_received = 0
             self._measurement_start_timestamp_ns = time.monotonic_ns()
             self._measurement_end_timestamp_ns = None
+
+    def mark_first_candidate_output_completed(self) -> None:
+        with self._lock:
+            self._first_candidate_output_completed = True
 
     @property
     def inside_measurement_window(self) -> bool:
@@ -66,6 +84,30 @@ class FileVideoSource(FrameSource):
     def measurement_source_frames_received(self) -> int:
         with self._lock:
             return self._measurement_source_frames_received
+
+    @property
+    def pre_request_source_frames_received(self) -> int:
+        with self._lock:
+            return self._pre_request_source_frames_received
+
+    @property
+    def transition_source_frames_received(self) -> int:
+        with self._lock:
+            return self._transition_source_frames_received
+
+    @property
+    def post_effect_source_frames_received(self) -> int:
+        with self._lock:
+            return self._post_effect_source_frames_received
+
+    @property
+    def measurement_stopped(self) -> bool:
+        with self._lock:
+            return self._measurement_stopped
+
+    @property
+    def queue_is_empty(self) -> bool:
+        return True
 
     @property
     def measurement_start_timestamp_ns(self) -> int | None:
@@ -262,13 +304,32 @@ class FileVideoSource(FrameSource):
             raise RuntimeError("FileVideoSource must be opened before reading")
 
         with self._lock:
+            if self._measurement_stopped:
+                return None
+
             is_measured = self._inside_measurement_window
+
             if is_measured:
-                if self._measurement_source_frames_received >= self._measurement_source_frame_target:
-                    return None
-                self._measurement_source_frames_received += 1
-                if self._measurement_source_frames_received == self._measurement_source_frame_target:
-                    self._measurement_end_timestamp_ns = time.monotonic_ns()
+                # Decide which phase counter to increment
+                if self._pre_request_source_frames_received < self._pre_request_target:
+                    self._pre_request_source_frames_received += 1
+                elif not self._first_candidate_output_completed:
+                    self._transition_source_frames_received += 1
+                else:
+                    if self._post_effect_source_frames_received >= self._post_effect_target:
+                        self._measurement_stopped = True
+                        self._measurement_end_timestamp_ns = time.monotonic_ns()
+                        return None
+                    self._post_effect_source_frames_received += 1
+                    if self._post_effect_source_frames_received == self._post_effect_target:
+                        self._measurement_stopped = True
+                        self._measurement_end_timestamp_ns = time.monotonic_ns()
+
+                self._measurement_source_frames_received = (
+                    self._pre_request_source_frames_received
+                    + self._transition_source_frames_received
+                    + self._post_effect_source_frames_received
+                )
 
         if self._is_synthetic or self._vframes is None:
             if self._current_frame_id >= 1000:
@@ -281,6 +342,8 @@ class FileVideoSource(FrameSource):
             img = np.zeros((h, w, 3), dtype=np.uint8)
 
             now_ns = time.monotonic_ns()
+            fps = self._metadata.fps
+            pts = int(round((self._current_frame_id - 1) * (1e9 / fps)))
             return FramePacket(
                 frame_id=self._current_frame_id,
                 source_timestamp_ns=now_ns,
@@ -288,6 +351,10 @@ class FileVideoSource(FrameSource):
                 width=w,
                 height=h,
                 inside_measurement_window=is_measured,
+                media_pts_ns=pts,
+                receiver_ingress_timestamp_ns=now_ns,
+                enqueue_decision_timestamp_ns=now_ns,
+                media_frame_index=self._current_frame_id,
             )
 
         if self._current_frame_id >= self._metadata.frame_count:  # type: ignore[operator]
@@ -301,6 +368,8 @@ class FileVideoSource(FrameSource):
         img = self._vframes[idx]  # pyright: ignore[reportUnknownVariableType,reportAttributeAccessIssue,reportIndexIssue]
 
         now_ns = time.monotonic_ns()
+        fps = self._metadata.fps
+        pts = int(round((self._current_frame_id - 1) * (1e9 / fps)))
         return FramePacket(
             frame_id=self._current_frame_id,
             source_timestamp_ns=now_ns,
@@ -308,6 +377,10 @@ class FileVideoSource(FrameSource):
             width=self._metadata.width,
             height=self._metadata.height,
             inside_measurement_window=is_measured,
+            media_pts_ns=pts,
+            receiver_ingress_timestamp_ns=now_ns,
+            enqueue_decision_timestamp_ns=now_ns,
+            media_frame_index=self._current_frame_id,
         )
 
     def close(self) -> None:
@@ -346,15 +419,33 @@ class RTSPVideoSource(FrameSource):
         self._measurement_start_timestamp_ns: int | None = None
         self._measurement_end_timestamp_ns: int | None = None
 
-    def start_measurement_window(self, target_frames: int) -> None:
+        # Phase-normalized measurement state
+        self._pre_request_source_frames_received: int = 0
+        self._transition_source_frames_received: int = 0
+        self._post_effect_source_frames_received: int = 0
+        self._first_candidate_output_completed: bool = False
+        self._measurement_stopped: bool = False
+        self._pre_request_target: int = 60
+        self._post_effect_target: int = 60
+
+    def start_measurement_window(self, target_frames: int = 180) -> None:
         with self._lock:
             self._inside_measurement_window = True
             self._measurement_source_frame_target = target_frames
+            self._pre_request_source_frames_received = 0
+            self._transition_source_frames_received = 0
+            self._post_effect_source_frames_received = 0
+            self._first_candidate_output_completed = False
+            self._measurement_stopped = False
             self._measurement_source_frames_received = 0
             self._measurement_start_timestamp_ns = time.monotonic_ns()
             self._measurement_end_timestamp_ns = None
             if self._ingress is not None:
                 self._ingress.queue.clear_and_cancel_all()
+
+    def mark_first_candidate_output_completed(self) -> None:
+        with self._lock:
+            self._first_candidate_output_completed = True
 
     @property
     def inside_measurement_window(self) -> bool:
@@ -365,6 +456,33 @@ class RTSPVideoSource(FrameSource):
     def measurement_source_frames_received(self) -> int:
         with self._lock:
             return self._measurement_source_frames_received
+
+    @property
+    def pre_request_source_frames_received(self) -> int:
+        with self._lock:
+            return self._pre_request_source_frames_received
+
+    @property
+    def transition_source_frames_received(self) -> int:
+        with self._lock:
+            return self._transition_source_frames_received
+
+    @property
+    def post_effect_source_frames_received(self) -> int:
+        with self._lock:
+            return self._post_effect_source_frames_received
+
+    @property
+    def measurement_stopped(self) -> bool:
+        with self._lock:
+            return self._measurement_stopped
+
+    @property
+    def queue_is_empty(self) -> bool:
+        with self._lock:
+            if self._ingress is not None:
+                return self._ingress.queue.size() == 0
+            return True
 
     @property
     def measurement_start_timestamp_ns(self) -> int | None:
@@ -442,19 +560,38 @@ class RTSPVideoSource(FrameSource):
                     return None
 
                 with self._lock:
-                    self._current_frame_id += 1
-                    fid = self._current_frame_id
+                    if self._measurement_stopped:
+                        return None
 
+                    fid = self._current_frame_id + 1
                     is_measured = self._inside_measurement_window
                     if is_measured:
-                        if self._measurement_source_frames_received >= self._measurement_source_frame_target:
-                            return None
-                        self._measurement_source_frames_received += 1
-                        if self._measurement_source_frames_received == self._measurement_source_frame_target:
-                            self._measurement_end_timestamp_ns = time.monotonic_ns()
+                        # Decide which phase counter to increment
+                        if self._pre_request_source_frames_received < self._pre_request_target:
+                            self._pre_request_source_frames_received += 1
+                        elif not self._first_candidate_output_completed:
+                            self._transition_source_frames_received += 1
+                        else:
+                            if self._post_effect_source_frames_received >= self._post_effect_target:
+                                self._measurement_stopped = True
+                                self._measurement_end_timestamp_ns = time.monotonic_ns()
+                                return None
+                            self._post_effect_source_frames_received += 1
+                            if self._post_effect_source_frames_received == self._post_effect_target:
+                                self._measurement_stopped = True
+                                self._measurement_end_timestamp_ns = time.monotonic_ns()
+
+                        self._measurement_source_frames_received = (
+                            self._pre_request_source_frames_received
+                            + self._transition_source_frames_received
+                            + self._post_effect_source_frames_received
+                        )
+
+                    self._current_frame_id = fid
 
                 img_np = np.frombuffer(raw_data, dtype=np.uint8).reshape((height, width, 3))
                 now_ns = time.monotonic_ns()
+                pts = int(round((fid - 1) * (1e9 / fps)))
 
                 return FramePacket(
                     frame_id=fid,
@@ -463,6 +600,10 @@ class RTSPVideoSource(FrameSource):
                     width=width,
                     height=height,
                     inside_measurement_window=is_measured,
+                    media_pts_ns=pts,
+                    receiver_ingress_timestamp_ns=now_ns,
+                    enqueue_decision_timestamp_ns=now_ns,
+                    media_frame_index=fid,
                 )
             except Exception:
                 return None

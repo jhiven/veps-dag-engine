@@ -57,6 +57,7 @@ class BoundedIngressQueue(Generic[T]):
         import dataclasses
         from typing import Any, cast
         dropped_item: T | None = None
+        now_ns = time.monotonic_ns()
         with self._lock:
             occ_before = len(self._queue)
             if occ_before >= self._capacity:
@@ -64,24 +65,28 @@ class BoundedIngressQueue(Generic[T]):
                 self._overflow_drop_count += 1
                 occ_after = self._capacity
                 
+                drop_ts = max(now_ns, getattr(raw_dropped, "enqueue_decision_timestamp_ns", 0) or 0)
                 if raw_dropped is not None and hasattr(raw_dropped, "queue_occupancy_before_enqueue"):
                     dropped_item = cast(T, dataclasses.replace(
                         cast(Any, raw_dropped),
                         queue_occupancy_before_enqueue=self._capacity,
                         queue_occupancy_after_enqueue=self._capacity,
-                        queue_capacity=self._capacity
+                        queue_capacity=self._capacity,
+                        drop_decision_timestamp_ns=drop_ts,
                     ))
                 else:
                     dropped_item = raw_dropped
             else:
                 occ_after = occ_before + 1
             
+            enqueue_ts = max(now_ns, getattr(item, "receiver_ingress_timestamp_ns", 0) or 0)
             if hasattr(item, "queue_occupancy_before_enqueue"):
                 updated_item = cast(T, dataclasses.replace(
                     cast(Any, item),
                     queue_occupancy_before_enqueue=occ_before,
                     queue_occupancy_after_enqueue=occ_after,
-                    queue_capacity=self._capacity
+                    queue_capacity=self._capacity,
+                    enqueue_decision_timestamp_ns=enqueue_ts,
                 ))
             else:
                 updated_item = item
@@ -99,9 +104,24 @@ class BoundedIngressQueue(Generic[T]):
 
     def clear_and_cancel_all(self, cancel_callback: Callable[[T, DropReason], None] | None = None) -> list[T]:
         """Clear all queued items and invoke cancellation callback."""
+        import dataclasses
+        from typing import Any, cast
+        now_ns = time.monotonic_ns()
         with self._lock:
-            items = list(self._queue)
+            raw_items = list(self._queue)
             self._queue.clear()
+
+        items: list[T] = []
+        for raw_item in raw_items:
+            drop_ts = max(now_ns, getattr(raw_item, "enqueue_decision_timestamp_ns", 0) or 0)
+            if raw_item is not None and hasattr(raw_item, "drop_decision_timestamp_ns"):
+                item = cast(T, dataclasses.replace(
+                    cast(Any, raw_item),
+                    drop_decision_timestamp_ns=drop_ts
+                ))
+            else:
+                item = raw_item
+            items.append(item)
 
         if cancel_callback is not None:
             for item in items:

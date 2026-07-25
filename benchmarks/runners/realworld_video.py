@@ -132,6 +132,32 @@ REALWORLD_VIDEO_HEADERS = (
     "live_plan_count_after_retirement",
     "live_detector_count_after_publication",
     "live_detector_count_after_retirement",
+    "measurement_start_media_frame_index",
+    "measurement_start_media_pts_ns",
+    "measurement_end_media_frame_index",
+    "measurement_end_media_pts_ns",
+    "request_trigger_media_frame_index",
+    "request_trigger_media_pts_ns",
+    "measurement_start_source_sequence",
+    "measurement_end_source_sequence",
+    "pre_request_source_frame_target",
+    "pre_request_source_frames_received",
+    "transition_source_frames_received",
+    "post_effect_source_frame_target",
+    "post_effect_source_frames_received",
+    "total_measurement_source_frames_received",
+    "source_frames_before_request",
+    "source_frames_during_candidate_preparation",
+    "source_frames_between_preparation_and_publication",
+    "source_frames_between_publication_and_first_candidate_output",
+    "source_frames_after_first_candidate_output",
+    "drop_rate_before_request",
+    "drop_rate_during_candidate_preparation",
+    "drop_rate_between_preparation_and_publication",
+    "drop_rate_between_publication_and_first_candidate_output",
+    "drop_rate_after_first_candidate_output",
+    "gpu_memory_transition_max_allocated_bytes",
+    "gpu_memory_transition_max_reserved_bytes",
 )
 
 REALWORLD_VIDEO_FRAME_HEADERS = (
@@ -153,6 +179,11 @@ REALWORLD_VIDEO_FRAME_HEADERS = (
     "dropped",
     "duplicated",
     "inside_measurement_window",
+    "media_pts_ns",
+    "receiver_ingress_timestamp_ns",
+    "enqueue_decision_timestamp_ns",
+    "drop_decision_timestamp_ns",
+    "media_frame_index",
 )
 
 
@@ -222,6 +253,32 @@ class RealworldVideoSampleRow:
     live_plan_count_after_retirement: int
     live_detector_count_after_publication: int
     live_detector_count_after_retirement: int
+    measurement_start_media_frame_index: int | None
+    measurement_start_media_pts_ns: int | None
+    measurement_end_media_frame_index: int | None
+    measurement_end_media_pts_ns: int | None
+    request_trigger_media_frame_index: int | None
+    request_trigger_media_pts_ns: int | None
+    measurement_start_source_sequence: int | None
+    measurement_end_source_sequence: int | None
+    pre_request_source_frame_target: int
+    pre_request_source_frames_received: int
+    transition_source_frames_received: int
+    post_effect_source_frame_target: int
+    post_effect_source_frames_received: int
+    total_measurement_source_frames_received: int
+    source_frames_before_request: int
+    source_frames_during_candidate_preparation: int
+    source_frames_between_preparation_and_publication: int
+    source_frames_between_publication_and_first_candidate_output: int
+    source_frames_after_first_candidate_output: int
+    drop_rate_before_request: float | None
+    drop_rate_during_candidate_preparation: float | None
+    drop_rate_between_preparation_and_publication: float | None
+    drop_rate_between_publication_and_first_candidate_output: float | None
+    drop_rate_after_first_candidate_output: float | None
+    gpu_memory_transition_max_allocated_bytes: int | None
+    gpu_memory_transition_max_reserved_bytes: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -244,6 +301,11 @@ class RealworldVideoFrameSampleRow:
     dropped: bool
     duplicated: bool
     inside_measurement_window: bool
+    media_pts_ns: int | None
+    receiver_ingress_timestamp_ns: int | None
+    enqueue_decision_timestamp_ns: int | None
+    drop_decision_timestamp_ns: int | None
+    media_frame_index: int | None
 
 
 def _calculate_file_hash(path: str) -> str:
@@ -336,6 +398,7 @@ def run_realworld_video_suite(
         t_pub: int | None,
         t_first_cand_out: int | None,
     ) -> tuple[int, int, int, int, int]:
+        """Classify each dropped frame into a phase using drop_decision_timestamp_ns (local monotonic)."""
         d_before = 0
         d_prep = 0
         d_between_prep_pub = 0
@@ -345,7 +408,7 @@ def run_realworld_video_suite(
         for r in frame_records:
             if not r.inside_measurement_window or not r.dropped:
                 continue
-            ts = r.source_timestamp_ns
+            ts = r.drop_decision_timestamp_ns
             if ts is None:
                 continue
 
@@ -361,6 +424,40 @@ def run_realworld_video_suite(
                 d_after += 1
 
         return d_before, d_prep, d_between_prep_pub, d_between_pub_first, d_after
+
+    def classify_source_frames(
+        frame_records: list[RealworldVideoFrameSampleRow],
+        t_req: int | None,
+        t_prep_end: int | None,
+        t_pub: int | None,
+        t_first_cand_out: int | None,
+    ) -> tuple[int, int, int, int, int]:
+        """Classify each source frame into a phase using receiver_ingress_timestamp_ns (local monotonic)."""
+        s_before = 0
+        s_prep = 0
+        s_between_prep_pub = 0
+        s_between_pub_first = 0
+        s_after = 0
+
+        for r in frame_records:
+            if not r.inside_measurement_window:
+                continue
+            ts = r.receiver_ingress_timestamp_ns
+            if ts is None:
+                continue
+
+            if t_req is None or ts < t_req:
+                s_before += 1
+            elif t_prep_end is None or ts < t_prep_end:
+                s_prep += 1
+            elif t_pub is None or ts < t_pub:
+                s_between_prep_pub += 1
+            elif t_first_cand_out is None or ts < t_first_cand_out:
+                s_between_pub_first += 1
+            else:
+                s_after += 1
+
+        return s_before, s_prep, s_between_prep_pub, s_between_pub_first, s_after
 
     try:
         for rep in range(1, repetition_count + 1):
@@ -436,6 +533,8 @@ def run_realworld_video_suite(
                         if reason is DropReason.INGRESS_OVERFLOW
                         else TerminalStatus.CANCELLED_ON_STOP
                     )
+                    drop_ts = packet.drop_decision_timestamp_ns or time.monotonic_ns()
+                    drop_ts = max(drop_ts, packet.enqueue_decision_timestamp_ns or 0)
                     fr_row = RealworldVideoFrameSampleRow(
                         run_id=run_id,
                         repetition=rep,
@@ -455,6 +554,11 @@ def run_realworld_video_suite(
                         dropped=True,
                         duplicated=False,
                         inside_measurement_window=packet.inside_measurement_window,
+                        media_pts_ns=packet.media_pts_ns,
+                        receiver_ingress_timestamp_ns=packet.receiver_ingress_timestamp_ns,
+                        enqueue_decision_timestamp_ns=packet.enqueue_decision_timestamp_ns,
+                        drop_decision_timestamp_ns=drop_ts,
+                        media_frame_index=packet.media_frame_index,
                     )
                     with telemetry_lock:
                         rep_frame_rows.append(fr_row)
@@ -488,6 +592,17 @@ def run_realworld_video_suite(
 
                     plan_ver = batch.plan_version if batch.plan_version is not None else 1
                     admission_ns = batch.admission_timestamp_ns if batch.admission_timestamp_ns is not None and batch.admission_timestamp_ns > 0 else None
+                    comp_ns = max(completion_ns, admission_ns or 0) if admission_ns is not None else completion_ns
+
+                    if (
+                        batch.plan_version is not None
+                        and batch.plan_version > 1
+                        and batch.detector_id == candidate_model
+                        and batch.inside_measurement_window
+                    ):
+                        if hasattr(source_obj, "mark_first_candidate_output_completed"):
+                            getattr(source_obj, "mark_first_candidate_output_completed")()
+
                     fr_row = RealworldVideoFrameSampleRow(
                         run_id=run_id,
                         repetition=rep,
@@ -495,7 +610,7 @@ def run_realworld_video_suite(
                         frame_id=batch.frame_id,
                         source_timestamp_ns=batch.source_timestamp_ns,
                         admission_timestamp_ns=admission_ns,
-                        completion_timestamp_ns=completion_ns,
+                        completion_timestamp_ns=comp_ns,
                         plan_version=plan_ver,
                         detector_id=batch.detector_id,
                         tracker_instance_id=batch.tracker_instance_id,
@@ -507,6 +622,11 @@ def run_realworld_video_suite(
                         dropped=False,
                         duplicated=is_dup,
                         inside_measurement_window=batch.inside_measurement_window,
+                        media_pts_ns=batch.media_pts_ns,
+                        receiver_ingress_timestamp_ns=batch.receiver_ingress_timestamp_ns,
+                        enqueue_decision_timestamp_ns=batch.enqueue_decision_timestamp_ns,
+                        drop_decision_timestamp_ns=batch.drop_decision_timestamp_ns,
+                        media_frame_index=batch.media_frame_index,
                     )
                     with telemetry_lock:
                         rep_frame_rows.append(fr_row)
@@ -536,14 +656,17 @@ def run_realworld_video_suite(
                         trk_inst_before = "unknown"
                         reset_before = 0
 
-                    # 3. Warm up the complete pipeline (warmup_completed_frames)
+                    # 3. Warm up the initial detector outside the measured window.
+                    #    Feed non-measured frames through the pipeline until the
+                    #    initial detector has processed warmup_completed_frames
+                    #    outputs.  Candidate detector must NOT be loaded yet.
                     warmup_completed = 0
                     warmup_admitted = 0
                     from nedo_vision_dag_engine.instrumentation import FrameStatus
                     while warmup_completed < warmup_completed_frames:
                         now_ns = time.monotonic_ns()
-                        app_controller: Any = getattr(app, "_controller")
-                        res = app_controller.admit_frame(
+                        app_controller_warmup: Any = getattr(app, "_controller")
+                        res = app_controller_warmup.admit_frame(
                             admitted_at_ns=now_ns,
                             frame_id=warmup_admitted + 1,
                         )
@@ -551,8 +674,24 @@ def run_realworld_video_suite(
                         if res.status is FrameStatus.COMPLETED:
                             warmup_completed += 1
 
-                    # 4. Start fixed source-frame measurement window
+                    # Capture the media frame index of the next frame that will
+                    # be read — this is our deterministic measurement origin.
+                    _measurement_start_media_frame_index: int | None = None
+                    _measurement_start_media_pts_ns: int | None = None
+                    _measurement_end_media_frame_index: int | None = None
+                    _measurement_end_media_pts_ns: int | None = None
+                    _request_trigger_media_frame_index: int | None = None
+                    _request_trigger_media_pts_ns: int | None = None
+                    _measurement_start_source_sequence: int | None = None
+
+                    # 4. Start phase-normalized measurement window.
                     getattr(source_obj, "start_measurement_window")(measurement_source_frames)
+                    # Configure phase targets so the source uses the correct
+                    # pre-request / post-effect frame counts for this run.
+                    if hasattr(source_obj, "_pre_request_target"):
+                        source_obj._pre_request_target = reconfiguration_trigger_frame_offset  # type: ignore[attr-defined]
+                    if hasattr(source_obj, "_post_effect_target"):
+                        source_obj._post_effect_target = reconfiguration_trigger_frame_offset  # type: ignore[attr-defined]
                     measurement_start_timestamp_ns = getattr(source_obj, "measurement_start_timestamp_ns", None)
 
                     # Telemetry snapshots & states
@@ -583,7 +722,7 @@ def run_realworld_video_suite(
 
                     # Measured window loop
                     while True:
-                        if getattr(source_obj, "measurement_source_frames_received") >= measurement_source_frames:
+                        if getattr(source_obj, "measurement_stopped", False):
                             break
 
                         if not swap_requested and getattr(source_obj, "measurement_source_frames_received") >= reconfiguration_trigger_frame_offset:
@@ -671,6 +810,10 @@ def run_realworld_video_suite(
                                 live_plan_count_after_publication = CoexistenceTracker.get_live_plan_count()
                                 live_detector_count_after_publication = CoexistenceTracker.get_live_detector_count()
 
+                                # Now retire superseded processors!
+                                from nedo_vision_dag_engine.lifecycle import retire_superseded_processors
+                                retire_superseded_processors(old_plan, compiled_plan)
+
                                 # Stop retires old plan immediately
                                 memory_sampler.synchronize()
                                 gpu_ret_snap = memory_sampler.sample()
@@ -730,6 +873,9 @@ def run_realworld_video_suite(
                                             ReconfigurationStatus.FAILED,
                                             ReconfigurationStatus.ABORTED,
                                         ):
+                                            break
+
+                                        if getattr(source_obj, "measurement_stopped", False):
                                             break
 
                                         if getattr(source_obj, "measurement_source_frames_received") >= measurement_source_frames:
@@ -853,6 +999,11 @@ def run_realworld_video_suite(
                                 dropped=False,
                                 duplicated=False,
                                 inside_measurement_window=True,
+                                media_pts_ns=pkt.media_pts_ns,
+                                receiver_ingress_timestamp_ns=pkt.receiver_ingress_timestamp_ns,
+                                enqueue_decision_timestamp_ns=pkt.enqueue_decision_timestamp_ns,
+                                drop_decision_timestamp_ns=pkt.drop_decision_timestamp_ns,
+                                media_frame_index=pkt.media_frame_index,
                             )
                             with telemetry_lock:
                                 rep_frame_rows.append(fr_row)
@@ -882,6 +1033,24 @@ def run_realworld_video_suite(
                         raise RuntimeError(
                             f"Repetition {rep} mechanism {mech}: No candidate output reached the sink."
                         )
+
+                    # ----- Measurement media alignment ---------------------------------
+                    # Derive alignment anchors from measured frame records (media time).
+                    measured_frames_sorted = sorted(
+                        [r for r in rep_frame_rows if r.inside_measurement_window],
+                        key=lambda r: r.frame_id,
+                    )
+                    if measured_frames_sorted:
+                        _measurement_start_media_frame_index = measured_frames_sorted[0].media_frame_index
+                        _measurement_start_media_pts_ns = measured_frames_sorted[0].media_pts_ns
+                        _measurement_end_media_frame_index = measured_frames_sorted[-1].media_frame_index
+                        _measurement_end_media_pts_ns = measured_frames_sorted[-1].media_pts_ns
+                        _measurement_start_source_sequence = 1
+                        # Request trigger aligns to the 60th measured source frame.
+                        if len(measured_frames_sorted) >= 60:
+                            _request_trigger_media_frame_index = measured_frames_sorted[59].media_frame_index
+                            _request_trigger_media_pts_ns = measured_frames_sorted[59].media_pts_ns
+                    # ------------------------------------------------------------------
 
                     # Find last old-plan output occurring before first candidate output
                     old_rows_before_cand = [
@@ -941,6 +1110,47 @@ def run_realworld_video_suite(
                             f"Repetition {rep} mechanism {mech}: Sum of phase-specific drops ({sum_phase_drops}) "
                             f"does not equal total dropped count ({flow_summary.total_dropped_frame_count})"
                         )
+
+                    # Compute phase source-frame counts
+                    s_before, s_prep, s_prep_pub, s_pub_first, s_after = classify_source_frames(
+                        rep_frame_rows,
+                        t_req_swap,
+                        t_prep_end,
+                        t_pub,
+                        first_candidate_output_ns,
+                    )
+                    total_measured = getattr(source_obj, "measurement_source_frames_received")
+                    pre_req_rec = getattr(source_obj, "pre_request_source_frames_received")
+                    trans_rec = getattr(source_obj, "transition_source_frames_received")
+                    post_eff_rec = getattr(source_obj, "post_effect_source_frames_received")
+
+                    # Phase-normalized drop rates (None when denominator is zero).
+                    def _rate(num: int, den: int) -> float | None:
+                        if den == 0:
+                            return None
+                        return num / den
+
+                    drop_rate_before = _rate(d_before, pre_req_rec)
+                    drop_rate_prep = _rate(d_prep, s_prep)
+                    drop_rate_prep_pub = _rate(d_between_prep_pub, s_prep_pub)
+                    drop_rate_pub_first = _rate(d_between_pub_first, s_pub_first)
+                    drop_rate_after = _rate(d_after, s_after)
+
+                    # GPU transition maximum (peak across all sampled checkpoints).
+                    _gpu_alloc_vals = [
+                        gpu_before_snap.allocated_bytes,
+                        gpu_coexist_snap.allocated_bytes,
+                        gpu_pub_snap.allocated_bytes,
+                        gpu_ret_snap.allocated_bytes,
+                    ]
+                    _gpu_resv_vals = [
+                        gpu_before_snap.reserved_bytes,
+                        gpu_coexist_snap.reserved_bytes,
+                        gpu_pub_snap.reserved_bytes,
+                        gpu_ret_snap.reserved_bytes,
+                    ]
+                    gpu_trans_max_alloc = max((v for v in _gpu_alloc_vals if v is not None), default=None)
+                    gpu_trans_max_resv = max((v for v in _gpu_resv_vals if v is not None), default=None)
 
                     sample_row = RealworldVideoSampleRow(
                         run_id=run_id,
@@ -1007,6 +1217,32 @@ def run_realworld_video_suite(
                         live_plan_count_after_retirement=live_plan_count_after_retirement,
                         live_detector_count_after_publication=live_detector_count_after_publication,
                         live_detector_count_after_retirement=live_detector_count_after_retirement,
+                        measurement_start_media_frame_index=_measurement_start_media_frame_index,
+                        measurement_start_media_pts_ns=_measurement_start_media_pts_ns,
+                        measurement_end_media_frame_index=_measurement_end_media_frame_index,
+                        measurement_end_media_pts_ns=_measurement_end_media_pts_ns,
+                        request_trigger_media_frame_index=_request_trigger_media_frame_index,
+                        request_trigger_media_pts_ns=_request_trigger_media_pts_ns,
+                        measurement_start_source_sequence=_measurement_start_source_sequence,
+                        measurement_end_source_sequence=getattr(source_obj, "measurement_source_frames_received"),
+                        pre_request_source_frame_target=reconfiguration_trigger_frame_offset,
+                        pre_request_source_frames_received=pre_req_rec,
+                        transition_source_frames_received=trans_rec,
+                        post_effect_source_frame_target=reconfiguration_trigger_frame_offset,
+                        post_effect_source_frames_received=post_eff_rec,
+                        total_measurement_source_frames_received=total_measured,
+                        source_frames_before_request=s_before,
+                        source_frames_during_candidate_preparation=s_prep,
+                        source_frames_between_preparation_and_publication=s_prep_pub,
+                        source_frames_between_publication_and_first_candidate_output=s_pub_first,
+                        source_frames_after_first_candidate_output=s_after,
+                        drop_rate_before_request=drop_rate_before,
+                        drop_rate_during_candidate_preparation=drop_rate_prep,
+                        drop_rate_between_preparation_and_publication=drop_rate_prep_pub,
+                        drop_rate_between_publication_and_first_candidate_output=drop_rate_pub_first,
+                        drop_rate_after_first_candidate_output=drop_rate_after,
+                        gpu_memory_transition_max_allocated_bytes=gpu_trans_max_alloc,
+                        gpu_memory_transition_max_reserved_bytes=gpu_trans_max_resv,
                     )
                     sample_rows.append(sample_row)
                     frame_rows.extend(rep_frame_rows)
@@ -1105,6 +1341,32 @@ def run_realworld_video_suite(
                     r.live_plan_count_after_retirement,
                     r.live_detector_count_after_publication,
                     r.live_detector_count_after_retirement,
+                    r.measurement_start_media_frame_index if r.measurement_start_media_frame_index is not None else "",
+                    r.measurement_start_media_pts_ns if r.measurement_start_media_pts_ns is not None else "",
+                    r.measurement_end_media_frame_index if r.measurement_end_media_frame_index is not None else "",
+                    r.measurement_end_media_pts_ns if r.measurement_end_media_pts_ns is not None else "",
+                    r.request_trigger_media_frame_index if r.request_trigger_media_frame_index is not None else "",
+                    r.request_trigger_media_pts_ns if r.request_trigger_media_pts_ns is not None else "",
+                    r.measurement_start_source_sequence if r.measurement_start_source_sequence is not None else "",
+                    r.measurement_end_source_sequence if r.measurement_end_source_sequence is not None else "",
+                    r.pre_request_source_frame_target,
+                    r.pre_request_source_frames_received,
+                    r.transition_source_frames_received,
+                    r.post_effect_source_frame_target,
+                    r.post_effect_source_frames_received,
+                    r.total_measurement_source_frames_received,
+                    r.source_frames_before_request,
+                    r.source_frames_during_candidate_preparation,
+                    r.source_frames_between_preparation_and_publication,
+                    r.source_frames_between_publication_and_first_candidate_output,
+                    r.source_frames_after_first_candidate_output,
+                    f"{r.drop_rate_before_request:.6f}" if r.drop_rate_before_request is not None else "",
+                    f"{r.drop_rate_during_candidate_preparation:.6f}" if r.drop_rate_during_candidate_preparation is not None else "",
+                    f"{r.drop_rate_between_preparation_and_publication:.6f}" if r.drop_rate_between_preparation_and_publication is not None else "",
+                    f"{r.drop_rate_between_publication_and_first_candidate_output:.6f}" if r.drop_rate_between_publication_and_first_candidate_output is not None else "",
+                    f"{r.drop_rate_after_first_candidate_output:.6f}" if r.drop_rate_after_first_candidate_output is not None else "",
+                    r.gpu_memory_transition_max_allocated_bytes if r.gpu_memory_transition_max_allocated_bytes is not None else "",
+                    r.gpu_memory_transition_max_reserved_bytes if r.gpu_memory_transition_max_reserved_bytes is not None else "",
                 ])
 
         with open(frame_csv_path, "w", newline="", encoding="utf-8") as f:
@@ -1130,6 +1392,11 @@ def run_realworld_video_suite(
                     1 if fr.dropped else 0,
                     1 if fr.duplicated else 0,
                     1 if fr.inside_measurement_window else 0,
+                    fr.media_pts_ns if fr.media_pts_ns is not None else "",
+                    fr.receiver_ingress_timestamp_ns if fr.receiver_ingress_timestamp_ns is not None else "",
+                    fr.enqueue_decision_timestamp_ns if fr.enqueue_decision_timestamp_ns is not None else "",
+                    fr.drop_decision_timestamp_ns if fr.drop_decision_timestamp_ns is not None else "",
+                    fr.media_frame_index if fr.media_frame_index is not None else "",
                 ])
 
     return sample_rows, frame_rows

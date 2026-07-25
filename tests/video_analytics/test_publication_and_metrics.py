@@ -205,4 +205,10 @@ def test_frame_level_count_agrees_with_run_level() -> None:
         assert len(samples) == 3
         for s in samples:
             m_frames = [f for f in frame_rows if f.mechanism == s.mechanism and f.repetition == s.repetition and f.inside_measurement_window]
-            assert len(m_frames) == 10
+            # Phase-normalized window: 5 pre-request + transition + 5 post-effect.
+            # Total measured frames may exceed the old fixed 10-frame window.
+            assert len(m_frames) >= 10
+            # Verify phase invariants on the summary row.
+            assert s.pre_request_source_frames_received == s.pre_request_source_frame_target
+            assert s.post_effect_source_frames_received == s.post_effect_source_frame_target
+            assert s.total_measurement_source_frames_received == len(m_frames)

@@ -505,6 +505,10 @@ def main() -> None:
     verify_parser = subparsers.add_parser("verify")
     verify_parser.add_argument("run_directory", type=str)
 
+    # validate-realworld subcommand
+    validate_parser = subparsers.add_parser("validate-realworld")
+    validate_parser.add_argument("run_directory", type=str)
+
     args = parser.parse_args()
 
     if args.subcommand == "run":
@@ -523,6 +527,13 @@ def main() -> None:
         report_cmd(args.run_directory)
     elif args.subcommand == "verify":
         verify_cmd(args.run_directory)
+    elif args.subcommand == "validate-realworld":
+        from usecases.video_analytics.validator import validate_benchmark_csvs
+        summary_csv = os.path.join(args.run_directory, "realworld-video-samples.csv")
+        frame_csv = os.path.join(args.run_directory, "realworld-video-frame-samples.csv")
+        success, _ = validate_benchmark_csvs(summary_csv, frame_csv)
+        if not success:
+            sys.exit(1)
 
 
 if __name__ == "__main__":
