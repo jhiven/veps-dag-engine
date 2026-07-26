@@ -380,7 +380,7 @@ def _run_reconfig_repetition(
             1
             for event in frame_log
             if event.plan_version == old_plan_version
-            and event.admission_ns >= t_request
+            and event.admission_ns >= t_adm_stop_start
             and event.completion_ns < t_pub_start
         )
         if old_frames_before_commit != 0:
@@ -594,7 +594,7 @@ def _run_reconfig_repetition(
             1
             for event in frame_log
             if event.plan_version == old_plan_version
-            and event.admission_ns >= t_request
+            and event.admission_ns >= t_adm_stop_start
             and event.completion_ns < t_pub_start
         )
         if old_frames_before_commit != 0:

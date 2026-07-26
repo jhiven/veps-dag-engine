@@ -81,7 +81,7 @@ def _calculate_file_sha256(filepath: str) -> str:
 def run_benchmarks(
     suite: str,
     profile: str = "smoke",
-    output_dir: str = "benchmark_runs",
+    output_dir: str = "benchmark-results",
     base_output_dir: str | None = None,
     seed: int = 42,
     source_video: str = "sample_video.mp4",
