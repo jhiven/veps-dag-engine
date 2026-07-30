@@ -161,15 +161,21 @@ REALWORLD_VIDEO_HEADERS = (
     "fixed_window_start_media_frame_index",
     "fixed_window_end_media_frame_index",
     "fixed_window_expected_source_frames",
-    "fixed_window_observed_source_frames",
-    "fixed_window_admitted",
-    "fixed_window_completed",
-    "fixed_window_dropped",
-    "fixed_window_duplicated",
+    "fixed_window_receiver_observed_frames",
+    "fixed_window_source_frames_missing_before_receiver",
+    "fixed_window_admitted_frames",
+    "fixed_window_completed_frames",
+    "fixed_window_ingress_dropped_frames",
+    "fixed_window_admission_rejected_frames",
+    "fixed_window_execution_cancelled_frames",
+    "fixed_window_frames_in_flight_at_window_end",
+    "fixed_window_duplicated_frames",
     "fixed_window_old_plan_completions",
     "fixed_window_new_plan_completions",
     "fixed_window_accounting_residual",
     "fixed_window_accounting_valid",
+    "fixed_window_ingress_drop_rate",
+    "fixed_window_end_to_end_frame_loss_rate",
 )
 
 REALWORLD_VIDEO_FRAME_HEADERS = (
@@ -292,19 +298,27 @@ class RealworldVideoSampleRow:
     gpu_memory_transition_max_allocated_bytes: int | None
     gpu_memory_transition_max_reserved_bytes: int | None
     # Fixed source-frame-index window (reviewer P0.6):
-    # 60 frames before request trigger + 150 after = 210 expected total
+    # 60 frames before request trigger + 150 after = 210 expected total.
+    # Accounting: expected = missing_before_receiver + completed + ingress_dropped
+    #                        + admission_rejected + execution_cancelled + in_flight
     fixed_window_start_media_frame_index: int = 0
     fixed_window_end_media_frame_index: int = 0
     fixed_window_expected_source_frames: int = 0
-    fixed_window_observed_source_frames: int = 0
-    fixed_window_admitted: int = 0
-    fixed_window_completed: int = 0
-    fixed_window_dropped: int = 0
-    fixed_window_duplicated: int = 0
+    fixed_window_receiver_observed_frames: int = 0
+    fixed_window_source_frames_missing_before_receiver: int = 0
+    fixed_window_admitted_frames: int = 0
+    fixed_window_completed_frames: int = 0
+    fixed_window_ingress_dropped_frames: int = 0
+    fixed_window_admission_rejected_frames: int = 0
+    fixed_window_execution_cancelled_frames: int = 0
+    fixed_window_frames_in_flight_at_window_end: int = 0
+    fixed_window_duplicated_frames: int = 0
     fixed_window_old_plan_completions: int = 0
     fixed_window_new_plan_completions: int = 0
     fixed_window_accounting_residual: int = 0
     fixed_window_accounting_valid: bool = False
+    fixed_window_ingress_drop_rate: float = 0.0
+    fixed_window_end_to_end_frame_loss_rate: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -346,81 +360,139 @@ def compute_fixed_window_metrics(
     request_trigger_media_frame_index: int,
     baseline_frame_count: int = 60,
     transition_frame_count: int = 150,
-) -> dict[str, int | bool]:
+) -> dict[str, int | bool | float]:
     """Compute source-frame-index-based fixed-window metrics.
 
-    Uses identical source-frame window for all mechanisms:
-    - Baseline: indices [trigger - 60, trigger)
-    - Transition: indices [trigger, trigger + 150)
-    - Total expected: 210 source frames
+    Accounting equation (reviewer P0.6):
+        expected_source_frames
+        = source_frames_missing_before_receiver
+        + completed_frames
+        + ingress_dropped_frames
+        + admission_rejected_frames
+        + execution_cancelled_frames
+        + frames_in_flight_at_window_end
 
-    This replaces mechanism-dependent wall-clock windows with a fair,
-    mechanism-independent source-frame-index comparison (reviewer P0.6).
+    Window: indices [trigger - 60, trigger + 150), 210 expected total.
+    Uses media_frame_index as the source of truth across all mechanisms.
     """
     window_start = max(0, request_trigger_media_frame_index - baseline_frame_count)
     window_end = request_trigger_media_frame_index + transition_frame_count
     expected_frames = baseline_frame_count + transition_frame_count  # 210
 
-    observed = 0
-    admitted = 0
-    completed = 0
-    dropped_count = 0
-    duplicated = 0
-    old_plan_completions = 0
-    new_plan_completions = 0
+    # Build a map of media_frame_index → list of frame rows
+    indexed: dict[int, list[RealworldVideoFrameSampleRow]] = {}
+    for row in frame_rows:
+        mfi = row.media_frame_index
+        if mfi is not None:
+            indexed.setdefault(mfi, []).append(row)
 
     # Determine old vs new plan version
     old_plan_version: int | None = None
     new_plan_version: int | None = None
-    for row in frame_rows:
-        if row.plan_version is not None:
-            if old_plan_version is None or row.plan_version < old_plan_version:
-                old_plan_version = row.plan_version
-            if new_plan_version is None or row.plan_version > new_plan_version:
-                new_plan_version = row.plan_version
+    for rows in indexed.values():
+        for row in rows:
+            if row.plan_version is not None:
+                if old_plan_version is None or row.plan_version < old_plan_version:
+                    old_plan_version = row.plan_version
+                if new_plan_version is None or row.plan_version > new_plan_version:
+                    new_plan_version = row.plan_version
 
-    for row in frame_rows:
-        mfi = row.media_frame_index
-        if mfi is None:
+    # Walk every expected media frame index and classify
+    receiver_observed = 0
+    missing_before_receiver = 0
+    admitted = 0
+    completed = 0
+    ingress_dropped = 0
+    admission_rejected = 0
+    execution_cancelled = 0
+    in_flight = 0
+    duplicated = 0
+    old_plan_completions = 0
+    new_plan_completions = 0
+
+    for mfi in range(window_start, window_end):
+        rows = indexed.get(mfi, [])
+
+        if not rows:
+            # Source frame never reached the receiver at all
+            missing_before_receiver += 1
             continue
-        if mfi < window_start or mfi >= window_end:
-            continue
 
-        observed += 1
-        if row.duplicated:
-            duplicated += 1
-        if row.dropped:
-            dropped_count += 1
-        else:
-            admitted += 1
-            if row.completion_timestamp_ns is not None:
-                completed += 1
-                if row.plan_version is not None:
-                    if old_plan_version is not None and row.plan_version == old_plan_version:
-                        old_plan_completions += 1
-                    elif new_plan_version is not None and row.plan_version == new_plan_version:
-                        new_plan_completions += 1
+        receiver_observed += 1
 
-    # Accounting: observed = completed + dropped + residual (in-flight)
-    accounted = completed + dropped_count
-    residual = observed - accounted
+        for row in rows:
+            if row.duplicated:
+                duplicated += 1
+
+            terminal = (row.terminal_status or "").lower()
+            drop_reason = (row.drop_reason or "").lower()
+
+            if row.dropped:
+                if "ingress" in drop_reason or "overflow" in drop_reason:
+                    ingress_dropped += 1
+                elif "reject" in terminal or "reject" in drop_reason:
+                    admission_rejected += 1
+                elif "cancel" in terminal or "cancel" in drop_reason:
+                    execution_cancelled += 1
+                else:
+                    # Unknown drop reason — classify as ingress for safety
+                    ingress_dropped += 1
+            else:
+                admitted += 1
+                if row.completion_timestamp_ns is not None:
+                    completed += 1
+                    if row.plan_version is not None:
+                        if old_plan_version is not None and row.plan_version == old_plan_version:
+                            old_plan_completions += 1
+                        elif new_plan_version is not None and row.plan_version == new_plan_version:
+                            new_plan_completions += 1
+
     in_flight = admitted - completed
-    accounting_valid = (residual >= 0 and duplicated == 0
-                        and residual == in_flight)
+
+    # Accounting residual:
+    #   expected = missing + completed + ingress + rejected + cancelled + in_flight
+    accounted = (
+        missing_before_receiver + completed + ingress_dropped
+        + admission_rejected + execution_cancelled + in_flight
+    )
+    residual = expected_frames - accounted
+
+    # Accounting is valid when:
+    #   - expected == accounted (residual == 0)
+    #   - no duplicated frames
+    #   - receiver_observed = expected - missing_before_receiver
+    receiver_check = receiver_observed == (expected_frames - missing_before_receiver)
+    accounting_valid = (residual == 0 and duplicated == 0 and receiver_check)
+
+    # Ingress drop rate: ingress_dropped / receiver_observed
+    ingress_drop_rate = (
+        ingress_dropped / receiver_observed if receiver_observed > 0 else 0.0
+    )
+
+    # End-to-end frame loss rate: (expected - completed) / expected
+    end_to_end_loss_rate = (
+        (expected_frames - completed) / expected_frames if expected_frames > 0 else 0.0
+    )
 
     return {
         "fixed_window_start_media_frame_index": window_start,
         "fixed_window_end_media_frame_index": window_end,
         "fixed_window_expected_source_frames": expected_frames,
-        "fixed_window_observed_source_frames": observed,
-        "fixed_window_admitted": admitted,
-        "fixed_window_completed": completed,
-        "fixed_window_dropped": dropped_count,
-        "fixed_window_duplicated": duplicated,
+        "fixed_window_receiver_observed_frames": receiver_observed,
+        "fixed_window_source_frames_missing_before_receiver": missing_before_receiver,
+        "fixed_window_admitted_frames": admitted,
+        "fixed_window_completed_frames": completed,
+        "fixed_window_ingress_dropped_frames": ingress_dropped,
+        "fixed_window_admission_rejected_frames": admission_rejected,
+        "fixed_window_execution_cancelled_frames": execution_cancelled,
+        "fixed_window_frames_in_flight_at_window_end": in_flight,
+        "fixed_window_duplicated_frames": duplicated,
         "fixed_window_old_plan_completions": old_plan_completions,
         "fixed_window_new_plan_completions": new_plan_completions,
         "fixed_window_accounting_residual": residual,
         "fixed_window_accounting_valid": accounting_valid,
+        "fixed_window_ingress_drop_rate": ingress_drop_rate,
+        "fixed_window_end_to_end_frame_loss_rate": end_to_end_loss_rate,
     }
 
 
@@ -1363,15 +1435,21 @@ def run_realworld_video_suite(
                             fixed_window_start_media_frame_index=int(fw["fixed_window_start_media_frame_index"]),  # type: ignore[arg-type]
                             fixed_window_end_media_frame_index=int(fw["fixed_window_end_media_frame_index"]),  # type: ignore[arg-type]
                             fixed_window_expected_source_frames=int(fw["fixed_window_expected_source_frames"]),  # type: ignore[arg-type]
-                            fixed_window_observed_source_frames=int(fw["fixed_window_observed_source_frames"]),  # type: ignore[arg-type]
-                            fixed_window_admitted=int(fw["fixed_window_admitted"]),  # type: ignore[arg-type]
-                            fixed_window_completed=int(fw["fixed_window_completed"]),  # type: ignore[arg-type]
-                            fixed_window_dropped=int(fw["fixed_window_dropped"]),  # type: ignore[arg-type]
-                            fixed_window_duplicated=int(fw["fixed_window_duplicated"]),  # type: ignore[arg-type]
+                            fixed_window_receiver_observed_frames=int(fw["fixed_window_receiver_observed_frames"]),  # type: ignore[arg-type]
+                            fixed_window_source_frames_missing_before_receiver=int(fw["fixed_window_source_frames_missing_before_receiver"]),  # type: ignore[arg-type]
+                            fixed_window_admitted_frames=int(fw["fixed_window_admitted_frames"]),  # type: ignore[arg-type]
+                            fixed_window_completed_frames=int(fw["fixed_window_completed_frames"]),  # type: ignore[arg-type]
+                            fixed_window_ingress_dropped_frames=int(fw["fixed_window_ingress_dropped_frames"]),  # type: ignore[arg-type]
+                            fixed_window_admission_rejected_frames=int(fw["fixed_window_admission_rejected_frames"]),  # type: ignore[arg-type]
+                            fixed_window_execution_cancelled_frames=int(fw["fixed_window_execution_cancelled_frames"]),  # type: ignore[arg-type]
+                            fixed_window_frames_in_flight_at_window_end=int(fw["fixed_window_frames_in_flight_at_window_end"]),  # type: ignore[arg-type]
+                            fixed_window_duplicated_frames=int(fw["fixed_window_duplicated_frames"]),  # type: ignore[arg-type]
                             fixed_window_old_plan_completions=int(fw["fixed_window_old_plan_completions"]),  # type: ignore[arg-type]
                             fixed_window_new_plan_completions=int(fw["fixed_window_new_plan_completions"]),  # type: ignore[arg-type]
                             fixed_window_accounting_residual=int(fw["fixed_window_accounting_residual"]),  # type: ignore[arg-type]
                             fixed_window_accounting_valid=bool(fw["fixed_window_accounting_valid"]),  # type: ignore[arg-type]
+                            fixed_window_ingress_drop_rate=float(fw["fixed_window_ingress_drop_rate"]),  # type: ignore[arg-type]
+                            fixed_window_end_to_end_frame_loss_rate=float(fw["fixed_window_end_to_end_frame_loss_rate"]),  # type: ignore[arg-type]
                         )
                     sample_rows.append(sample_row)
                     frame_rows.extend(rep_frame_rows)
@@ -1499,15 +1577,21 @@ def run_realworld_video_suite(
                     r.fixed_window_start_media_frame_index,
                     r.fixed_window_end_media_frame_index,
                     r.fixed_window_expected_source_frames,
-                    r.fixed_window_observed_source_frames,
-                    r.fixed_window_admitted,
-                    r.fixed_window_completed,
-                    r.fixed_window_dropped,
-                    r.fixed_window_duplicated,
+                    r.fixed_window_receiver_observed_frames,
+                    r.fixed_window_source_frames_missing_before_receiver,
+                    r.fixed_window_admitted_frames,
+                    r.fixed_window_completed_frames,
+                    r.fixed_window_ingress_dropped_frames,
+                    r.fixed_window_admission_rejected_frames,
+                    r.fixed_window_execution_cancelled_frames,
+                    r.fixed_window_frames_in_flight_at_window_end,
+                    r.fixed_window_duplicated_frames,
                     r.fixed_window_old_plan_completions,
                     r.fixed_window_new_plan_completions,
                     r.fixed_window_accounting_residual,
                     r.fixed_window_accounting_valid,
+                    f"{r.fixed_window_ingress_drop_rate:.6f}",
+                    f"{r.fixed_window_end_to_end_frame_loss_rate:.6f}",
                 ])
 
         with open(frame_csv_path, "w", newline="", encoding="utf-8") as f:
