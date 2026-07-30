@@ -7,7 +7,7 @@ import hashlib
 import os
 import random
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal, cast, Any
 
 import numpy as np
@@ -1368,17 +1368,20 @@ def run_realworld_video_suite(
                             frame_rows=rep_frame_rows,
                             request_timestamp_ns=sample_row.request_timestamp_ns,
                         )
-                        sample_row.fixed_window_baseline_source_frames = int(fw["fixed_window_baseline_source_frames"])  # type: ignore[arg-type]
-                        sample_row.fixed_window_baseline_admitted = int(fw["fixed_window_baseline_admitted"])  # type: ignore[arg-type]
-                        sample_row.fixed_window_baseline_completed = int(fw["fixed_window_baseline_completed"])  # type: ignore[arg-type]
-                        sample_row.fixed_window_baseline_dropped = int(fw["fixed_window_baseline_dropped"])  # type: ignore[arg-type]
-                        sample_row.fixed_window_transition_source_frames = int(fw["fixed_window_transition_source_frames"])  # type: ignore[arg-type]
-                        sample_row.fixed_window_transition_admitted = int(fw["fixed_window_transition_admitted"])  # type: ignore[arg-type]
-                        sample_row.fixed_window_transition_completed = int(fw["fixed_window_transition_completed"])  # type: ignore[arg-type]
-                        sample_row.fixed_window_transition_dropped = int(fw["fixed_window_transition_dropped"])  # type: ignore[arg-type]
-                        sample_row.fixed_window_old_plan_completions = int(fw["fixed_window_old_plan_completions"])  # type: ignore[arg-type]
-                        sample_row.fixed_window_new_plan_completions = int(fw["fixed_window_new_plan_completions"])  # type: ignore[arg-type]
-                        sample_row.fixed_window_request_to_effect_ns = fw["fixed_window_request_to_effect_ns"]  # type: ignore[arg-type]
+                        sample_row = replace(
+                            sample_row,
+                            fixed_window_baseline_source_frames=int(fw["fixed_window_baseline_source_frames"]),  # type: ignore[arg-type]
+                            fixed_window_baseline_admitted=int(fw["fixed_window_baseline_admitted"]),  # type: ignore[arg-type]
+                            fixed_window_baseline_completed=int(fw["fixed_window_baseline_completed"]),  # type: ignore[arg-type]
+                            fixed_window_baseline_dropped=int(fw["fixed_window_baseline_dropped"]),  # type: ignore[arg-type]
+                            fixed_window_transition_source_frames=int(fw["fixed_window_transition_source_frames"]),  # type: ignore[arg-type]
+                            fixed_window_transition_admitted=int(fw["fixed_window_transition_admitted"]),  # type: ignore[arg-type]
+                            fixed_window_transition_completed=int(fw["fixed_window_transition_completed"]),  # type: ignore[arg-type]
+                            fixed_window_transition_dropped=int(fw["fixed_window_transition_dropped"]),  # type: ignore[arg-type]
+                            fixed_window_old_plan_completions=int(fw["fixed_window_old_plan_completions"]),  # type: ignore[arg-type]
+                            fixed_window_new_plan_completions=int(fw["fixed_window_new_plan_completions"]),  # type: ignore[arg-type]
+                            fixed_window_request_to_effect_ns=fw["fixed_window_request_to_effect_ns"],  # type: ignore[arg-type]
+                        )
                     sample_rows.append(sample_row)
                     frame_rows.extend(rep_frame_rows)
 
