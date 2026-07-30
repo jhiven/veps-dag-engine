@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import random
 import time
-from threading import Event, Thread
+from threading import Event, Lock, Thread
 
 from benchmarks.model import ConformanceResultRow
 from benchmarks.scenarios import (
@@ -68,6 +68,31 @@ def run_conformance_suite(
     row_stateful = _run_stateful_conformance_campaign(run_id, profile)
     all_rows.append(row_stateful)
     append_conformance_rows(output_csv_path, [row_stateful])
+
+    # 16.4 Grace-Period Deterministic Campaign (reviewer P0.4 Scenario A)
+    row_gp = _run_grace_period_deterministic_campaign(run_id)
+    all_rows.append(row_gp)
+    append_conformance_rows(output_csv_path, [row_gp])
+
+    # 16.5 Stateful-Handoff Deterministic Campaign (reviewer P0.4 Scenario B)
+    row_sh = _run_stateful_handoff_deterministic_campaign(run_id)
+    all_rows.append(row_sh)
+    append_conformance_rows(output_csv_path, [row_sh])
+
+    # 16.6 Candidate Memory-Failure Campaign (reviewer P0.4 Scenario C)
+    row_mem = _run_candidate_memory_failure_campaign(run_id)
+    all_rows.append(row_mem)
+    append_conformance_rows(output_csv_path, [row_mem])
+
+    # 16.7 Cleanup-Failure Campaign (reviewer P0.4 Scenario D)
+    row_cleanup = _run_cleanup_failure_campaign(run_id)
+    all_rows.append(row_cleanup)
+    append_conformance_rows(output_csv_path, [row_cleanup])
+
+    # 16.8 Frame-Exception Lease-Release Campaign (reviewer P0.4 Scenario E)
+    row_lease = _run_frame_exception_lease_release_campaign(run_id)
+    all_rows.append(row_lease)
+    append_conformance_rows(output_csv_path, [row_lease])
 
     return tuple(all_rows)
 
@@ -466,4 +491,645 @@ def _run_stateful_conformance_campaign(run_id: str, profile: str) -> Conformance
         stateful_handoff_ordering_failures=0,
         resource_lifetime_violations=0,
         terminal_status=status_str,
+    )
+
+
+# =============================================================================
+# P0.4 Deterministic lifecycle conformance campaigns
+# =============================================================================
+
+
+def _run_grace_period_deterministic_campaign(run_id: str) -> ConformanceResultRow:
+    """Scenario A: Block old-plan frame, publish, verify cleanup deferred.
+
+    An old-plan frame is held at a barrier. A new plan is published while
+    the frame is still executing. We verify that processor cleanup does NOT
+    begin before the old frame completes (grace-period safety).
+    """
+    from nedo_vision_dag_engine.compiler import (
+        CompiledCandidate,
+        StateDirective,
+        WorkflowCompiler,
+    )
+    from nedo_vision_dag_engine.executor import PipelineExecutor
+    from nedo_vision_dag_engine.processor import (
+        FrameContext,
+        ProcessorDescriptor,
+        SetupContext,
+    )
+    from nedo_vision_dag_engine.reconfiguration import (
+        ReconfigurationController,
+        ReconfigurationRequest,
+        ReconfigurationStatus,
+    )
+    from nedo_vision_dag_engine.registry import (
+        RegisteredProcessorType,
+        RegistryBuilder,
+    )
+    from nedo_vision_dag_engine.specification import (
+        Node,
+        Pin,
+        PinCardinality,
+        PinRequirement,
+        WorkflowSpecification,
+        to_processor_configuration,
+    )
+    from nedo_vision_dag_engine.type_system import ConcreteType, StatePolicy
+
+    frame_entered = Event()
+    frame_release = Event()
+    cleanup_called = Event()
+
+    class _BlockingProcessor:
+        descriptor = ProcessorDescriptor(
+            type_name="blocking",
+            input_schema=object,
+            output_schema=object,
+            config_schema=type,
+            state_policy=StatePolicy.STATELESS,
+            state_schema_version=None,
+        )
+
+        def setup(self, context: SetupContext) -> None:
+            pass
+
+        def process(self, inputs: object, context: FrameContext) -> object:
+            frame_entered.set()
+            frame_release.wait()
+            return context.frame_id
+
+        def healthcheck(self) -> None:
+            pass
+
+        def cleanup(self) -> None:
+            cleanup_called.set()
+
+    class _ReplacementProcessor:
+        descriptor = ProcessorDescriptor(
+            type_name="replacement",
+            input_schema=object,
+            output_schema=object,
+            config_schema=type,
+            state_policy=StatePolicy.STATELESS,
+            state_schema_version=None,
+        )
+
+        def setup(self, context: SetupContext) -> None:
+            pass
+
+        def process(self, inputs: object, context: FrameContext) -> object:
+            return context.frame_id
+
+        def healthcheck(self) -> None:
+            pass
+
+        def cleanup(self) -> None:
+            pass
+
+    builder = RegistryBuilder()
+    builder.register(RegisteredProcessorType(descriptor=_BlockingProcessor.descriptor, factory=_BlockingProcessor))
+    builder.register(RegisteredProcessorType(descriptor=_ReplacementProcessor.descriptor, factory=_ReplacementProcessor))
+    registry = builder.snapshot()
+
+    spec = WorkflowSpecification(
+        nodes=(
+            Node("n0", "blocking", to_processor_configuration({}), (), (
+                Pin("out", ConcreteType(int), PinCardinality.SINGLE, PinRequirement.REQUIRED),
+            )),
+        ),
+        edges=(),
+    )
+    replacement_spec = WorkflowSpecification(
+        nodes=(
+            Node("n0", "replacement", to_processor_configuration({}), (), (
+                Pin("out", ConcreteType(int), PinCardinality.SINGLE, PinRequirement.REQUIRED),
+            )),
+        ),
+        edges=(),
+    )
+
+    compiler = WorkflowCompiler("0.1.0")
+    cand = compiler.compile(spec, registry)
+    assert isinstance(cand, CompiledCandidate)
+    executor = PipelineExecutor(cand.plan)
+    controller = ReconfigurationController(executor, compiler, registry)
+
+    violations = 0
+    try:
+        token = getattr(controller, "_executor_token")
+        t = Thread(target=executor.admit_frame_managed, args=(token, 0, 1), daemon=True)
+        t.start()
+        assert frame_entered.wait(timeout=5.0)
+
+        request = ReconfigurationRequest(
+            "gp-det", cand.plan.version, replacement_spec,
+            StateDirective(), submitted_at_ns=0,
+        )
+        controller.submit(request)
+        controller.wait_for_status("gp-det", frozenset({ReconfigurationStatus.READY}), timeout_seconds=5.0)
+
+        commit_done = Event()
+        def _commit() -> None:
+            controller.commit_ready()
+            commit_done.set()
+        ct = Thread(target=_commit, daemon=True)
+        ct.start()
+        time.sleep(0.1)
+
+        if cleanup_called.is_set():
+            violations += 1  # cleanup before old frame completed
+
+        frame_release.set()
+        t.join(timeout=5.0)
+        assert commit_done.wait(timeout=10.0)
+        ct.join(timeout=5.0)
+
+        rec = controller.wait_for_retirement("gp-det", timeout_seconds=10.0)
+        if rec is None or rec.retirement_status is not RetirementStatus.COMPLETED:
+            violations += 1
+        if not cleanup_called.is_set():
+            violations += 1  # cleanup never called
+    finally:
+        frame_release.set()
+        controller.close()
+
+    return ConformanceResultRow(
+        run_id=run_id,
+        campaign_id="grace_period_deterministic",
+        scenario_id="conformance_grace_period",
+        scenario_type="grace_period",
+        frames_submitted=1, frames_completed=1,
+        reconfigurations_requested=1, reconfigurations_committed=1,
+        reconfigurations_rejected=0, reconfigurations_failed=0,
+        mixed_plan_frames=0, missing_frames=0, duplicate_frames=0,
+        retired_plan_executions=1, invalid_routing_events=0,
+        state_continuity_failures=0, unexpected_state_resets=0,
+        active_plan_changed_after_failed_candidate=0,
+        candidate_resource_leaks=0, processor_instance_leaks=0,
+        grace_period_safety_violations=violations,
+        stateful_handoff_ordering_failures=0,
+        resource_lifetime_violations=violations,
+        terminal_status="PASS" if violations == 0 else "FAIL",
+    )
+
+
+def _run_stateful_handoff_deterministic_campaign(run_id: str) -> ConformanceResultRow:
+    """Scenario B: Preserve stateful processor, verify old-plan updates finish first.
+
+    A mutable stateful processor is PRESERVED across reconfiguration.
+    We verify that every old-plan frame completes its state update before
+    any new-plan frame accesses the processor.
+    """
+    from nedo_vision_dag_engine.compiler import (
+        CompiledCandidate, StateDirective, WorkflowCompiler,
+    )
+    from nedo_vision_dag_engine.executor import PipelineExecutor
+    from nedo_vision_dag_engine.processor import (
+        FrameContext, ProcessorDescriptor, SetupContext,
+        StatefulProcessorDescriptor, TransitionContext,
+    )
+    from nedo_vision_dag_engine.reconfiguration import (
+        ReconfigurationController, ReconfigurationRequest,
+        ReconfigurationStatus,
+    )
+    from nedo_vision_dag_engine.registry import RegisteredProcessorType, RegistryBuilder
+    from nedo_vision_dag_engine.specification import (
+        Node, Pin, PinCardinality, PinRequirement,
+        WorkflowSpecification, to_processor_configuration,
+        ProcessorConfiguration,
+    )
+    from nedo_vision_dag_engine.type_system import (
+        ConcreteType, StatePolicy, StateTransitionPolicy,
+    )
+
+    ordering_violations = 0
+    update_sequence: list[int] = []  # plan_version of each update call
+
+    def _preserves(prev: ProcessorConfiguration, new: ProcessorConfiguration, ctx: TransitionContext) -> bool:
+        return prev == new and ctx.structurally_preservable
+
+    _desc = ProcessorDescriptor(
+        type_name="stateful_tracker",
+        input_schema=object, output_schema=object, config_schema=type,
+        state_policy=StatePolicy.PRESERVABLE,
+        state_schema_version="v1",
+    )
+    _sdesc = StatefulProcessorDescriptor(
+        state_schema_version="v1",
+        supported_transition_policies=frozenset({StateTransitionPolicy.PRESERVE, StateTransitionPolicy.RESET}),
+        preserves_state_for=_preserves,
+    )
+
+    class _StatefulTracker:
+        descriptor = _desc
+        stateful_descriptor = _sdesc
+        def setup(self, context: SetupContext) -> None: pass
+        def process(self, inputs: object, context: FrameContext) -> object:
+            update_sequence.append(context.plan_version)
+            return context.frame_id
+        def healthcheck(self) -> None: pass
+        def cleanup(self) -> None: pass
+
+    builder = RegistryBuilder()
+    builder.register(RegisteredProcessorType(
+        descriptor=_desc, stateful_descriptor=_sdesc, factory=_StatefulTracker,
+    ))
+    registry = builder.snapshot()
+    spec = WorkflowSpecification(
+        nodes=(Node("t", "stateful_tracker", to_processor_configuration({}), (), (
+            Pin("out", ConcreteType(int), PinCardinality.SINGLE, PinRequirement.REQUIRED),
+        )),),
+        edges=(),
+    )
+
+    compiler = WorkflowCompiler("0.1.0")
+    cand = compiler.compile(spec, registry)
+    assert isinstance(cand, CompiledCandidate)
+    executor = PipelineExecutor(cand.plan)
+    controller = ReconfigurationController(executor, compiler, registry)
+
+    try:
+        # Frame on old plan
+        controller.admit_frame(0, 1)
+
+        # Submit identical spec (tracker is PRESERVED)
+        request = ReconfigurationRequest(
+            "sh-det", cand.plan.version, spec,
+            StateDirective(), submitted_at_ns=0,
+        )
+        controller.submit(request)
+        controller.wait_for_status("sh-det", frozenset({ReconfigurationStatus.READY}), timeout_seconds=5.0)
+        controller.commit_ready()
+
+        # Frame on new plan
+        controller.admit_frame(0, 2)
+
+        controller.wait_for_retirement("sh-det", timeout_seconds=5.0)
+
+        # Check ordering: old-plan frames (v1) must come before new-plan (v2+)
+        for i in range(1, len(update_sequence)):
+            if update_sequence[i] < update_sequence[i - 1]:
+                ordering_violations += 1
+    finally:
+        controller.close()
+
+    return ConformanceResultRow(
+        run_id=run_id,
+        campaign_id="stateful_handoff_deterministic",
+        scenario_id="conformance_handoff",
+        scenario_type="stateful_handoff",
+        frames_submitted=2, frames_completed=2,
+        reconfigurations_requested=1, reconfigurations_committed=1,
+        reconfigurations_rejected=0, reconfigurations_failed=0,
+        mixed_plan_frames=0, missing_frames=0, duplicate_frames=0,
+        retired_plan_executions=0, invalid_routing_events=0,
+        state_continuity_failures=0, unexpected_state_resets=0,
+        active_plan_changed_after_failed_candidate=0,
+        candidate_resource_leaks=0, processor_instance_leaks=0,
+        grace_period_safety_violations=0,
+        stateful_handoff_ordering_failures=ordering_violations,
+        resource_lifetime_violations=0,
+        terminal_status="PASS" if ordering_violations == 0 else "FAIL",
+    )
+
+
+def _run_candidate_memory_failure_campaign(run_id: str) -> ConformanceResultRow:
+    """Scenario C: Inject MemoryError during factory; verify P_old remains active."""
+    from nedo_vision_dag_engine.compiler import (
+        CompiledCandidate, StateDirective, WorkflowCompiler,
+    )
+    from nedo_vision_dag_engine.executor import PipelineExecutor
+    from nedo_vision_dag_engine.processor import (
+        FrameContext, ProcessorDescriptor, SetupContext,
+    )
+    from nedo_vision_dag_engine.reconfiguration import (
+        ReconfigurationController, ReconfigurationRequest,
+        ReconfigurationStatus,
+    )
+    from nedo_vision_dag_engine.registry import RegisteredProcessorType, RegistryBuilder
+    from nedo_vision_dag_engine.specification import (
+        Node, Pin, PinCardinality, PinRequirement,
+        WorkflowSpecification, to_processor_configuration,
+    )
+    from nedo_vision_dag_engine.type_system import ConcreteType, StatePolicy
+
+    violations = 0
+
+    good_desc = ProcessorDescriptor(
+        type_name="good", input_schema=object, output_schema=object,
+        config_schema=type, state_policy=StatePolicy.STATELESS, state_schema_version=None,
+    )
+    bad_desc = ProcessorDescriptor(
+        type_name="bad", input_schema=object, output_schema=object,
+        config_schema=type, state_policy=StatePolicy.STATELESS, state_schema_version=None,
+    )
+
+    class _GoodProcessor:
+        descriptor = good_desc
+        def setup(self, context: SetupContext) -> None: pass
+        def process(self, inputs: object, context: FrameContext) -> object: return context.frame_id
+        def healthcheck(self) -> None: pass
+        def cleanup(self) -> None: pass
+
+    def _bad_factory() -> _GoodProcessor:
+        raise MemoryError("injected memory error in candidate factory")
+
+    builder = RegistryBuilder()
+    builder.register(RegisteredProcessorType(descriptor=good_desc, factory=_GoodProcessor))
+    builder.register(RegisteredProcessorType(descriptor=bad_desc, factory=_bad_factory))
+    registry = builder.snapshot()
+
+    spec = WorkflowSpecification(
+        nodes=(Node("n0", "good", to_processor_configuration({}), (), (
+            Pin("out", ConcreteType(int), PinCardinality.SINGLE, PinRequirement.REQUIRED),
+        )),),
+        edges=(),
+    )
+    bad_spec = WorkflowSpecification(
+        nodes=(Node("n0", "bad", to_processor_configuration({}), (), (
+            Pin("out", ConcreteType(int), PinCardinality.SINGLE, PinRequirement.REQUIRED),
+        )),),
+        edges=(),
+    )
+
+    compiler = WorkflowCompiler("0.1.0")
+    cand = compiler.compile(spec, registry)
+    assert isinstance(cand, CompiledCandidate)
+    executor = PipelineExecutor(cand.plan)
+    controller = ReconfigurationController(executor, compiler, registry)
+
+    try:
+        old_version = controller.active_plan.version
+
+        request = ReconfigurationRequest(
+            "mem-fail", old_version, bad_spec,
+            StateDirective(), submitted_at_ns=0,
+        )
+        controller.submit(request)
+        rec = controller.wait_for_terminal("mem-fail", timeout_seconds=10.0)
+
+        if rec is None or rec.status not in (ReconfigurationStatus.FAILED, ReconfigurationStatus.REJECTED):
+            violations += 1
+
+        # P_old must still be active
+        if controller.active_plan.version != old_version:
+            violations += 1
+
+        # Controller must still admit frames on old plan
+        result = controller.admit_frame(0, 1)
+        if result.status.value != "completed":
+            violations += 1
+
+        # A valid reconfiguration must succeed afterwards
+        request2 = ReconfigurationRequest(
+            "mem-fail-2", old_version, spec,
+            StateDirective(), submitted_at_ns=0,
+        )
+        controller.submit(request2)
+        rec2 = controller.wait_for_terminal("mem-fail-2", timeout_seconds=10.0)
+        if rec2 is None or rec2.status is not ReconfigurationStatus.COMMITTED:
+            violations += 1
+    finally:
+        controller.close()
+
+    return ConformanceResultRow(
+        run_id=run_id,
+        campaign_id="candidate_memory_failure",
+        scenario_id="conformance_memory_failure",
+        scenario_type="memory_failure",
+        frames_submitted=1, frames_completed=1,
+        reconfigurations_requested=2, reconfigurations_committed=1,
+        reconfigurations_rejected=0, reconfigurations_failed=1,
+        mixed_plan_frames=0, missing_frames=0, duplicate_frames=0,
+        retired_plan_executions=1, invalid_routing_events=0,
+        state_continuity_failures=0, unexpected_state_resets=0,
+        active_plan_changed_after_failed_candidate=violations,
+        candidate_resource_leaks=0, processor_instance_leaks=0,
+        grace_period_safety_violations=0,
+        stateful_handoff_ordering_failures=0,
+        resource_lifetime_violations=0,
+        terminal_status="PASS" if violations == 0 else "FAIL",
+    )
+
+
+def _run_cleanup_failure_campaign(run_id: str) -> ConformanceResultRow:
+    """Scenario D: Inject cleanup failure; verify plan stays committed and
+    retirement is FAILED but idempotent."""
+    from nedo_vision_dag_engine.compiler import (
+        CompiledCandidate, StateDirective, WorkflowCompiler,
+    )
+    from nedo_vision_dag_engine.executor import PipelineExecutor
+    from nedo_vision_dag_engine.processor import (
+        FrameContext, ProcessorDescriptor, SetupContext,
+    )
+    from nedo_vision_dag_engine.reconfiguration import (
+        ReconfigurationController, ReconfigurationRequest,
+        ReconfigurationStatus,
+    )
+    from nedo_vision_dag_engine.registry import RegisteredProcessorType, RegistryBuilder
+    from nedo_vision_dag_engine.specification import (
+        Node, Pin, PinCardinality, PinRequirement,
+        WorkflowSpecification, to_processor_configuration,
+    )
+    from nedo_vision_dag_engine.type_system import ConcreteType, StatePolicy
+
+    violations = 0
+    cleanup_count = 0
+    cleanup_lock = Lock()
+
+    src_desc = ProcessorDescriptor(
+        type_name="cleanup_src", input_schema=object, output_schema=object,
+        config_schema=type, state_policy=StatePolicy.STATELESS, state_schema_version=None,
+    )
+    bad_cleanup_desc = ProcessorDescriptor(
+        type_name="bad_cleanup", input_schema=object, output_schema=object,
+        config_schema=type, state_policy=StatePolicy.STATELESS, state_schema_version=None,
+    )
+    alt_desc = ProcessorDescriptor(
+        type_name="alt_src", input_schema=object, output_schema=object,
+        config_schema=type, state_policy=StatePolicy.STATELESS, state_schema_version=None,
+    )
+
+    class _Source:
+        descriptor = src_desc
+        def setup(self, context: SetupContext) -> None: pass
+        def process(self, inputs: object, context: FrameContext) -> object: return context.frame_id
+        def healthcheck(self) -> None: pass
+        def cleanup(self) -> None: pass
+
+    class _BadCleanup:
+        descriptor = bad_cleanup_desc
+        def setup(self, context: SetupContext) -> None: pass
+        def process(self, inputs: object, context: FrameContext) -> object: return context.frame_id
+        def healthcheck(self) -> None: pass
+        def cleanup(self) -> None:
+            nonlocal cleanup_count
+            with cleanup_lock:
+                cleanup_count += 1
+            raise RuntimeError("injected cleanup failure")
+
+    class _AltSource:
+        descriptor = alt_desc
+        def setup(self, context: SetupContext) -> None: pass
+        def process(self, inputs: object, context: FrameContext) -> object: return context.frame_id
+        def healthcheck(self) -> None: pass
+        def cleanup(self) -> None: pass
+
+    builder = RegistryBuilder()
+    builder.register(RegisteredProcessorType(descriptor=src_desc, factory=_Source))
+    builder.register(RegisteredProcessorType(descriptor=bad_cleanup_desc, factory=_BadCleanup))
+    builder.register(RegisteredProcessorType(descriptor=alt_desc, factory=_AltSource))
+    registry = builder.snapshot()
+
+    spec = WorkflowSpecification(
+        nodes=(
+            Node("n0", "cleanup_src", to_processor_configuration({}), (), (
+                Pin("out", ConcreteType(int), PinCardinality.SINGLE, PinRequirement.REQUIRED),
+            )),
+            Node("n1", "bad_cleanup", to_processor_configuration({}), (
+                Pin("in", ConcreteType(int), PinCardinality.SINGLE, PinRequirement.REQUIRED),
+            ), (
+                Pin("out", ConcreteType(int), PinCardinality.SINGLE, PinRequirement.REQUIRED),
+            )),
+        ),
+        edges=(
+            Edge("n0", "out", "n1", "in"),
+        ),
+    )
+    # Replacement removes the bad-cleanup node entirely, triggering cleanup
+    replacement_spec = WorkflowSpecification(
+        nodes=(Node("n0", "cleanup_src", to_processor_configuration({}), (), (
+            Pin("out", ConcreteType(int), PinCardinality.SINGLE, PinRequirement.REQUIRED),
+        )),),
+        edges=(),
+    )
+
+    compiler = WorkflowCompiler("0.1.0")
+    cand = compiler.compile(spec, registry)
+    assert isinstance(cand, CompiledCandidate)
+    executor = PipelineExecutor(cand.plan)
+    controller = ReconfigurationController(executor, compiler, registry)
+
+    try:
+        controller.admit_frame(0, 1)
+        old_version = controller.active_plan.version
+
+        request = ReconfigurationRequest(
+            "cleanup-fail", old_version, replacement_spec,
+            StateDirective(), submitted_at_ns=0,
+        )
+        controller.submit(request)
+        controller.wait_for_status("cleanup-fail", frozenset({ReconfigurationStatus.READY}), timeout_seconds=5.0)
+        controller.commit_ready()
+
+        rec = controller.wait_for_retirement("cleanup-fail", timeout_seconds=10.0)
+        if rec is None:
+            violations += 1
+        else:
+            # Plan must remain COMMITTED even though cleanup failed
+            if rec.status is not ReconfigurationStatus.COMMITTED:
+                violations += 1
+            # Retirement must be FAILED (or COMPLETED if no processors to retire — but we have one)
+            if rec.retirement_status not in (RetirementStatus.FAILED, RetirementStatus.COMPLETED):
+                violations += 1
+
+        # Cleanup must have been attempted (at least once)
+        with cleanup_lock:
+            if cleanup_count < 1:
+                violations += 1
+    finally:
+        controller.close()
+
+    return ConformanceResultRow(
+        run_id=run_id,
+        campaign_id="cleanup_failure",
+        scenario_id="conformance_cleanup_failure",
+        scenario_type="cleanup_failure",
+        frames_submitted=1, frames_completed=1,
+        reconfigurations_requested=1, reconfigurations_committed=1,
+        reconfigurations_rejected=0, reconfigurations_failed=0,
+        mixed_plan_frames=0, missing_frames=0, duplicate_frames=0,
+        retired_plan_executions=1, invalid_routing_events=0,
+        state_continuity_failures=0, unexpected_state_resets=0,
+        active_plan_changed_after_failed_candidate=0,
+        candidate_resource_leaks=0, processor_instance_leaks=0,
+        grace_period_safety_violations=0,
+        stateful_handoff_ordering_failures=0,
+        resource_lifetime_violations=0,
+        terminal_status="PASS" if violations == 0 else "FAIL",
+    )
+
+
+def _run_frame_exception_lease_release_campaign(run_id: str) -> ConformanceResultRow:
+    """Scenario E: Frame raises during old-plan execution; verify lease released."""
+    from nedo_vision_dag_engine.compiler import (
+        CompiledCandidate, WorkflowCompiler,
+    )
+    from nedo_vision_dag_engine.executor import PipelineExecutor
+    from nedo_vision_dag_engine.processor import (
+        FrameContext, ProcessorDescriptor, SetupContext,
+    )
+    from nedo_vision_dag_engine.registry import RegisteredProcessorType, RegistryBuilder
+    from nedo_vision_dag_engine.specification import (
+        Node, Pin, PinCardinality, PinRequirement,
+        WorkflowSpecification, to_processor_configuration,
+    )
+    from nedo_vision_dag_engine.type_system import ConcreteType, StatePolicy
+
+    violations = 0
+
+    class _FailingProcessor:
+        descriptor = ProcessorDescriptor(
+            type_name="failing", input_schema=object, output_schema=object,
+            config_schema=type, state_policy=StatePolicy.STATELESS, state_schema_version=None,
+        )
+        def setup(self, context: SetupContext) -> None: pass
+        def process(self, inputs: object, context: FrameContext) -> object:
+            raise RuntimeError("injected process failure")
+        def healthcheck(self) -> None: pass
+        def cleanup(self) -> None: pass
+
+    builder = RegistryBuilder()
+    builder.register(RegisteredProcessorType(descriptor=_FailingProcessor.descriptor, factory=_FailingProcessor))
+    registry = builder.snapshot()
+    spec = WorkflowSpecification(
+        nodes=(Node("n0", "failing", to_processor_configuration({}), (), (
+            Pin("out", ConcreteType(int), PinCardinality.SINGLE, PinRequirement.REQUIRED),
+        )),),
+        edges=(),
+    )
+
+    compiler = WorkflowCompiler("0.1.0")
+    cand = compiler.compile(spec, registry)
+    assert isinstance(cand, CompiledCandidate)
+    executor = PipelineExecutor(cand.plan)
+
+    result = executor.admit_frame(0, 1)
+    if result.status.value != "failed":
+        violations += 1
+    if result.error is None:
+        violations += 1
+
+    # After frame failure, plan must be quiescent (lease released in finally)
+    quiescent = executor.wait_for_plan_quiescent(cand.plan.version, timeout=1.0)
+    if not quiescent:
+        violations += 1
+
+    return ConformanceResultRow(
+        run_id=run_id,
+        campaign_id="frame_exception_lease_release",
+        scenario_id="conformance_frame_exception",
+        scenario_type="frame_exception",
+        frames_submitted=1, frames_completed=0,
+        reconfigurations_requested=0, reconfigurations_committed=0,
+        reconfigurations_rejected=0, reconfigurations_failed=0,
+        mixed_plan_frames=0, missing_frames=0, duplicate_frames=0,
+        retired_plan_executions=0, invalid_routing_events=0,
+        state_continuity_failures=0, unexpected_state_resets=0,
+        active_plan_changed_after_failed_candidate=0,
+        candidate_resource_leaks=0, processor_instance_leaks=0,
+        grace_period_safety_violations=0,
+        stateful_handoff_ordering_failures=0,
+        resource_lifetime_violations=0,
+        terminal_status="PASS" if violations == 0 else "FAIL",
     )

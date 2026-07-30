@@ -158,17 +158,18 @@ REALWORLD_VIDEO_HEADERS = (
     "drop_rate_after_first_candidate_output",
     "gpu_memory_transition_max_allocated_bytes",
     "gpu_memory_transition_max_reserved_bytes",
-    "fixed_window_baseline_source_frames",
-    "fixed_window_baseline_admitted",
-    "fixed_window_baseline_completed",
-    "fixed_window_baseline_dropped",
-    "fixed_window_transition_source_frames",
-    "fixed_window_transition_admitted",
-    "fixed_window_transition_completed",
-    "fixed_window_transition_dropped",
+    "fixed_window_start_media_frame_index",
+    "fixed_window_end_media_frame_index",
+    "fixed_window_expected_source_frames",
+    "fixed_window_observed_source_frames",
+    "fixed_window_admitted",
+    "fixed_window_completed",
+    "fixed_window_dropped",
+    "fixed_window_duplicated",
     "fixed_window_old_plan_completions",
     "fixed_window_new_plan_completions",
-    "fixed_window_request_to_effect_ns",
+    "fixed_window_accounting_residual",
+    "fixed_window_accounting_valid",
 )
 
 REALWORLD_VIDEO_FRAME_HEADERS = (
@@ -290,17 +291,20 @@ class RealworldVideoSampleRow:
     drop_rate_after_first_candidate_output: float | None
     gpu_memory_transition_max_allocated_bytes: int | None
     gpu_memory_transition_max_reserved_bytes: int | None
-    fixed_window_baseline_source_frames: int = 0
-    fixed_window_baseline_admitted: int = 0
-    fixed_window_baseline_completed: int = 0
-    fixed_window_baseline_dropped: int = 0
-    fixed_window_transition_source_frames: int = 0
-    fixed_window_transition_admitted: int = 0
-    fixed_window_transition_completed: int = 0
-    fixed_window_transition_dropped: int = 0
+    # Fixed source-frame-index window (reviewer P0.6):
+    # 60 frames before request trigger + 150 after = 210 expected total
+    fixed_window_start_media_frame_index: int = 0
+    fixed_window_end_media_frame_index: int = 0
+    fixed_window_expected_source_frames: int = 0
+    fixed_window_observed_source_frames: int = 0
+    fixed_window_admitted: int = 0
+    fixed_window_completed: int = 0
+    fixed_window_dropped: int = 0
+    fixed_window_duplicated: int = 0
     fixed_window_old_plan_completions: int = 0
     fixed_window_new_plan_completions: int = 0
-    fixed_window_request_to_effect_ns: int | None = None
+    fixed_window_accounting_residual: int = 0
+    fixed_window_accounting_valid: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -339,98 +343,84 @@ def _calculate_file_hash(path: str) -> str:
 
 def compute_fixed_window_metrics(
     frame_rows: list[RealworldVideoFrameSampleRow],
-    request_timestamp_ns: int,
-    baseline_duration_ns: int = 2_000_000_000,  # 2 s
-    observation_duration_ns: int = 5_000_000_000,  # 5 s
-) -> dict[str, int | None]:
-    """Compute fixed wall-clock window metrics from frame-level data.
+    request_trigger_media_frame_index: int,
+    baseline_frame_count: int = 60,
+    transition_frame_count: int = 150,
+) -> dict[str, int | bool]:
+    """Compute source-frame-index-based fixed-window metrics.
 
-    Uses identical window for all mechanisms:
-    - Baseline: [request - 2s, request)
-    - Transition: [request, request + 5s)
+    Uses identical source-frame window for all mechanisms:
+    - Baseline: indices [trigger - 60, trigger)
+    - Transition: indices [trigger, trigger + 150)
+    - Total expected: 210 source frames
 
-    This replaces mechanism-dependent event windows with a fair,
-    mechanism-independent wall-clock comparison required by reviewer P0.6.
+    This replaces mechanism-dependent wall-clock windows with a fair,
+    mechanism-independent source-frame-index comparison (reviewer P0.6).
     """
-    baseline_start = request_timestamp_ns - baseline_duration_ns
-    baseline_end = request_timestamp_ns
-    transition_end = request_timestamp_ns + observation_duration_ns
+    window_start = max(0, request_trigger_media_frame_index - baseline_frame_count)
+    window_end = request_trigger_media_frame_index + transition_frame_count
+    expected_frames = baseline_frame_count + transition_frame_count  # 210
 
-    baseline_source = 0
-    baseline_admitted = 0
-    baseline_completed = 0
-    baseline_dropped = 0
-    transition_source = 0
-    transition_admitted = 0
-    transition_completed = 0
-    transition_dropped = 0
+    observed = 0
+    admitted = 0
+    completed = 0
+    dropped_count = 0
+    duplicated = 0
     old_plan_completions = 0
     new_plan_completions = 0
-    first_new_frame_completion_ns: int | None = None
 
-    # Use the minimum plan_version in the log as a heuristic for "old" plan
+    # Determine old vs new plan version
     old_plan_version: int | None = None
+    new_plan_version: int | None = None
     for row in frame_rows:
         if row.plan_version is not None:
-            old_plan_version = row.plan_version
-            break
+            if old_plan_version is None or row.plan_version < old_plan_version:
+                old_plan_version = row.plan_version
+            if new_plan_version is None or row.plan_version > new_plan_version:
+                new_plan_version = row.plan_version
 
     for row in frame_rows:
-        ts = row.receiver_ingress_timestamp_ns
-        if ts is None:
-            # Fall back to admission timestamp for frames without receiver ts
-            ts = row.admission_timestamp_ns
-        if ts is None:
+        mfi = row.media_frame_index
+        if mfi is None:
+            continue
+        if mfi < window_start or mfi >= window_end:
             continue
 
-        # Baseline window
-        if baseline_start <= ts < baseline_end:
-            baseline_source += 1
-            if row.dropped:
-                baseline_dropped += 1
-            else:
-                baseline_admitted += 1
-                if row.completion_timestamp_ns is not None:
-                    baseline_completed += 1
+        observed += 1
+        if row.duplicated:
+            duplicated += 1
+        if row.dropped:
+            dropped_count += 1
+        else:
+            admitted += 1
+            if row.completion_timestamp_ns is not None:
+                completed += 1
+                if row.plan_version is not None:
+                    if old_plan_version is not None and row.plan_version == old_plan_version:
+                        old_plan_completions += 1
+                    elif new_plan_version is not None and row.plan_version == new_plan_version:
+                        new_plan_completions += 1
 
-        # Transition window
-        if request_timestamp_ns <= ts < transition_end:
-            transition_source += 1
-            if row.dropped:
-                transition_dropped += 1
-            else:
-                transition_admitted += 1
-                if row.completion_timestamp_ns is not None:
-                    transition_completed += 1
-                    if (
-                        old_plan_version is not None
-                        and row.plan_version is not None
-                    ):
-                        if row.plan_version == old_plan_version:
-                            old_plan_completions += 1
-                        elif row.plan_version > old_plan_version:
-                            new_plan_completions += 1
-                            if first_new_frame_completion_ns is None:
-                                first_new_frame_completion_ns = (
-                                    row.completion_timestamp_ns
-                                )
-
-    request_to_effect_ns: int | None = None
-    if first_new_frame_completion_ns is not None:
-        request_to_effect_ns = first_new_frame_completion_ns - request_timestamp_ns
+    # Accounting: observed = completed + dropped + residual (in-flight)
+    accounted = completed + dropped_count
+    residual = observed - accounted
+    in_flight = admitted - completed
+    accounting_valid = (residual >= 0 and duplicated == 0
+                        and residual == in_flight)
 
     return {
-        "fixed_window_baseline_source_frames": baseline_source,
-        "fixed_window_baseline_admitted": baseline_admitted,
-        "fixed_window_baseline_completed": baseline_completed,
-        "fixed_window_baseline_dropped": baseline_dropped,
-        "fixed_window_transition_source_frames": transition_source,
-        "fixed_window_transition_admitted": transition_admitted,
-        "fixed_window_transition_completed": transition_completed,
-        "fixed_window_transition_dropped": transition_dropped,
+        "fixed_window_start_media_frame_index": window_start,
+        "fixed_window_end_media_frame_index": window_end,
+        "fixed_window_expected_source_frames": expected_frames,
+        "fixed_window_observed_source_frames": observed,
+        "fixed_window_admitted": admitted,
+        "fixed_window_completed": completed,
+        "fixed_window_dropped": dropped_count,
+        "fixed_window_duplicated": duplicated,
         "fixed_window_old_plan_completions": old_plan_completions,
         "fixed_window_new_plan_completions": new_plan_completions,
-        "fixed_window_request_to_effect_ns": request_to_effect_ns,
+        "fixed_window_accounting_residual": residual,
+        "fixed_window_accounting_valid": accounting_valid,
     }
 
 
@@ -1363,24 +1353,25 @@ def run_realworld_video_suite(
                         gpu_memory_transition_max_allocated_bytes=gpu_trans_max_alloc,
                         gpu_memory_transition_max_reserved_bytes=gpu_trans_max_resv,
                     )
-                    if sample_row.request_timestamp_ns is not None:
+                    if sample_row.request_trigger_media_frame_index is not None:
                         fw = compute_fixed_window_metrics(
                             frame_rows=rep_frame_rows,
-                            request_timestamp_ns=sample_row.request_timestamp_ns,
+                            request_trigger_media_frame_index=sample_row.request_trigger_media_frame_index,
                         )
                         sample_row = replace(
                             sample_row,
-                            fixed_window_baseline_source_frames=int(fw["fixed_window_baseline_source_frames"]),  # type: ignore[arg-type]
-                            fixed_window_baseline_admitted=int(fw["fixed_window_baseline_admitted"]),  # type: ignore[arg-type]
-                            fixed_window_baseline_completed=int(fw["fixed_window_baseline_completed"]),  # type: ignore[arg-type]
-                            fixed_window_baseline_dropped=int(fw["fixed_window_baseline_dropped"]),  # type: ignore[arg-type]
-                            fixed_window_transition_source_frames=int(fw["fixed_window_transition_source_frames"]),  # type: ignore[arg-type]
-                            fixed_window_transition_admitted=int(fw["fixed_window_transition_admitted"]),  # type: ignore[arg-type]
-                            fixed_window_transition_completed=int(fw["fixed_window_transition_completed"]),  # type: ignore[arg-type]
-                            fixed_window_transition_dropped=int(fw["fixed_window_transition_dropped"]),  # type: ignore[arg-type]
+                            fixed_window_start_media_frame_index=int(fw["fixed_window_start_media_frame_index"]),  # type: ignore[arg-type]
+                            fixed_window_end_media_frame_index=int(fw["fixed_window_end_media_frame_index"]),  # type: ignore[arg-type]
+                            fixed_window_expected_source_frames=int(fw["fixed_window_expected_source_frames"]),  # type: ignore[arg-type]
+                            fixed_window_observed_source_frames=int(fw["fixed_window_observed_source_frames"]),  # type: ignore[arg-type]
+                            fixed_window_admitted=int(fw["fixed_window_admitted"]),  # type: ignore[arg-type]
+                            fixed_window_completed=int(fw["fixed_window_completed"]),  # type: ignore[arg-type]
+                            fixed_window_dropped=int(fw["fixed_window_dropped"]),  # type: ignore[arg-type]
+                            fixed_window_duplicated=int(fw["fixed_window_duplicated"]),  # type: ignore[arg-type]
                             fixed_window_old_plan_completions=int(fw["fixed_window_old_plan_completions"]),  # type: ignore[arg-type]
                             fixed_window_new_plan_completions=int(fw["fixed_window_new_plan_completions"]),  # type: ignore[arg-type]
-                            fixed_window_request_to_effect_ns=fw["fixed_window_request_to_effect_ns"],  # type: ignore[arg-type]
+                            fixed_window_accounting_residual=int(fw["fixed_window_accounting_residual"]),  # type: ignore[arg-type]
+                            fixed_window_accounting_valid=bool(fw["fixed_window_accounting_valid"]),  # type: ignore[arg-type]
                         )
                     sample_rows.append(sample_row)
                     frame_rows.extend(rep_frame_rows)
@@ -1505,17 +1496,18 @@ def run_realworld_video_suite(
                     f"{r.drop_rate_after_first_candidate_output:.6f}" if r.drop_rate_after_first_candidate_output is not None else "",
                     r.gpu_memory_transition_max_allocated_bytes if r.gpu_memory_transition_max_allocated_bytes is not None else "",
                     r.gpu_memory_transition_max_reserved_bytes if r.gpu_memory_transition_max_reserved_bytes is not None else "",
-                    r.fixed_window_baseline_source_frames,
-                    r.fixed_window_baseline_admitted,
-                    r.fixed_window_baseline_completed,
-                    r.fixed_window_baseline_dropped,
-                    r.fixed_window_transition_source_frames,
-                    r.fixed_window_transition_admitted,
-                    r.fixed_window_transition_completed,
-                    r.fixed_window_transition_dropped,
+                    r.fixed_window_start_media_frame_index,
+                    r.fixed_window_end_media_frame_index,
+                    r.fixed_window_expected_source_frames,
+                    r.fixed_window_observed_source_frames,
+                    r.fixed_window_admitted,
+                    r.fixed_window_completed,
+                    r.fixed_window_dropped,
+                    r.fixed_window_duplicated,
                     r.fixed_window_old_plan_completions,
                     r.fixed_window_new_plan_completions,
-                    r.fixed_window_request_to_effect_ns if r.fixed_window_request_to_effect_ns is not None else "",
+                    r.fixed_window_accounting_residual,
+                    r.fixed_window_accounting_valid,
                 ])
 
         with open(frame_csv_path, "w", newline="", encoding="utf-8") as f:

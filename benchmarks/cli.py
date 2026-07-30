@@ -527,6 +527,11 @@ def main() -> None:
         report_cmd(args.run_directory)
     elif args.subcommand == "verify":
         verify_cmd(args.run_directory)
+    elif args.subcommand == "validate-gate":
+        from benchmarks.validation_gate import validate_benchmark_directory
+        report = validate_benchmark_directory(args.run_directory)
+        if not report.all_passed:
+            sys.exit(1)
     elif args.subcommand == "validate-realworld":
         from usecases.video_analytics.validator import validate_benchmark_csvs
         summary_csv = os.path.join(args.run_directory, "realworld-video-samples.csv")
