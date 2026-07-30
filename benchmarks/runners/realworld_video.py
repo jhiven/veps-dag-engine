@@ -290,9 +290,6 @@ class RealworldVideoSampleRow:
     drop_rate_after_first_candidate_output: float | None
     gpu_memory_transition_max_allocated_bytes: int | None
     gpu_memory_transition_max_reserved_bytes: int | None
-    # Fixed wall-clock window metrics (reviewer P0.6):
-    # 2 s baseline before request → 5 s observation after request,
-    # identical window for all mechanisms.
     fixed_window_baseline_source_frames: int = 0
     fixed_window_baseline_admitted: int = 0
     fixed_window_baseline_completed: int = 0
@@ -1366,6 +1363,22 @@ def run_realworld_video_suite(
                         gpu_memory_transition_max_allocated_bytes=gpu_trans_max_alloc,
                         gpu_memory_transition_max_reserved_bytes=gpu_trans_max_resv,
                     )
+                    if sample_row.request_timestamp_ns is not None:
+                        fw = compute_fixed_window_metrics(
+                            frame_rows=rep_frame_rows,
+                            request_timestamp_ns=sample_row.request_timestamp_ns,
+                        )
+                        sample_row.fixed_window_baseline_source_frames = int(fw["fixed_window_baseline_source_frames"])  # type: ignore[arg-type]
+                        sample_row.fixed_window_baseline_admitted = int(fw["fixed_window_baseline_admitted"])  # type: ignore[arg-type]
+                        sample_row.fixed_window_baseline_completed = int(fw["fixed_window_baseline_completed"])  # type: ignore[arg-type]
+                        sample_row.fixed_window_baseline_dropped = int(fw["fixed_window_baseline_dropped"])  # type: ignore[arg-type]
+                        sample_row.fixed_window_transition_source_frames = int(fw["fixed_window_transition_source_frames"])  # type: ignore[arg-type]
+                        sample_row.fixed_window_transition_admitted = int(fw["fixed_window_transition_admitted"])  # type: ignore[arg-type]
+                        sample_row.fixed_window_transition_completed = int(fw["fixed_window_transition_completed"])  # type: ignore[arg-type]
+                        sample_row.fixed_window_transition_dropped = int(fw["fixed_window_transition_dropped"])  # type: ignore[arg-type]
+                        sample_row.fixed_window_old_plan_completions = int(fw["fixed_window_old_plan_completions"])  # type: ignore[arg-type]
+                        sample_row.fixed_window_new_plan_completions = int(fw["fixed_window_new_plan_completions"])  # type: ignore[arg-type]
+                        sample_row.fixed_window_request_to_effect_ns = fw["fixed_window_request_to_effect_ns"]  # type: ignore[arg-type]
                     sample_rows.append(sample_row)
                     frame_rows.extend(rep_frame_rows)
 
@@ -1489,6 +1502,17 @@ def run_realworld_video_suite(
                     f"{r.drop_rate_after_first_candidate_output:.6f}" if r.drop_rate_after_first_candidate_output is not None else "",
                     r.gpu_memory_transition_max_allocated_bytes if r.gpu_memory_transition_max_allocated_bytes is not None else "",
                     r.gpu_memory_transition_max_reserved_bytes if r.gpu_memory_transition_max_reserved_bytes is not None else "",
+                    r.fixed_window_baseline_source_frames,
+                    r.fixed_window_baseline_admitted,
+                    r.fixed_window_baseline_completed,
+                    r.fixed_window_baseline_dropped,
+                    r.fixed_window_transition_source_frames,
+                    r.fixed_window_transition_admitted,
+                    r.fixed_window_transition_completed,
+                    r.fixed_window_transition_dropped,
+                    r.fixed_window_old_plan_completions,
+                    r.fixed_window_new_plan_completions,
+                    r.fixed_window_request_to_effect_ns if r.fixed_window_request_to_effect_ns is not None else "",
                 ])
 
         with open(frame_csv_path, "w", newline="", encoding="utf-8") as f:
