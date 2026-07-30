@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from threading import Lock
+from threading import Event, Lock
 
 from nedo_vision_dag_engine.instrumentation import (
     FrameExecutionEvent,
@@ -12,6 +12,7 @@ from nedo_vision_dag_engine.instrumentation import (
     NanosecondClock,
     RuntimeInstrumentation,
 )
+from nedo_vision_dag_engine.lifecycle import PlanLifecycleState
 from nedo_vision_dag_engine.plan import ExecutionPlan, ExecutionStep, construct_inputs
 from nedo_vision_dag_engine.processor import FrameContext
 from nedo_vision_dag_engine.type_system import MISSING
@@ -127,10 +128,14 @@ class PipelineExecutor:
         "_active_plan",
         "_clock",
         "_execution_lock",
+        "_in_flight_lock",
         "_instrumentation",
         "_manager_token",
         "_next_frame_id",
+        "_plan_inflight",
+        "_plan_lifecycle",
         "_plan_lock",
+        "_plan_quiescent_events",
         "_workspace_pool",
     )
 
@@ -146,11 +151,17 @@ class PipelineExecutor:
         self._next_frame_id = 0
         self._plan_lock = Lock()
         self._execution_lock = Lock()
+        self._in_flight_lock = Lock()
         self._manager_token: object | None = None
         self._clock = clock
         self._instrumentation = (
             instrumentation if instrumentation is not None else RuntimeInstrumentation(clock=clock)
         )
+        self._plan_inflight: dict[int, int] = {}
+        self._plan_quiescent_events: dict[int, Event] = {}
+        self._plan_lifecycle: dict[int, PlanLifecycleState] = {
+            initial_plan.version: PlanLifecycleState.ACTIVE,
+        }
 
     @property
     def active_plan(self) -> ExecutionPlan:
@@ -166,6 +177,66 @@ class PipelineExecutor:
         """
         with self._plan_lock:
             return self._active_plan
+
+    def plan_lifecycle_state(self, plan_version: int) -> PlanLifecycleState | None:
+        """Return the lifecycle state for a plan version, or None if unknown."""
+        with self._plan_lock:
+            return self._plan_lifecycle.get(plan_version)
+
+    def wait_for_plan_quiescent(self, plan_version: int, timeout: float | None = None) -> bool:
+        """Block until no frames are in-flight on the given plan version.
+
+        Returns True if the plan became quiescent, False on timeout.
+        Safe to call from any thread; does not acquire ``_execution_lock``.
+        """
+        event: Event | None = None
+        with self._in_flight_lock:
+            count = self._plan_inflight.get(plan_version, 0)
+            if count == 0:
+                self._plan_lifecycle[plan_version] = PlanLifecycleState.QUIESCENT
+                return True
+            event = self._plan_quiescent_events.setdefault(plan_version, Event())
+
+        # Wait outside any lock so frames can complete
+        assert event is not None
+        result = event.wait(timeout=timeout)
+        if result:
+            with self._in_flight_lock:
+                self._plan_lifecycle[plan_version] = PlanLifecycleState.QUIESCENT
+        return result
+
+    def _increment_inflight(self, plan_version: int) -> None:
+        """Increment the in-flight counter for a plan version.
+
+        Caller may hold ``_execution_lock`` or ``_plan_lock``; this method
+        acquires ``_in_flight_lock`` internally.
+        """
+        with self._in_flight_lock:
+            self._plan_inflight[plan_version] = self._plan_inflight.get(plan_version, 0) + 1
+
+    def _decrement_inflight(self, plan_version: int) -> None:
+        """Decrement the in-flight counter and signal waiters if it reaches zero.
+
+        Acquires ``_in_flight_lock`` internally.  Safe to call while holding
+        ``_execution_lock``.
+        """
+        with self._in_flight_lock:
+            current = self._plan_inflight.get(plan_version, 0)
+            if current <= 0:
+                return  # defensive: should not happen
+            new_count = current - 1
+            if new_count == 0:
+                del self._plan_inflight[plan_version]
+                event = self._plan_quiescent_events.pop(plan_version, None)
+                if event is not None:
+                    event.set()
+            else:
+                self._plan_inflight[plan_version] = new_count
+
+    def update_plan_lifecycle(self, plan_version: int, state: PlanLifecycleState) -> None:
+        """Update the lifecycle state for a plan version."""
+        with self._plan_lock:
+            self._plan_lifecycle[plan_version] = state
 
     def claim_management(self, token: object) -> None:
         """Claim exclusive management of this executor."""
@@ -253,6 +324,7 @@ class PipelineExecutor:
                 else:
                     self._require_unmanaged()
                 plan = self._active_plan
+                self._increment_inflight(plan.version)
             resolved_frame_id = self._next_frame_id if frame_id is None else frame_id
             if resolved_frame_id < 0:
                 raise ValueError("frame_id must be non-negative.")
@@ -263,6 +335,7 @@ class PipelineExecutor:
                 result = execute_frame(plan, resolved_frame_id, admitted_at_ns, workspace)
             finally:
                 self._workspace_pool.release(workspace)
+                self._decrement_inflight(plan.version)
 
             completed_at_ns = self._clock()
             self._instrumentation.record_frame(
@@ -304,6 +377,11 @@ class PipelineExecutor:
                 f"version {previous_plan.version}."
             )
         self._active_plan = new_plan
+
+        # Update plan lifecycle states
+        self._plan_lifecycle[previous_plan.version] = PlanLifecycleState.SUPERSEDED
+        self._plan_lifecycle[new_plan.version] = PlanLifecycleState.ACTIVE
+
         return PlanSwap(previous_plan=previous_plan, active_plan=new_plan)
 
     def _commit_plan_locked(self, new_plan: ExecutionPlan) -> PlanSwap:

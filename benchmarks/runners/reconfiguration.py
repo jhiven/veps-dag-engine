@@ -106,26 +106,19 @@ def run_reconfiguration_suite(
                 all_rows.append(row)
                 append_reconfiguration_rows(output_csv_path, [row])
 
-    # 2. Graph-Size Sensitivity (5, 25, 100 nodes)
-    # For sizes ≥ 25 we also measure the pause baselines so the paper can
-    # report the crossover point where async preparation overtakes
-    # synchronous rebuild / pause-compile-resume.
-    sensitivity_sizes: tuple[int, ...] = (5, 25, 100)
+    # 2. Graph-Size Sensitivity (5, 10, 25, 50, 100 nodes)
+    # All baselines tested at every size for complete scaling trends
+    # required by reviewer feedback (P1.4).
+    sensitivity_sizes: tuple[int, ...] = (5, 10, 25, 50, 100)
     for sz in sensitivity_sizes:
         sens_base = generate_layered_dag(sz)
         sens_target = apply_reconfiguration_edit(sens_base, "insert_stateless_node")
         sens_scenario_id = f"graph_size_sensitivity_{sz}"
 
-        sens_baselines: tuple[str, ...]
-        if sz <= 5:
-            sens_baselines = ("prepare_and_commit",)
-        else:
-            sens_baselines = baselines  # all three baselines for crossover data
-
         for rep in range(1, repetition_count + 1):
             # Counterbalanced baseline ordering per repetition
-            rot_idx = (rep - 1) % len(sens_baselines)
-            rep_sens_baselines = sens_baselines[rot_idx:] + sens_baselines[:rot_idx]
+            rot_idx = (rep - 1) % len(baselines)
+            rep_sens_baselines = baselines[rot_idx:] + baselines[:rot_idx]
 
             for baseline in rep_sens_baselines:
                 gc.collect()
@@ -270,8 +263,14 @@ def _run_reconfig_repetition(
         new_plan = replace(cand.plan, version=new_version)
         cand = replace(cand, plan=new_plan)
 
+        # Executor teardown: the synthetic benchmark has no external resources
+        # (GPU, file descriptors) to release; teardown is the cost of abandoning
+        # the old executor's processor references to the GC.  Recorded as a
+        # lower bound.
         t_teardown_start = time.perf_counter_ns()
-        # Executor teardown timing
+        # Explicitly drop the reference to old executor's processors to force
+        # any pending reference cleanup before reconstruction begins.
+        del current_executor
         t_teardown_end = time.perf_counter_ns()
 
         t_ret_start = time.perf_counter_ns()
@@ -848,6 +847,18 @@ def _run_reconfig_repetition(
         total_sync_ns = pub_ns
         phases_may_overlap = True
 
+        # Extract new grace-period and handoff engine instrumentation
+        grace_period_ns_val: int | None = None
+        if record.grace_period_start_ns is not None and record.grace_period_complete_ns is not None:
+            grace_period_ns_val = max(0, record.grace_period_complete_ns - record.grace_period_start_ns)
+        handoff_wait_ns_val: int | None = None
+        if record.handoff_wait_start_ns is not None and record.handoff_wait_complete_ns is not None:
+            handoff_wait_ns_val = max(0, record.handoff_wait_complete_ns - record.handoff_wait_start_ns)
+        cleanup_duration_ns_val: int | None = None
+        if record.cleanup_start_ns is not None and record.cleanup_end_ns is not None:
+            cleanup_duration_ns_val = max(0, record.cleanup_end_ns - record.cleanup_start_ns)
+        last_old_frame_ns_val: int | None = record.last_old_frame_completed_ns
+
         row = ReconfigurationSampleRow(
             run_id=run_id,
             scenario_id=scenario_id,
@@ -894,6 +905,10 @@ def _run_reconfig_repetition(
             unattributed_request_time_ns=decomp_prep.unattributed_critical_path_ns,
             instrumented_duration_overlap_ns=decomp_prep.instrumented_duration_overlap_ns,
             instrumented_duration_outside_effect_window_ns=decomp_prep.instrumented_duration_outside_effect_window_ns,
+            grace_period_ns=grace_period_ns_val,
+            handoff_wait_ns=handoff_wait_ns_val,
+            cleanup_duration_ns=cleanup_duration_ns_val,
+            last_old_frame_completed_ns=last_old_frame_ns_val,
         )
         validate_reconfiguration_sample(row)
         return row

@@ -201,6 +201,10 @@ def append_reconfiguration_rows(
             _format_optional_int(row.unattributed_request_time_ns),
             _format_optional_int(row.instrumented_duration_overlap_ns),
             _format_optional_int(row.instrumented_duration_outside_effect_window_ns),
+            _format_optional_int(row.grace_period_ns),
+            _format_optional_int(row.handoff_wait_ns),
+            _format_optional_int(row.cleanup_duration_ns),
+            _format_optional_int(row.last_old_frame_completed_ns),
         ]
         for row in rows
     ]
@@ -268,6 +272,10 @@ def read_reconfiguration_rows(path: str) -> tuple[ReconfigurationSampleRow, ...]
                     unattributed_request_time_ns=_parse_optional_int(d.get("unattributed_request_time_ns")),
                     instrumented_duration_overlap_ns=_parse_optional_int(d.get("instrumented_duration_overlap_ns")),
                     instrumented_duration_outside_effect_window_ns=_parse_optional_int(d.get("instrumented_duration_outside_effect_window_ns")),
+                    grace_period_ns=_parse_optional_int(d.get("grace_period_ns")),
+                    handoff_wait_ns=_parse_optional_int(d.get("handoff_wait_ns")),
+                    cleanup_duration_ns=_parse_optional_int(d.get("cleanup_duration_ns")),
+                    last_old_frame_completed_ns=_parse_optional_int(d.get("last_old_frame_completed_ns")),
                 )
             )
     return tuple(rows)
@@ -519,6 +527,9 @@ def append_conformance_rows(
             str(row.active_plan_changed_after_failed_candidate),
             str(row.candidate_resource_leaks),
             str(row.processor_instance_leaks),
+            str(row.grace_period_safety_violations),
+            str(row.stateful_handoff_ordering_failures),
+            str(row.resource_lifetime_violations),
             row.terminal_status,
         ]
         for row in rows
@@ -562,6 +573,9 @@ def read_conformance_rows(path: str) -> tuple[ConformanceResultRow, ...]:
                     active_plan_changed_after_failed_candidate=int(d["active_plan_changed_after_failed_candidate"]),
                     candidate_resource_leaks=int(d["candidate_resource_leaks"]),
                     processor_instance_leaks=int(d["processor_instance_leaks"]),
+                    grace_period_safety_violations=int(d.get("grace_period_safety_violations", 0)),
+                    stateful_handoff_ordering_failures=int(d.get("stateful_handoff_ordering_failures", 0)),
+                    resource_lifetime_violations=int(d.get("resource_lifetime_violations", 0)),
                     terminal_status=d["terminal_status"],
                 )
             )

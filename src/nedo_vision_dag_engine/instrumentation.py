@@ -68,6 +68,7 @@ class RetirementStatus(Enum):
     RUNNING = "running"
     COMPLETED = "completed"
     FAILED = "failed"
+    STALLED = "stalled"
 
 
 class RuntimeEventKind(Enum):
@@ -147,6 +148,13 @@ class ReconfigurationMeasurement:
     old_plan_frames_admitted_after_request_before_commit: int = 0
     retirement_status: RetirementStatus = RetirementStatus.NOT_REQUIRED
     retirement_failure_reason: str | None = None
+    grace_period_start_ns: int | None = None
+    grace_period_complete_ns: int | None = None
+    last_old_frame_completed_ns: int | None = None
+    handoff_wait_start_ns: int | None = None
+    handoff_wait_complete_ns: int | None = None
+    cleanup_start_ns: int | None = None
+    cleanup_end_ns: int | None = None
 
     def __post_init__(self) -> None:
         if not self.request_id:
@@ -188,6 +196,21 @@ class ReconfigurationMeasurement:
             self.retirement_completed_ns,
             "retirement execution",
         )
+        _validate_ordered_pair(
+            self.grace_period_start_ns,
+            self.grace_period_complete_ns,
+            "grace period",
+        )
+        _validate_ordered_pair(
+            self.handoff_wait_start_ns,
+            self.handoff_wait_complete_ns,
+            "handoff wait",
+        )
+        _validate_ordered_pair(
+            self.cleanup_start_ns,
+            self.cleanup_end_ns,
+            "cleanup",
+        )
 
     def _timestamps(self) -> tuple[tuple[str, int | None], ...]:
         return (
@@ -204,6 +227,13 @@ class ReconfigurationMeasurement:
             ("first_new_frame_completed_ns", self.first_new_frame_completed_ns),
             ("retirement_started_ns", self.retirement_started_ns),
             ("retirement_completed_ns", self.retirement_completed_ns),
+            ("grace_period_start_ns", self.grace_period_start_ns),
+            ("grace_period_complete_ns", self.grace_period_complete_ns),
+            ("last_old_frame_completed_ns", self.last_old_frame_completed_ns),
+            ("handoff_wait_start_ns", self.handoff_wait_start_ns),
+            ("handoff_wait_complete_ns", self.handoff_wait_complete_ns),
+            ("cleanup_start_ns", self.cleanup_start_ns),
+            ("cleanup_end_ns", self.cleanup_end_ns),
         )
 
     @property
@@ -221,6 +251,9 @@ class ReconfigurationMeasurement:
             retirement_queue_delay_ns=_duration(self.committed_at_ns, self.retirement_started_ns),
             retirement_duration_ns=_duration(self.retirement_started_ns, self.retirement_completed_ns),
             commit_to_retirement_complete_ns=_duration(self.committed_at_ns, self.retirement_completed_ns),
+            grace_period_ns=_duration(self.grace_period_start_ns, self.grace_period_complete_ns),
+            handoff_wait_ns=_duration(self.handoff_wait_start_ns, self.handoff_wait_complete_ns),
+            cleanup_duration_ns=_duration(self.cleanup_start_ns, self.cleanup_end_ns),
         )
 
 
@@ -235,6 +268,9 @@ class ReconfigurationTimings:
     retirement_queue_delay_ns: int | None
     retirement_duration_ns: int | None
     commit_to_retirement_complete_ns: int | None
+    grace_period_ns: int | None = None
+    handoff_wait_ns: int | None = None
+    cleanup_duration_ns: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -600,11 +636,22 @@ def _event_to_json(event: RuntimeEvent) -> dict[str, JsonValue]:
             "committed_at_ns": _optional_int(event.committed_at_ns),
             "first_new_frame_admitted_ns": _optional_int(event.first_new_frame_admitted_ns),
             "first_new_frame_completed_ns": _optional_int(event.first_new_frame_completed_ns),
+            "retirement_started_ns": _optional_int(event.retirement_started_ns),
             "retirement_completed_ns": _optional_int(event.retirement_completed_ns),
             "terminal_status": event.terminal_status.value,
             "failure_reason": _optional_string(event.failure_reason),
             "candidate_cleanup_failure_count": event.candidate_cleanup_failure_count,
             "retirement_failure_count": event.retirement_failure_count,
+            "old_plan_frames_admitted_after_request_before_commit": event.old_plan_frames_admitted_after_request_before_commit,
+            "retirement_status": event.retirement_status.value,
+            "retirement_failure_reason": _optional_string(event.retirement_failure_reason),
+            "grace_period_start_ns": _optional_int(event.grace_period_start_ns),
+            "grace_period_complete_ns": _optional_int(event.grace_period_complete_ns),
+            "last_old_frame_completed_ns": _optional_int(event.last_old_frame_completed_ns),
+            "handoff_wait_start_ns": _optional_int(event.handoff_wait_start_ns),
+            "handoff_wait_complete_ns": _optional_int(event.handoff_wait_complete_ns),
+            "cleanup_start_ns": _optional_int(event.cleanup_start_ns),
+            "cleanup_end_ns": _optional_int(event.cleanup_end_ns),
         }
     if isinstance(event, StateTransitionEvent):
         return {

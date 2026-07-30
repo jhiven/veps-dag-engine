@@ -28,6 +28,7 @@ from nedo_vision_dag_engine.instrumentation import (
 from nedo_vision_dag_engine.lifecycle import (
     CleanupReason,
     CleanupReport,
+    PlanLifecycleState,
     ProcessorCleanupFailure,
     cleanup_candidate_processors,
     retire_superseded_processors,
@@ -139,6 +140,13 @@ class ReconfigurationRecord:
     old_plan_frames_admitted_after_request_before_commit: int = 0
     retirement_status: RetirementStatus = RetirementStatus.NOT_REQUIRED
     retirement_failure_reason: str | None = None
+    grace_period_start_ns: int | None = None
+    grace_period_complete_ns: int | None = None
+    last_old_frame_completed_ns: int | None = None
+    handoff_wait_start_ns: int | None = None
+    handoff_wait_complete_ns: int | None = None
+    cleanup_start_ns: int | None = None
+    cleanup_end_ns: int | None = None
 
     @property
     def is_terminal(self) -> bool:
@@ -155,6 +163,8 @@ class BoundaryCommitResult:
     state_transition_events: tuple[StateTransitionEvent, ...]
     retirement_deferred: bool
     cleanup_report: CleanupReport | None
+    handoff_required: bool = False
+    handoff_wait_ns: int | None = None
 
     def __post_init__(self) -> None:
         if self.status not in {ReconfigurationStatus.COMMITTED, ReconfigurationStatus.STALE}:
@@ -233,6 +243,7 @@ def _retirement_finished(record: ReconfigurationRecord) -> bool:
         RetirementStatus.NOT_REQUIRED,
         RetirementStatus.COMPLETED,
         RetirementStatus.FAILED,
+        RetirementStatus.STALLED,
     }
 
 
@@ -250,8 +261,10 @@ class ReconfigurationController:
     """
 
     __slots__ = (
+        "_abort_requested_ids",
         "_active_request_id",
         "_admission_lock",
+        "_cleaned_plans",
         "_closed",
         "_clock",
         "_committed_request_by_plan_version",
@@ -270,7 +283,6 @@ class ReconfigurationController:
         "_state_lock",
         "_work_queue",
         "_worker",
-        "_abort_requested_ids",
     )
 
     def __init__(
@@ -303,6 +315,7 @@ class ReconfigurationController:
         self._committed_request_by_plan_version: dict[int, str] = {}
         self._active_request_id: str | None = None
         self._effect_pending_request_id: str | None = None
+        self._cleaned_plans: set[int] = set()
         self._closed = False
         self._worker = Thread(target=self._worker_main, name=worker_name, daemon=True)
         self._worker.start()
@@ -863,6 +876,20 @@ class ReconfigurationController:
         request = ready_candidate.request
         candidate = ready_candidate.candidate
         commit_started_at_ns = self._clock()
+
+        # Detect whether a stateful handoff drain is required.
+        # When any stateful processor is preserved across plan versions,
+        # we must ensure all old-plan frames complete before publication
+        # so that the shared mutable processor state is never accessed
+        # concurrently by frames from two plan versions.
+        handoff_required = bool(candidate.preserved_stateful_node_ids)
+        handoff_wait_start_ns: int | None = None
+        handoff_wait_complete_ns: int | None = None
+        if handoff_required:
+            handoff_wait_start_ns = self._clock()
+            self._executor.wait_for_plan_quiescent(self._executor.active_plan.version)
+            handoff_wait_complete_ns = self._clock()
+
         with self._condition:
             record = self._record_or_raise_locked(request.request_id)
         plan_swap = self._executor.commit_if_version_managed(
@@ -949,6 +976,8 @@ class ReconfigurationController:
                 staged_processor_count=len(candidate.staged_node_ids),
                 retired_processor_count=0,
                 retirement_status=retirement_status,
+                handoff_wait_start_ns=handoff_wait_start_ns,
+                handoff_wait_complete_ns=handoff_wait_complete_ns,
             )
             for transition_event in transition_events:
                 self._instrumentation.record_state_transition(transition_event)
@@ -982,6 +1011,13 @@ class ReconfigurationController:
             state_transition_events=transition_events,
             retirement_deferred=retirement_required,
             cleanup_report=None,
+            handoff_required=handoff_required,
+            handoff_wait_ns=(
+                handoff_wait_complete_ns - handoff_wait_start_ns
+                if handoff_wait_start_ns is not None
+                and handoff_wait_complete_ns is not None
+                else None
+            ),
         )
 
     def _take_ready_candidate(self) -> _ReadyCandidate | None:
@@ -1099,6 +1135,11 @@ class ReconfigurationController:
     def _process_pending_retirement(self, deferred: _PendingRetirement) -> None:
         retirement_started_at_ns = self._clock()
 
+        # Idempotent guard: skip if this plan version was already cleaned.
+        if deferred.previous_plan.version in self._cleaned_plans:
+            return
+        self._cleaned_plans.add(deferred.previous_plan.version)
+
         with self._condition:
             record = self._records.get(deferred.request_id)
             if record is not None:
@@ -1110,6 +1151,40 @@ class ReconfigurationController:
                 self._records[deferred.request_id] = updated_record
                 self._condition.notify_all()
 
+        # ── Grace period: wait until no frames are in-flight on the old plan ──
+        grace_period_start_ns = self._clock()
+        quiescent = self._executor.wait_for_plan_quiescent(
+            deferred.previous_plan.version,
+            timeout=30.0,
+        )
+        grace_period_complete_ns = self._clock()
+        last_old_frame_completed_ns = grace_period_complete_ns
+
+        if not quiescent:
+            # Grace period timed out — stall rather than force-cleanup.
+            stalled_at_ns = self._clock()
+            with self._condition:
+                record = self._records.get(deferred.request_id)
+                if record is not None:
+                    updated_record = replace(
+                        record,
+                        retirement_status=RetirementStatus.STALLED,
+                        retirement_completed_ns=stalled_at_ns,
+                        grace_period_start_ns=grace_period_start_ns,
+                        grace_period_complete_ns=grace_period_complete_ns,
+                        last_old_frame_completed_ns=last_old_frame_completed_ns,
+                        retirement_failure_reason=(
+                            "grace period timed out waiting for plan version "
+                            f"{deferred.previous_plan.version} to become quiescent"
+                        ),
+                    )
+                    self._records[deferred.request_id] = updated_record
+                    self._record_measurement(updated_record)
+                    self._condition.notify_all()
+            return
+
+        # ── Cleanup superseded processors ──
+        cleanup_start_ns = self._clock()
         try:
             retirement_report = retire_superseded_processors(
                 previous_plan=deferred.previous_plan,
@@ -1131,6 +1206,7 @@ class ReconfigurationController:
                 ),
             )
             retirement_reason = f"processor retirement raised unexpected exception: {e!r}"
+        cleanup_end_ns = self._clock()
 
         try:
             with self._compiler_lock:
@@ -1151,6 +1227,12 @@ class ReconfigurationController:
             )
             retirement_report = replace(retirement_report, failures=tuple(failures))
 
+        # ── Update plan lifecycle ──
+        self._executor.update_plan_lifecycle(
+            deferred.previous_plan.version,
+            PlanLifecycleState.RETIRED,
+        )
+
         retirement_completed_at_ns = self._clock()
 
         is_success = (retirement_reason is None) and (retirement_report.succeeded)
@@ -1166,6 +1248,11 @@ class ReconfigurationController:
                     retirement_report=retirement_report,
                     retirement_failure_reason=retirement_reason,
                     retired_processor_count=len(retirement_report.cleaned_node_ids),
+                    grace_period_start_ns=grace_period_start_ns,
+                    grace_period_complete_ns=grace_period_complete_ns,
+                    last_old_frame_completed_ns=last_old_frame_completed_ns,
+                    cleanup_start_ns=cleanup_start_ns,
+                    cleanup_end_ns=cleanup_end_ns,
                 )
                 self._records[deferred.request_id] = updated_record
                 self._record_measurement(updated_record)
@@ -1208,6 +1295,13 @@ class ReconfigurationController:
                 old_plan_frames_admitted_after_request_before_commit=record.old_plan_frames_admitted_after_request_before_commit,
                 retirement_status=record.retirement_status,
                 retirement_failure_reason=record.retirement_failure_reason,
+                grace_period_start_ns=record.grace_period_start_ns,
+                grace_period_complete_ns=record.grace_period_complete_ns,
+                last_old_frame_completed_ns=record.last_old_frame_completed_ns,
+                handoff_wait_start_ns=record.handoff_wait_start_ns,
+                handoff_wait_complete_ns=record.handoff_wait_complete_ns,
+                cleanup_start_ns=record.cleanup_start_ns,
+                cleanup_end_ns=record.cleanup_end_ns,
             )
         )
 

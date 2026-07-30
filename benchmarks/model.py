@@ -90,6 +90,10 @@ class ReconfigurationSampleRow:
     unattributed_request_time_ns: int | None = None
     instrumented_duration_overlap_ns: int | None = None
     instrumented_duration_outside_effect_window_ns: int | None = None
+    grace_period_ns: int | None = None
+    handoff_wait_ns: int | None = None
+    cleanup_duration_ns: int | None = None
+    last_old_frame_completed_ns: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -531,6 +535,9 @@ class ConformanceResultRow:
     active_plan_changed_after_failed_candidate: int
     candidate_resource_leaks: int
     processor_instance_leaks: int
+    grace_period_safety_violations: int
+    stateful_handoff_ordering_failures: int
+    resource_lifetime_violations: int
     terminal_status: str
 
 
@@ -595,6 +602,10 @@ RECONFIGURATION_HEADERS: tuple[str, ...] = (
     "unattributed_request_time_ns",
     "instrumented_duration_overlap_ns",
     "instrumented_duration_outside_effect_window_ns",
+    "grace_period_ns",
+    "handoff_wait_ns",
+    "cleanup_duration_ns",
+    "last_old_frame_completed_ns",
 )
 
 ABLATION_HEADERS: tuple[str, ...] = (
@@ -860,5 +871,8 @@ CONFORMANCE_HEADERS: tuple[str, ...] = (
     "active_plan_changed_after_failed_candidate",
     "candidate_resource_leaks",
     "processor_instance_leaks",
+    "grace_period_safety_violations",
+    "stateful_handoff_ordering_failures",
+    "resource_lifetime_violations",
     "terminal_status",
 )

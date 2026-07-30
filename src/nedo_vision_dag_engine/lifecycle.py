@@ -10,6 +10,7 @@ from nedo_vision_dag_engine.processor import Processor
 
 __all__ = [
     "CleanupReason",
+    "PlanLifecycleState",
     "ProcessorCleanupFailure",
     "CleanupReport",
     "ProcessorStagingArea",
@@ -24,6 +25,20 @@ class CleanupReason(Enum):
     CANDIDATE_DISCARDED = "candidate_discarded"
     PLAN_RETIREMENT = "plan_retirement"
     RUNTIME_SHUTDOWN = "runtime_shutdown"
+
+
+class PlanLifecycleState(Enum):
+    """Per-plan-version lifecycle states tracked by the executor.
+
+    A plan transitions through these states as it is published, superseded,
+    quiesced (all in-flight frames completed), and eventually retired.
+    """
+
+    ACTIVE = "active"
+    SUPERSEDED = "superseded"
+    QUIESCENT = "quiescent"
+    RETIRED = "retired"
+    RETIREMENT_FAILED = "retirement_failed"
 
 
 @dataclass(frozen=True, slots=True)

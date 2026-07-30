@@ -116,6 +116,9 @@ def test_reporting_from_fixture_csvs() -> None:
                     active_plan_changed_after_failed_candidate=0,
                     candidate_resource_leaks=0,
                     processor_instance_leaks=0,
+                    grace_period_safety_violations=0,
+                    stateful_handoff_ordering_failures=0,
+                    resource_lifetime_violations=0,
                     terminal_status="PASS",
                 )
             ],

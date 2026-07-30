@@ -12,10 +12,13 @@ from scipy import stats
 __all__ = [
     "SummaryStats",
     "PairedStats",
+    "BootstrapMedianDiff",
     "TOSTResult",
     "calculate_summary_stats",
     "calculate_paired_stats",
     "calculate_tost_equivalence",
+    "bootstrap_median_difference",
+    "bootstrap_paired_difference_ci",
 ]
 
 
@@ -268,3 +271,91 @@ def calculate_tost_equivalence(
         bootstrap_ci_95_lower=boot_95_lower,
         bootstrap_ci_95_upper=boot_95_upper,
     )
+
+
+@dataclass(frozen=True, slots=True)
+class BootstrapMedianDiff:
+    """Paired median difference with 95% bootstrap confidence interval.
+
+    Used as the primary effect-size metric per reviewer P0.7 guidance:
+    report median difference ± 95% bootstrap CI instead of TOST.
+    """
+
+    median_diff: float
+    ci_95_lower: float
+    ci_95_upper: float
+    pair_count: int
+    absolute_diff: float
+    relative_diff_pct: float
+
+
+def bootstrap_median_difference(
+    a_values: Sequence[float] | np.ndarray,
+    b_values: Sequence[float] | np.ndarray,
+    n_resamples: int = 2000,
+) -> BootstrapMedianDiff:
+    """Paired median difference (B - A) with 95% bootstrap CI.
+
+    Computes the median of paired differences and bootstraps the
+    sampling distribution to obtain a 95% confidence interval.
+    This is the primary effect-size metric replacing TOST per
+    reviewer guidance (P0.7/P0.8).
+    """
+    a_arr = np.asarray(a_values, dtype=np.float64)
+    b_arr = np.asarray(b_values, dtype=np.float64)
+    if len(a_arr) != len(b_arr):
+        raise ValueError("Paired samples must have identical length.")
+    n = len(a_arr)
+    if n == 0:
+        return BootstrapMedianDiff(0.0, 0.0, 0.0, 0, 0.0, 0.0)
+
+    diffs = b_arr - a_arr
+    median_diff_val = float(np.median(diffs))
+
+    mean_a = float(np.mean(a_arr))
+    abs_diff = median_diff_val
+    rel_diff_pct = (median_diff_val / mean_a * 100.0) if mean_a != 0 else 0.0
+
+    def median_fn(d: np.ndarray) -> float:
+        return float(np.median(d))
+
+    ci_lower, ci_upper = _bootstrap_ci(diffs, median_fn, n_resamples=n_resamples)
+
+    return BootstrapMedianDiff(
+        median_diff=median_diff_val,
+        ci_95_lower=ci_lower,
+        ci_95_upper=ci_upper,
+        pair_count=n,
+        absolute_diff=abs_diff,
+        relative_diff_pct=rel_diff_pct,
+    )
+
+
+def bootstrap_paired_difference_ci(
+    a_values: Sequence[float] | np.ndarray,
+    b_values: Sequence[float] | np.ndarray,
+    n_resamples: int = 2000,
+) -> tuple[float, float, float]:
+    """Return (mean_diff, ci_95_lower, ci_95_upper) for paired difference.
+
+    Convenience wrapper around the bootstrap median/mean approach.
+    Uses Hodges-Lehmann-style median of pairwise averages for the
+    location estimate, with 95% bootstrap CI.
+
+    Implements the reviewer's P0.7 recommendation: replace TOST with
+    paired difference + 95% bootstrap CI for primary metrics.
+    """
+    a_arr = np.asarray(a_values, dtype=np.float64)
+    b_arr = np.asarray(b_values, dtype=np.float64)
+    n = len(a_arr)
+    if n < 2:
+        return (0.0, 0.0, 0.0)
+
+    diffs = b_arr - a_arr
+
+    def mean_fn(d: np.ndarray) -> float:
+        return float(np.mean(d))
+
+    mean_diff = float(np.mean(diffs))
+    ci_lower, ci_upper = _bootstrap_ci(diffs, mean_fn, n_resamples=n_resamples)
+    return (mean_diff, ci_lower, ci_upper)

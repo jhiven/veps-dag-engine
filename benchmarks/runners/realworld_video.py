@@ -158,6 +158,17 @@ REALWORLD_VIDEO_HEADERS = (
     "drop_rate_after_first_candidate_output",
     "gpu_memory_transition_max_allocated_bytes",
     "gpu_memory_transition_max_reserved_bytes",
+    "fixed_window_baseline_source_frames",
+    "fixed_window_baseline_admitted",
+    "fixed_window_baseline_completed",
+    "fixed_window_baseline_dropped",
+    "fixed_window_transition_source_frames",
+    "fixed_window_transition_admitted",
+    "fixed_window_transition_completed",
+    "fixed_window_transition_dropped",
+    "fixed_window_old_plan_completions",
+    "fixed_window_new_plan_completions",
+    "fixed_window_request_to_effect_ns",
 )
 
 REALWORLD_VIDEO_FRAME_HEADERS = (
@@ -279,6 +290,20 @@ class RealworldVideoSampleRow:
     drop_rate_after_first_candidate_output: float | None
     gpu_memory_transition_max_allocated_bytes: int | None
     gpu_memory_transition_max_reserved_bytes: int | None
+    # Fixed wall-clock window metrics (reviewer P0.6):
+    # 2 s baseline before request → 5 s observation after request,
+    # identical window for all mechanisms.
+    fixed_window_baseline_source_frames: int = 0
+    fixed_window_baseline_admitted: int = 0
+    fixed_window_baseline_completed: int = 0
+    fixed_window_baseline_dropped: int = 0
+    fixed_window_transition_source_frames: int = 0
+    fixed_window_transition_admitted: int = 0
+    fixed_window_transition_completed: int = 0
+    fixed_window_transition_dropped: int = 0
+    fixed_window_old_plan_completions: int = 0
+    fixed_window_new_plan_completions: int = 0
+    fixed_window_request_to_effect_ns: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -313,6 +338,103 @@ def _calculate_file_hash(path: str) -> str:
         return "fake_hash"
     with open(path, "rb") as f:
         return hashlib.sha256(f.read()).hexdigest()
+
+
+def compute_fixed_window_metrics(
+    frame_rows: list[RealworldVideoFrameSampleRow],
+    request_timestamp_ns: int,
+    baseline_duration_ns: int = 2_000_000_000,  # 2 s
+    observation_duration_ns: int = 5_000_000_000,  # 5 s
+) -> dict[str, int | None]:
+    """Compute fixed wall-clock window metrics from frame-level data.
+
+    Uses identical window for all mechanisms:
+    - Baseline: [request - 2s, request)
+    - Transition: [request, request + 5s)
+
+    This replaces mechanism-dependent event windows with a fair,
+    mechanism-independent wall-clock comparison required by reviewer P0.6.
+    """
+    baseline_start = request_timestamp_ns - baseline_duration_ns
+    baseline_end = request_timestamp_ns
+    transition_end = request_timestamp_ns + observation_duration_ns
+
+    baseline_source = 0
+    baseline_admitted = 0
+    baseline_completed = 0
+    baseline_dropped = 0
+    transition_source = 0
+    transition_admitted = 0
+    transition_completed = 0
+    transition_dropped = 0
+    old_plan_completions = 0
+    new_plan_completions = 0
+    first_new_frame_completion_ns: int | None = None
+
+    # Use the minimum plan_version in the log as a heuristic for "old" plan
+    old_plan_version: int | None = None
+    for row in frame_rows:
+        if row.plan_version is not None:
+            old_plan_version = row.plan_version
+            break
+
+    for row in frame_rows:
+        ts = row.receiver_ingress_timestamp_ns
+        if ts is None:
+            # Fall back to admission timestamp for frames without receiver ts
+            ts = row.admission_timestamp_ns
+        if ts is None:
+            continue
+
+        # Baseline window
+        if baseline_start <= ts < baseline_end:
+            baseline_source += 1
+            if row.dropped:
+                baseline_dropped += 1
+            else:
+                baseline_admitted += 1
+                if row.completion_timestamp_ns is not None:
+                    baseline_completed += 1
+
+        # Transition window
+        if request_timestamp_ns <= ts < transition_end:
+            transition_source += 1
+            if row.dropped:
+                transition_dropped += 1
+            else:
+                transition_admitted += 1
+                if row.completion_timestamp_ns is not None:
+                    transition_completed += 1
+                    if (
+                        old_plan_version is not None
+                        and row.plan_version is not None
+                    ):
+                        if row.plan_version == old_plan_version:
+                            old_plan_completions += 1
+                        elif row.plan_version > old_plan_version:
+                            new_plan_completions += 1
+                            if first_new_frame_completion_ns is None:
+                                first_new_frame_completion_ns = (
+                                    row.completion_timestamp_ns
+                                )
+
+    request_to_effect_ns: int | None = None
+    if first_new_frame_completion_ns is not None:
+        request_to_effect_ns = first_new_frame_completion_ns - request_timestamp_ns
+
+    return {
+        "fixed_window_baseline_source_frames": baseline_source,
+        "fixed_window_baseline_admitted": baseline_admitted,
+        "fixed_window_baseline_completed": baseline_completed,
+        "fixed_window_baseline_dropped": baseline_dropped,
+        "fixed_window_transition_source_frames": transition_source,
+        "fixed_window_transition_admitted": transition_admitted,
+        "fixed_window_transition_completed": transition_completed,
+        "fixed_window_transition_dropped": transition_dropped,
+        "fixed_window_old_plan_completions": old_plan_completions,
+        "fixed_window_new_plan_completions": new_plan_completions,
+        "fixed_window_request_to_effect_ns": request_to_effect_ns,
+    }
 
 
 def run_realworld_video_suite(

@@ -257,6 +257,7 @@ class CompiledCandidate:
     reused_node_ids: frozenset[str]
     staged_node_ids: frozenset[str]
     retired_node_ids: frozenset[str]
+    preserved_stateful_node_ids: frozenset[str]
 
 
 class CompilationFailureKind(Enum):
@@ -502,7 +503,14 @@ def _build_plan(
     compiler_version: str,
     new_version: int,
 ) -> (
-    tuple[ExecutionPlan, tuple[PendingStateTransition, ...], frozenset[str], frozenset[str], frozenset[str]]
+    tuple[
+        ExecutionPlan,
+        tuple[PendingStateTransition, ...],
+        frozenset[str],
+        frozenset[str],
+        frozenset[str],
+        frozenset[str],
+    ]
     | CompilationFailure
 ):
     nodes_by_id = {node.node_id: node for node in specification.nodes}
@@ -672,6 +680,14 @@ def _build_plan(
             if classification.kind is NodeChangeKind.REMOVED
         )
 
+        preserved_stateful_node_ids = frozenset(
+            step.node_id
+            for step in steps
+            if step.node_id in reused_node_ids
+            and step.processor_ref.descriptor.state_policy
+            in (StatePolicy.PRESERVABLE, StatePolicy.RESETTABLE)
+        )
+
         plan = ExecutionPlan(
             version=new_version,
             specification_hash=_compute_specification_hash(specification),
@@ -691,6 +707,7 @@ def _build_plan(
         frozenset(reused_node_ids),
         staged_node_ids,
         retired_node_ids,
+        preserved_stateful_node_ids,
     )
 
 
@@ -775,7 +792,7 @@ class WorkflowCompiler:
         )
         if isinstance(build_result, CompilationFailure):
             return build_result
-        plan, pending_transitions, reused_node_ids, staged_node_ids, retired_node_ids = build_result
+        plan, pending_transitions, reused_node_ids, staged_node_ids, retired_node_ids, preserved_stateful_node_ids = build_result
 
         self._specifications_by_version[plan.version] = specification
 
@@ -786,6 +803,7 @@ class WorkflowCompiler:
             reused_node_ids=reused_node_ids,
             staged_node_ids=staged_node_ids,
             retired_node_ids=retired_node_ids,
+            preserved_stateful_node_ids=preserved_stateful_node_ids,
         )
 
     def compile(

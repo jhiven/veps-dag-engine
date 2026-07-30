@@ -189,6 +189,9 @@ def _run_frame_consistency_stress_campaign(
         active_plan_changed_after_failed_candidate=0,
         candidate_resource_leaks=0,
         processor_instance_leaks=0,
+        grace_period_safety_violations=0,
+        stateful_handoff_ordering_failures=0,
+        resource_lifetime_violations=0,
         terminal_status=status_str,
     )
 
@@ -329,6 +332,9 @@ def _run_failure_atomicity_campaign(run_id: str, profile: str) -> ConformanceRes
         active_plan_changed_after_failed_candidate=plan_changed_count,
         candidate_resource_leaks=0,
         processor_instance_leaks=0,
+        grace_period_safety_violations=0,
+        stateful_handoff_ordering_failures=0,
+        resource_lifetime_violations=0,
         terminal_status=status_str,
     )
 
@@ -456,5 +462,8 @@ def _run_stateful_conformance_campaign(run_id: str, profile: str) -> Conformance
         active_plan_changed_after_failed_candidate=0,
         candidate_resource_leaks=0,
         processor_instance_leaks=processor_instance_leaks,
+        grace_period_safety_violations=0,
+        stateful_handoff_ordering_failures=0,
+        resource_lifetime_violations=0,
         terminal_status=status_str,
     )
