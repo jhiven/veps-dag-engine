@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import json
 import os
 import random
+import subprocess
 import time
 from dataclasses import dataclass, replace
 from typing import Literal, cast, Any
@@ -355,6 +357,30 @@ def _calculate_file_hash(path: str) -> str:
         return hashlib.sha256(f.read()).hexdigest()
 
 
+def _probe_video_frame_count(path: str) -> int:
+    """Return the decoded frame count used to select a common loop boundary."""
+    command = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-count_frames",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=nb_read_frames,nb_frames",
+        "-of",
+        "json",
+        path,
+    ]
+    result = subprocess.run(command, check=True, capture_output=True, text=True)
+    stream = json.loads(result.stdout)["streams"][0]
+    raw_count = stream.get("nb_read_frames") or stream.get("nb_frames")
+    frame_count = int(raw_count)
+    if frame_count < 1:
+        raise RuntimeError(f"Video contains no decodable frames: {path}")
+    return frame_count
+
+
 def compute_fixed_window_metrics(
     frame_rows: list[RealworldVideoFrameSampleRow],
     request_trigger_media_frame_index: int,
@@ -640,6 +666,12 @@ def run_realworld_video_suite(
 
         return s_before, s_prep, s_between_prep_pub, s_between_pub_first, s_after
 
+    source_video_frame_count = (
+        _probe_video_frame_count(video_path)
+        if mode is ExecutionMode.PUBLICATION
+        else None
+    )
+
     try:
         for rep in range(1, repetition_count + 1):
             mech_order = list(mechanisms)
@@ -866,7 +898,23 @@ def run_realworld_video_suite(
                     _measurement_start_source_sequence: int | None = None
 
                     # 4. Start phase-normalized measurement window.
-                    getattr(source_obj, "start_measurement_window")(measurement_source_frames)
+                    # Arm every RTSP sub-run at the beginning of the second
+                    # receiver-local source cycle. Warm-up therefore cannot
+                    # shift the measured media interval between mechanisms.
+                    common_measurement_start = (
+                        source_video_frame_count + 1
+                        if source_video_frame_count is not None
+                        else None
+                    )
+                    if isinstance(source_obj, RTSPVideoSource):
+                        source_obj.start_measurement_window(
+                            measurement_source_frames,
+                            start_media_frame_index=common_measurement_start,
+                        )
+                    else:
+                        getattr(source_obj, "start_measurement_window")(
+                            measurement_source_frames
+                        )
                     # Configure phase targets so the source uses the correct
                     # pre-request / post-effect frame counts for this run.
                     if hasattr(source_obj, "_pre_request_target"):
@@ -1227,10 +1275,18 @@ def run_realworld_video_suite(
                         _measurement_end_media_frame_index = measured_frames_sorted[-1].media_frame_index
                         _measurement_end_media_pts_ns = measured_frames_sorted[-1].media_pts_ns
                         _measurement_start_source_sequence = 1
-                        # Request trigger aligns to the 60th measured source frame.
-                        if len(measured_frames_sorted) >= 60:
-                            _request_trigger_media_frame_index = measured_frames_sorted[59].media_frame_index
-                            _request_trigger_media_pts_ns = measured_frames_sorted[59].media_pts_ns
+                        # The request occurs after the baseline frames and before
+                        # the following frame. Anchor the fixed window to that
+                        # boundary, rather than to the last baseline frame.
+                        if _measurement_start_media_frame_index is not None:
+                            _request_trigger_media_frame_index = (
+                                _measurement_start_media_frame_index
+                                + reconfiguration_trigger_frame_offset
+                            )
+                            _request_trigger_media_pts_ns = int(round(
+                                (_request_trigger_media_frame_index - 1)
+                                * (1e9 / meta.fps)
+                            ))
                     # ------------------------------------------------------------------
 
                     # Find last old-plan output occurring before first candidate output

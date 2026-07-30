@@ -418,6 +418,7 @@ class RTSPVideoSource(FrameSource):
         self._measurement_source_frames_received: int = 0
         self._measurement_start_timestamp_ns: int | None = None
         self._measurement_end_timestamp_ns: int | None = None
+        self._measurement_start_media_frame_index: int | None = None
 
         # Phase-normalized measurement state
         self._pre_request_source_frames_received: int = 0
@@ -428,9 +429,25 @@ class RTSPVideoSource(FrameSource):
         self._pre_request_target: int = 60
         self._post_effect_target: int = 60
 
-    def start_measurement_window(self, target_frames: int = 180) -> None:
+    def start_measurement_window(
+        self,
+        target_frames: int = 180,
+        *,
+        start_media_frame_index: int | None = None,
+    ) -> None:
+        """Arm measurement at a deterministic receiver media-frame index."""
+        if start_media_frame_index is not None and start_media_frame_index < 1:
+            raise ValueError("start_media_frame_index must be positive")
         with self._lock:
+            if (
+                start_media_frame_index is not None
+                and self._current_frame_id >= start_media_frame_index
+            ):
+                raise RuntimeError(
+                    "Cannot arm a measurement boundary that the receiver has already passed"
+                )
             self._inside_measurement_window = True
+            self._measurement_start_media_frame_index = start_media_frame_index
             self._measurement_source_frame_target = target_frames
             self._pre_request_source_frames_received = 0
             self._transition_source_frames_received = 0
@@ -438,7 +455,9 @@ class RTSPVideoSource(FrameSource):
             self._first_candidate_output_completed = False
             self._measurement_stopped = False
             self._measurement_source_frames_received = 0
-            self._measurement_start_timestamp_ns = time.monotonic_ns()
+            self._measurement_start_timestamp_ns = (
+                time.monotonic_ns() if start_media_frame_index is None else None
+            )
             self._measurement_end_timestamp_ns = None
             if self._ingress is not None:
                 self._ingress.queue.clear_and_cancel_all()
@@ -564,7 +583,12 @@ class RTSPVideoSource(FrameSource):
                         return None
 
                     fid = self._current_frame_id + 1
-                    is_measured = self._inside_measurement_window
+                    is_measured = self._inside_measurement_window and (
+                        self._measurement_start_media_frame_index is None
+                        or fid >= self._measurement_start_media_frame_index
+                    )
+                    if is_measured and self._measurement_start_timestamp_ns is None:
+                        self._measurement_start_timestamp_ns = time.monotonic_ns()
                     if is_measured:
                         # Decide which phase counter to increment
                         if self._pre_request_source_frames_received < self._pre_request_target:
