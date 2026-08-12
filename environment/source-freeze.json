@@ -1,0 +1,41 @@
+{
+  "schema_version": "1.0.0",
+  "created_on": "2026-08-12",
+  "repository": "nedo-vision-dag-engine",
+  "provenance_policy": "A frozen archive preserves a source candidate for audit. It does not convert a chronology-based candidate into a contemporaneously verified experiment revision.",
+  "dependency_lock_sha256": "b90faa930139016e93f4ee2a27d5a3db61a44b69be52cc068610e418a3aacbf9",
+  "campaigns": [
+    {
+      "campaign": "core",
+      "run_id": "run_2026-07-30T11-00-12_42",
+      "revision_status": "verified",
+      "git_commit": "4e5724000c9813bfba2d1ab44ec75497ac08edae",
+      "git_tree": "bd4f239aad95909d7a5491dba47e4dc8e0c30ba9",
+      "commit_datetime": "2026-07-30T17:54:22+07:00",
+      "archive": "environment/source-snapshots/nedo-vision-dag-engine-4e572400.tar.gz",
+      "archive_sha256": "02a901fb9b939e4d7a78d05a733fc946bdb4430d63c9958db85652910d0ff805"
+    },
+    {
+      "campaign": "conformance",
+      "run_id": "run_2026-07-30T13-06-19_42",
+      "revision_status": "chronology_candidate",
+      "git_commit": "f7cf91533a0b2227116509e9fdfe71ca279edb1a",
+      "git_tree": "1ae0b9cda0a69df402f15344df8b949c9e595d63",
+      "commit_datetime": "2026-07-30T20:00:52+07:00",
+      "archive": "environment/source-snapshots/nedo-vision-dag-engine-f7cf9153.tar.gz",
+      "archive_sha256": "5e075ee4d89cd5d994a07220269fb0c505d2114af0ae09ad3513813e069b0a12",
+      "qualification": "The experiment CSV did not contemporaneously record a commit. This archived commit is the chronology candidate already documented in benchmark-output/manifest.json."
+    },
+    {
+      "campaign": "gpu_rtsp",
+      "run_id": "run_2026-07-30T16-16-34_42",
+      "revision_status": "chronology_candidate",
+      "git_commit": "3af88fdd2967815d70b5624e0e31c67f1be8696a",
+      "git_tree": "532d696a793aadc5993381d75833ebc90bfd9916",
+      "commit_datetime": "2026-07-30T23:05:48+07:00",
+      "archive": "environment/source-snapshots/nedo-vision-dag-engine-3af88fdd.tar.gz",
+      "archive_sha256": "5da8a8812f3c15e93638d20098d47e0eb7d5055cb6dce91d2bf71c23d78a6716",
+      "qualification": "The experiment CSV did not contemporaneously record a commit. This archived commit is the chronology candidate already documented in benchmark-output/manifest.json."
+    }
+  ]
+}

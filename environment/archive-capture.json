@@ -1,0 +1,15 @@
+{
+  "schema_version": "1.0.0",
+  "captured_on": "2026-08-12",
+  "purpose": "Archive-construction environment only; this is not represented as the environment that produced the benchmark CSV files.",
+  "operating_system": "Linux",
+  "kernel": "7.1.5-arch1-2",
+  "architecture": "x86_64",
+  "cpu": "AMD Ryzen 7 8845HS with Radeon 780M Graphics",
+  "logical_cpu_count": 16,
+  "uv_version": "0.12.1",
+  "python_pin": "3.14.6t",
+  "pyproject_sha256": "7a204be157af71afa9739605efb37b1dc93e1af8b0bc8f5b5c75053af3c46e11",
+  "uv_lock_sha256": "b90faa930139016e93f4ee2a27d5a3db61a44b69be52cc068610e418a3aacbf9",
+  "gpu_probe": "nvidia-smi unavailable in the archive-construction environment"
+}

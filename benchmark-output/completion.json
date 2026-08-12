@@ -1,0 +1,44 @@
+{
+  "run_id": "run_2026-07-30T11-00-12_42",
+  "utc_completion_datetime": "2026-07-30T11:42:16.686327+00:00",
+  "status": "SUCCESS",
+  "total_duration_seconds": 2524.637364019,
+  "raw_file_row_counts": {
+    "steady-state-samples.csv": 540,
+    "reconfiguration-samples.csv": 810,
+    "reconfiguration-stress-samples.csv": 270,
+    "conformance-results.csv": 8,
+    "ablation-samples.csv": 240,
+    "interference-samples.csv": 180,
+    "realworld-video-samples.csv": 90
+  },
+  "raw_file_sha256": {
+    "steady-state-samples.csv": "34c0126b257d3049d3ca62ec07867454e1a9707b46ea3e12ef77761e0491300a",
+    "reconfiguration-samples.csv": "437a53a2cdf4651c679cd0b2d19ccd855ee6eee9edfa11ec892814f5e361c440",
+    "reconfiguration-stress-samples.csv": "27312d914bcd4833e6e2fa6df807167a9e582d135d587550d4f2b1a70b369028",
+    "conformance-results.csv": "df58a3cb27aadf69591782501e30b5e2eb122c31829dab044fe569a2a97f335b",
+    "ablation-samples.csv": "a842369d89a956a27f3d0668e9464b74fc9ff5e99098add1eda5c5f884c5b718",
+    "interference-samples.csv": "9c74e6f2f7b50eae4d480b35e6757967526a7c52afc6a8bc69cb87cabf7e4443",
+    "realworld-video-samples.csv": "3096cb2362906cdd969eabfa52fa3fadf518afb59497e0cbc622a0b2eb68ed2c"
+  },
+  "generated_table_paths": [
+    "benchmark-results/run_2026-07-30T11-00-12_42/tables/table1_steady_state.csv",
+    "benchmark-results/run_2026-07-30T11-00-12_42/tables/table1_steady_state.md",
+    "benchmark-results/run_2026-07-30T11-00-12_42/tables/table2_reconfiguration.csv",
+    "benchmark-results/run_2026-07-30T11-00-12_42/tables/table2_reconfiguration.md",
+    "benchmark-results/run_2026-07-30T11-00-12_42/tables/table3_conformance.csv",
+    "benchmark-results/run_2026-07-30T11-00-12_42/tables/table3_conformance.md"
+  ],
+  "generated_figure_paths": [
+    "benchmark-results/run_2026-07-30T11-00-12_42/figures/figure1_absolute_overhead.pdf",
+    "benchmark-results/run_2026-07-30T11-00-12_42/figures/figure1_absolute_overhead.png",
+    "benchmark-results/run_2026-07-30T11-00-12_42/figures/figure2_relative_overhead.pdf",
+    "benchmark-results/run_2026-07-30T11-00-12_42/figures/figure2_relative_overhead.png",
+    "benchmark-results/run_2026-07-30T11-00-12_42/figures/figure3_reconfiguration_breakdown.pdf",
+    "benchmark-results/run_2026-07-30T11-00-12_42/figures/figure3_reconfiguration_breakdown.png",
+    "benchmark-results/run_2026-07-30T11-00-12_42/figures/figure4_maximum_output_gap.pdf",
+    "benchmark-results/run_2026-07-30T11-00-12_42/figures/figure4_maximum_output_gap.png",
+    "benchmark-results/run_2026-07-30T11-00-12_42/figures/figure5_graph_size_sensitivity.pdf",
+    "benchmark-results/run_2026-07-30T11-00-12_42/figures/figure5_graph_size_sensitivity.png"
+  ]
+}

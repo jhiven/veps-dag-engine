@@ -1,0 +1,17 @@
+{
+  "record_type": "post_run_environment_provenance_correction",
+  "run_id": "run_2026-07-30T11-00-12_42",
+  "python_implementation": "CPython",
+  "python_version": "3.14.6",
+  "python_build": "3.14.6t",
+  "free_threaded_build": true,
+  "gil_enabled": false,
+  "interpreter_option": "-Xgil=0",
+  "benchmark_command": ". \"$HOME/.cargo/env\" && cd veps-dag-engine && MPLBACKEND=Agg uv run --group benchmark python -Xgil=0 -m benchmarks.cli run all --publication --source sample_video.mp4 --rtsp-base-url rtsp://127.0.0.1:8554 --queue-capacity 4 --warmup-frames 60 --measurement-frames 180",
+  "evidence": [
+    "The benchmark engine repository pins the free-threaded CPython build in .python-version as 3.14.6t.",
+    "The recorded run metadata identifies CPython 3.14.6 but its schema omitted the collected free_threaded_build and gil_enabled fields.",
+    "The benchmark invocation supplied for the publication run explicitly used -Xgil=0."
+  ],
+  "reason": "The run-metadata model did not persist the free-threaded-build and GIL-state fields collected by the benchmark environment probe."
+}

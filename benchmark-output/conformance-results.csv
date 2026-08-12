@@ -1,0 +1,9 @@
+run_id,campaign_id,scenario_id,scenario_type,frames_submitted,frames_completed,reconfigurations_requested,reconfigurations_committed,reconfigurations_rejected,reconfigurations_failed,mixed_plan_frames,missing_frames,duplicate_frames,retired_plan_executions,invalid_routing_events,state_continuity_failures,unexpected_state_resets,active_plan_changed_after_failed_candidate,candidate_resource_leaks,processor_instance_leaks,grace_period_safety_violations,stateful_handoff_ordering_failures,resource_lifetime_violations,terminal_status
+run_2026-07-30T13-06-19_42,frame_consistency_stress,conformance_stress,stress,8122,8122,1000,663,337,0,0,0,0,0,0,0,0,0,0,0,0,0,0,PASS
+run_2026-07-30T13-06-19_42,failure_atomicity,conformance_failure_atomicity,failure_atomicity,10,10,3,0,2,1,0,0,0,0,0,0,0,0,0,0,0,0,0,PASS
+run_2026-07-30T13-06-19_42,stateful_conformance,conformance_stateful,stateful,10,10,3,2,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,PASS
+run_2026-07-30T13-06-19_42,grace_period_deterministic,conformance_grace_period,grace_period,1,1,1,1,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,PASS
+run_2026-07-30T13-06-19_42,stateful_handoff_deterministic,conformance_handoff,stateful_handoff,2,2,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,PASS
+run_2026-07-30T13-06-19_42,candidate_memory_failure,conformance_memory_failure,memory_failure,1,1,2,1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,PASS
+run_2026-07-30T13-06-19_42,cleanup_failure,conformance_cleanup_failure,cleanup_failure,1,1,1,1,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,PASS
+run_2026-07-30T13-06-19_42,frame_exception_lease_release,conformance_frame_exception,frame_exception,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,PASS

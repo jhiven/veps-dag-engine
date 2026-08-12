@@ -1,0 +1,45 @@
+{
+  "schema_version": "2.0.0",
+  "description": "Current canonical VEPS manuscript artifacts. This manifest supersedes completion.json for multi-campaign inventory without rewriting that historical record.",
+  "source_freeze": {
+    "manifest": "environment/source-freeze.json",
+    "policy": "The core revision is verified. Later revisions are frozen chronology candidates and remain explicitly unverified."
+  },
+  "campaigns": [
+    {
+      "campaign": "core",
+      "run_id": "run_2026-07-30T11-00-12_42",
+      "source_revision": "4e5724000c9813bfba2d1ab44ec75497ac08edae",
+      "source_revision_verified": true,
+      "interpreter": "CPython 3.14.6t",
+      "gil_enabled": false
+    },
+    {
+      "campaign": "conformance",
+      "run_id": "run_2026-07-30T13-06-19_42",
+      "source_revision": null,
+      "source_revision_verified": false,
+      "provenance_note": "The CSV carries its own run identifier, but no contemporaneous run manifest recorded an exact source revision. Git chronology suggests f7cf915 but the manuscript does not present that inference as fact."
+    },
+    {
+      "campaign": "gpu_rtsp",
+      "run_id": "run_2026-07-30T16-16-34_42",
+      "source_revision": null,
+      "source_revision_verified": false,
+      "provenance_note": "The summary and frame-level CSVs carry the same run identifier. No contemporaneous run manifest recorded an exact source revision. Git chronology suggests 3af88fd but the manuscript does not present that inference as fact."
+    }
+  ],
+  "artifacts": [
+    {"path": "benchmark-output/steady-state-samples.csv", "campaign": "core", "rows": 540, "sha256": "34c0126b257d3049d3ca62ec07867454e1a9707b46ea3e12ef77761e0491300a"},
+    {"path": "benchmark-output/reconfiguration-samples.csv", "campaign": "core", "rows": 810, "sha256": "437a53a2cdf4651c679cd0b2d19ccd855ee6eee9edfa11ec892814f5e361c440"},
+    {"path": "benchmark-output/reconfiguration-stress-samples.csv", "campaign": "core", "rows": 270, "sha256": "27312d914bcd4833e6e2fa6df807167a9e582d135d587550d4f2b1a70b369028"},
+    {"path": "benchmark-output/ablation-samples.csv", "campaign": "core", "rows": 240, "sha256": "a842369d89a956a27f3d0668e9464b74fc9ff5e99098add1eda5c5f884c5b718"},
+    {"path": "benchmark-output/interference-samples.csv", "campaign": "core", "rows": 180, "sha256": "9c74e6f2f7b50eae4d480b35e6757967526a7c52afc6a8bc69cb87cabf7e4443"},
+    {"path": "benchmark-output/interference-frame-samples.csv", "campaign": "core", "rows": 513442, "sha256": "b62fa1f381119def9894c7ebea60c2cb16f1f7409ad0d8a1e0e6e5c7f00f69a9"},
+    {"path": "benchmark-output/conformance-results.csv", "campaign": "conformance", "rows": 8, "sha256": "67a6b27a3a4eb23a52d1ca6ad52f482317a638df23203fca4cbc92dba641d363"},
+    {"path": "benchmark-output/realworld-video-samples.csv", "campaign": "gpu_rtsp", "rows": 90, "sha256": "e5d88549fa412b84a64139b9d4288db2f05687b81f6fea98be52db956cefd2ce"},
+    {"path": "benchmark-output/realworld-video-frame-samples.csv", "campaign": "gpu_rtsp", "rows": 41880, "sha256": "b918d065176726a17e88fda88dcb7f6c01dc2603055fdad95078be72c476d256"},
+    {"path": "benchmark-output/summary.csv", "campaign": "core", "rows": 126, "sha256": "95b8cbeaeceae8647bf5531d2926c2401f58fe2ff94e4f82db91389ce56faaf3"},
+    {"path": "benchmark-output/tost_summary.csv", "campaign": "legacy_not_used_for_claims", "rows": 18, "sha256": "fbb3b355e0526bf4dce2ffee36ca6ec040c0ddc4e21b0e7dbdddfbc22947cd1f"}
+  ]
+}

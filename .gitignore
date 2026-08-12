@@ -13,3 +13,8 @@ benchmark-results/
 
 *.md
 *.csv
+
+# Canonical, publication-fixed benchmark artifacts are versioned. Raw and
+# exploratory runs remain ignored under benchmark-results/.
+!benchmark-output/
+!benchmark-output/**
