@@ -84,7 +84,7 @@ class TestPreservationCompatibleChange:
         initial = compile_initial(compiler, registry, spec_v1)
 
         executor = PipelineExecutor(initial.plan, clock=IncrementingClock())
-        controller = ReconfigurationController(executor, compiler, registry, clock=IncrementingClock())
+        controller = ReconfigurationController(executor, compiler, registry)
 
         try:
             for frame_id in range(3):
@@ -122,7 +122,7 @@ class TestPreservationCompatibleChange:
         spec_v1 = tracker_only(SYNTHETIC_TRACKER_DESCRIPTOR.type_name)
         initial = compile_initial(compiler, registry, spec_v1)
         executor = PipelineExecutor(initial.plan, clock=IncrementingClock())
-        controller = ReconfigurationController(executor, compiler, registry, clock=IncrementingClock())
+        controller = ReconfigurationController(executor, compiler, registry)
 
         try:
             r0 = controller.admit_frame(admitted_at_ns=1, frame_id=0)
@@ -147,7 +147,7 @@ class TestPreservationCompatibleChange:
         spec_v1 = tracker_only(SYNTHETIC_TRACKER_DESCRIPTOR.type_name)
         initial = compile_initial(compiler, registry, spec_v1)
         executor = PipelineExecutor(initial.plan, clock=IncrementingClock())
-        controller = ReconfigurationController(executor, compiler, registry, clock=IncrementingClock())
+        controller = ReconfigurationController(executor, compiler, registry)
 
         try:
             controller.admit_frame(admitted_at_ns=1, frame_id=0)
@@ -175,7 +175,7 @@ class TestPreservationCompatibleChange:
         spec_v1 = tracker_only(SYNTHETIC_TRACKER_DESCRIPTOR.type_name)
         initial = compile_initial(compiler, registry, spec_v1)
         executor = PipelineExecutor(initial.plan, clock=IncrementingClock())
-        controller = ReconfigurationController(executor, compiler, registry, clock=IncrementingClock())
+        controller = ReconfigurationController(executor, compiler, registry)
 
         try:
             controller.admit_frame(admitted_at_ns=1, frame_id=0)
@@ -223,7 +223,7 @@ class TestPreservationCompatibleChange:
         spec_v1 = tracker_only(SYNTHETIC_TRACKER_DESCRIPTOR.type_name)
         initial = compile_initial(compiler, registry, spec_v1)
         executor = PipelineExecutor(initial.plan, clock=IncrementingClock())
-        controller = ReconfigurationController(executor, compiler, registry, clock=IncrementingClock())
+        controller = ReconfigurationController(executor, compiler, registry)
 
         try:
             controller.admit_frame(admitted_at_ns=1, frame_id=0)
@@ -270,7 +270,7 @@ class TestExplicitReset:
         spec = tracker_only(SYNTHETIC_TRACKER_DESCRIPTOR.type_name)
         initial = compile_initial(compiler, registry, spec)
         executor = PipelineExecutor(initial.plan, clock=IncrementingClock())
-        controller = ReconfigurationController(executor, compiler, registry, clock=IncrementingClock())
+        controller = ReconfigurationController(executor, compiler, registry)
 
         try:
             controller.admit_frame(admitted_at_ns=1, frame_id=0)
@@ -318,7 +318,7 @@ class TestExplicitReset:
         spec = tracker_only(SYNTHETIC_TRACKER_DESCRIPTOR.type_name)
         initial = compile_initial(compiler, registry, spec)
         executor = PipelineExecutor(initial.plan, clock=IncrementingClock())
-        controller = ReconfigurationController(executor, compiler, registry, clock=IncrementingClock())
+        controller = ReconfigurationController(executor, compiler, registry)
 
         try:
             controller.admit_frame(admitted_at_ns=1, frame_id=0)
@@ -361,7 +361,7 @@ class TestExplicitReset:
         spec = tracker_only(SYNTHETIC_TRACKER_DESCRIPTOR.type_name)
         initial = compile_initial(compiler, registry, spec)
         executor = PipelineExecutor(initial.plan, clock=IncrementingClock())
-        controller = ReconfigurationController(executor, compiler, registry, clock=IncrementingClock())
+        controller = ReconfigurationController(executor, compiler, registry)
 
         try:
             controller.admit_frame(admitted_at_ns=1, frame_id=0)
@@ -402,7 +402,7 @@ class TestExplicitReset:
         spec = tracker_only(SYNTHETIC_TRACKER_DESCRIPTOR.type_name)
         initial = compile_initial(compiler, registry, spec)
         executor = PipelineExecutor(initial.plan, clock=IncrementingClock())
-        controller = ReconfigurationController(executor, compiler, registry, clock=IncrementingClock())
+        controller = ReconfigurationController(executor, compiler, registry)
 
         try:
             controller.admit_frame(admitted_at_ns=1, frame_id=0)
@@ -441,9 +441,7 @@ class TestIncompatiblePreservationRejection:
         spec_v1 = tracker_only(SYNTHETIC_TRACKER_DESCRIPTOR.type_name)
         initial = compile_initial(compiler, registry, spec_v1)
         executor = PipelineExecutor(initial.plan, clock=IncrementingClock())
-        controller = ReconfigurationController(
-            executor, compiler, registry, clock=IncrementingClock()
-        )
+        controller = ReconfigurationController(executor, compiler, registry)
         return controller
 
     def test_rejection_when_tracker_type_changes(self) -> None:
@@ -643,9 +641,7 @@ class TestNoConcurrentAccess:
         initial = compile_initial(compiler, registry, spec_v1)
         executor = PipelineExecutor(initial.plan, clock=IncrementingClock())
         spec_v2 = tracker_then_pass(SYNTHETIC_TRACKER_DESCRIPTOR.type_name)
-        controller = ReconfigurationController(
-            executor, compiler, registry, clock=IncrementingClock()
-        )
+        controller = ReconfigurationController(executor, compiler, registry)
         try:
             # Process several frames on version 1
             for frame_id in range(3):
@@ -715,9 +711,7 @@ class TestLeakDetection:
         initial = compile_initial(compiler, registry, spec_tracker)
 
         executor = PipelineExecutor(initial.plan, clock=IncrementingClock())
-        controller = ReconfigurationController(
-            executor, compiler, registry, clock=IncrementingClock()
-        )
+        controller = ReconfigurationController(executor, compiler, registry)
         try:
             iterations = 5
             frame_id = 0
@@ -797,9 +791,7 @@ class TestLeakDetection:
         spec = tracker_only(SYNTHETIC_TRACKER_DESCRIPTOR.type_name)
         initial = compile_initial(compiler, registry, spec)
         executor = PipelineExecutor(initial.plan, clock=IncrementingClock())
-        controller = ReconfigurationController(
-            executor, compiler, registry, clock=IncrementingClock()
-        )
+        controller = ReconfigurationController(executor, compiler, registry)
 
         try:
             controller.admit_frame(admitted_at_ns=1, frame_id=0)
@@ -827,7 +819,7 @@ class TestFramePlanConsistency:
         initial = compile_initial(compiler, registry, spec_v1)
         clock = IncrementingClock()
         executor = PipelineExecutor(initial.plan, clock=clock)
-        controller = ReconfigurationController(executor, compiler, registry, clock=clock)
+        controller = ReconfigurationController(executor, compiler, registry)
 
         try:
             frame_results: list[FrameStatus] = []
@@ -868,7 +860,7 @@ class TestFramePlanConsistency:
         initial = compile_initial(compiler, registry, spec_v1)
         clock = IncrementingClock()
         executor = PipelineExecutor(initial.plan, clock=clock)
-        controller = ReconfigurationController(executor, compiler, registry, clock=clock)
+        controller = ReconfigurationController(executor, compiler, registry)
 
         try:
             for frame_id in range(3):

@@ -11,6 +11,8 @@ from nedo_vision_dag_engine.instrumentation import (
     FrameStatus,
     NanosecondClock,
     RuntimeInstrumentation,
+    emit_runtime_evidence,
+    runtime_evidence_sink,
 )
 from nedo_vision_dag_engine.lifecycle import PlanLifecycleState
 from nedo_vision_dag_engine.plan import ExecutionPlan, ExecutionStep, construct_inputs
@@ -82,6 +84,10 @@ def execute_frame(
     context = FrameContext(frame_id=frame_id, plan_version=plan.version, admitted_at_ns=admitted_at_ns)
     executed: list[str] = []
     skipped: list[str] = []
+    # Read once per frame, not once per node: with no sink installed the whole
+    # node-level evidence path must cost nothing, because steady-state
+    # measurements run with evidence disabled.
+    evidence = runtime_evidence_sink()
 
     for step in plan.steps:
         if not step.readiness_rule.is_ready(workspace):
@@ -90,10 +96,33 @@ def execute_frame(
             continue
 
         try:
+            if evidence is not None:
+                evidence(
+                    "node_entered",
+                    {
+                        "frame_id": frame_id,
+                        "plan_id": plan.version,
+                        "node_id": step.node_id,
+                        "processor_instance_id": f"0x{id(step.processor_ref):x}",
+                    },
+                )
             raw_inputs = construct_inputs(step.input_bindings, workspace)
             materialized_inputs = _materialize_inputs(step, raw_inputs)
             output = step.processor_ref.process(materialized_inputs, context)
         except Exception as error:
+            if evidence is not None:
+                evidence(
+                    "node_exited",
+                    {
+                        "frame_id": frame_id,
+                        "plan_id": plan.version,
+                        "node_id": step.node_id,
+                        "processor_instance_id": f"0x{id(step.processor_ref):x}",
+                        "outcome": "failed",
+                        "error_type": type(error).__name__,
+                        "error_message": str(error),
+                    },
+                )
             return FrameResult(
                 frame_id=frame_id,
                 plan_version=plan.version,
@@ -105,6 +134,17 @@ def execute_frame(
 
         workspace.set(step.output_index, output)
         executed.append(step.node_id)
+        if evidence is not None:
+            evidence(
+                "node_exited",
+                {
+                    "frame_id": frame_id,
+                    "plan_id": plan.version,
+                    "node_id": step.node_id,
+                    "processor_instance_id": f"0x{id(step.processor_ref):x}",
+                    "outcome": "completed",
+                },
+            )
 
     return FrameResult(
         frame_id=frame_id,
@@ -297,6 +337,15 @@ class PipelineExecutor:
     def instrumentation(self) -> RuntimeInstrumentation:
         return self._instrumentation
 
+    @property
+    def clock(self) -> NanosecondClock:
+        """Return the executor's monotonic clock.
+
+        Managed controllers must use this exact clock so every runtime
+        timestamp belongs to one comparable domain.
+        """
+        return self._clock
+
     def commit(self, new_plan: ExecutionPlan) -> PlanSwap:
         """Public commit. Raises if managed by a controller."""
         with self._admission_lock:
@@ -367,13 +416,53 @@ class PipelineExecutor:
             frame_id=frame_id,
         )
 
+    def cancel_reserved_frame_managed(
+        self,
+        token: object,
+        admission: FrameAdmission,
+    ) -> None:
+        """Cancel an unexecuted managed reservation and release its lease.
+
+        A reservation has exactly one terminal action: execution or
+        cancellation.  Foreign and already-consumed records are rejected
+        without changing lease accounting.
+        """
+        with self._admission_lock:
+            with self._plan_lock:
+                if token is not self._manager_token:
+                    raise RuntimeError("invalid executor management token")
+            self._consume_admission_locked(admission)
+        emit_runtime_evidence(
+            "frame_cancelled",
+            frame_id=admission.frame_id,
+            plan_id=admission.plan.version,
+            outcome="reservation_cancelled",
+        )
+        self._release_admission_lease(admission.plan.version, admission.frame_id)
+
     def _reserve_frame(
         self, token: object | None, is_managed: bool, admitted_at_ns: int, frame_id: int | None = None
     ) -> FrameAdmission:
         """Select a plan and acquire its lease at the admission boundary."""
         if admitted_at_ns < 0:
+            emit_runtime_evidence("frame_offered", frame_id=frame_id)
+            emit_runtime_evidence(
+                "frame_failed",
+                frame_id=frame_id,
+                outcome="admission_rejected",
+                error_type="ValueError",
+                error_message="admitted_at_ns must be non-negative",
+            )
             raise ValueError("admitted_at_ns must be non-negative.")
         if frame_id is not None and frame_id < 0:
+            emit_runtime_evidence("frame_offered", frame_id=frame_id)
+            emit_runtime_evidence(
+                "frame_failed",
+                frame_id=frame_id,
+                outcome="admission_rejected",
+                error_type="ValueError",
+                error_message="frame_id must be non-negative",
+            )
             raise ValueError("frame_id must be non-negative.")
 
         with self._admission_lock:
@@ -386,6 +475,9 @@ class PipelineExecutor:
                 plan = self._active_plan
                 self._increment_inflight(plan.version)
             resolved_frame_id = self._next_frame_id if frame_id is None else frame_id
+            evidence = runtime_evidence_sink()
+            if evidence is not None:
+                evidence("frame_offered", {"frame_id": resolved_frame_id})
             self._next_frame_id = max(self._next_frame_id, resolved_frame_id + 1)
             admission_id = self._next_admission_id
             self._next_admission_id += 1
@@ -396,16 +488,22 @@ class PipelineExecutor:
                 admitted_at_ns=admitted_at_ns,
             )
             self._pending_admissions[admission_id] = admission
+            if evidence is not None:
+                evidence(
+                    "lease_acquired",
+                    {"frame_id": resolved_frame_id, "plan_id": plan.version},
+                )
+                evidence(
+                    "frame_admitted",
+                    {"frame_id": resolved_frame_id, "plan_id": plan.version},
+                )
             return admission
 
     def execute_admitted_frame(self, admission: FrameAdmission) -> FrameResult:
         """Execute one admitted frame and release its lease on every exit."""
         plan = admission.plan
         with self._admission_lock:
-            pending = self._pending_admissions.get(admission.admission_id)
-            if pending is not admission:
-                raise RuntimeError("frame admission is foreign or has already been consumed")
-            del self._pending_admissions[admission.admission_id]
+            self._consume_admission_locked(admission)
 
         try:
             with self._frame_execution_lock:
@@ -420,13 +518,20 @@ class PipelineExecutor:
                 finally:
                     self._workspace_pool.release(workspace)
         finally:
-            completed_at_ns: int | None = None
-            try:
-                completed_at_ns = self._clock()
-            finally:
-                self._decrement_inflight(plan.version, completed_at_ns)
+            completed_at_ns = self._release_admission_lease(plan.version, admission.frame_id)
 
         assert completed_at_ns is not None
+        evidence = runtime_evidence_sink()
+        if evidence is not None:
+            evidence(
+                "frame_completed" if result.status is FrameStatus.COMPLETED else "frame_failed",
+                {
+                    "frame_id": result.frame_id,
+                    "plan_id": result.plan_version,
+                    "outcome": result.status.value,
+                    "error_message": result.error,
+                },
+            )
         self._instrumentation.record_frame(
             FrameExecutionEvent(
                 frame_id=result.frame_id,
@@ -440,6 +545,31 @@ class PipelineExecutor:
             )
         )
         return result
+
+    def _consume_admission_locked(self, admission: FrameAdmission) -> None:
+        pending = self._pending_admissions.get(admission.admission_id)
+        if pending is not admission:
+            raise RuntimeError("frame admission is foreign or has already been consumed")
+        del self._pending_admissions[admission.admission_id]
+
+    def _release_admission_lease(self, plan_version: int, frame_id: int) -> int | None:
+        """Release one lease even when reading the completion clock fails."""
+        completed_at_ns: int | None = None
+        try:
+            completed_at_ns = self._clock()
+            return completed_at_ns
+        finally:
+            self._decrement_inflight(plan_version, completed_at_ns)
+            evidence = runtime_evidence_sink()
+            if evidence is not None:
+                evidence(
+                    "lease_released",
+                    {
+                        "frame_id": frame_id,
+                        "plan_id": plan_version,
+                        "outcome": "released",
+                    },
+                )
 
     def snapshot_active_plan(self) -> ExecutionPlan:
         """Centralized accessor for taking a thread-safe snapshot of the active plan.
@@ -466,6 +596,12 @@ class PipelineExecutor:
                 f"version {previous_plan.version}."
             )
         self._active_plan = new_plan
+        emit_runtime_evidence(
+            "plan_published",
+            plan_id=new_plan.version,
+            previous_plan_id=previous_plan.version,
+            outcome="committed",
+        )
 
         # Update plan lifecycle states
         self._plan_lifecycle[previous_plan.version] = PlanLifecycleState.SUPERSEDED

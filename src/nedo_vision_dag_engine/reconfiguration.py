@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass, replace
 from queue import Queue
 from threading import Condition, Lock, Thread, current_thread
@@ -25,6 +24,7 @@ from nedo_vision_dag_engine.instrumentation import (
     RetirementStatus,
     RuntimeInstrumentation,
     StateReuseEvent,
+    emit_runtime_evidence,
 )
 from nedo_vision_dag_engine.lifecycle import (
     CleanupReason,
@@ -310,7 +310,6 @@ class ReconfigurationController:
         executor: PipelineExecutor,
         compiler: WorkflowCompiler,
         registry: RegistrySnapshot,
-        clock: NanosecondClock = time.monotonic_ns,
         worker_name: str = "dag-reconfiguration",
     ) -> None:
         if not worker_name:
@@ -321,7 +320,10 @@ class ReconfigurationController:
         self._executor.claim_management(self._executor_token)
         self._compiler = compiler
         self._registry = registry
-        self._clock = clock
+        # The executor owns the sole runtime clock domain. Controller and frame
+        # timestamps must be comparable, so the controller cannot be given an
+        # independent clock.
+        self._clock = executor.clock
         self._state_lock = Lock()
         self._condition = Condition(self._state_lock)
         self._admission_lock = Lock()
@@ -515,7 +517,14 @@ class ReconfigurationController:
                     frame_id=frame_id,
                 )
                 record_completion = True
-                self._record_frame_admission(admission.plan.version)
+                try:
+                    self._record_frame_admission(admission.plan.version)
+                except BaseException:
+                    self._executor.cancel_reserved_frame_managed(
+                        self._executor_token,
+                        admission,
+                    )
+                    raise
 
         result = self._executor.execute_admitted_frame(admission)
         if record_completion:
@@ -936,6 +945,11 @@ class ReconfigurationController:
         handoff_wait_complete_ns: int | None = None
         if handoff_required:
             handoff_wait_start_ns = self._clock()
+            emit_runtime_evidence(
+                "handoff_gate_closed",
+                request_id=request.request_id,
+                plan_id=self._executor.active_plan.version,
+            )
             drained = self._executor.wait_for_plan_quiescent(
                 self._executor.active_plan.version,
                 timeout=HANDOFF_DRAIN_TIMEOUT_SECONDS,
@@ -949,6 +963,11 @@ class ReconfigurationController:
                     handoff_wait_start_ns=handoff_wait_start_ns,
                     handoff_wait_complete_ns=handoff_wait_complete_ns,
                 )
+            emit_runtime_evidence(
+                "handoff_gate_opened",
+                request_id=request.request_id,
+                plan_id=self._executor.active_plan.version,
+            )
 
         with self._condition:
             record = self._record_or_raise_locked(request.request_id)
@@ -1217,6 +1236,14 @@ class ReconfigurationController:
             deferred.previous_plan.version,
             PlanLifecycleState.RETIREMENT_FAILED,
         )
+        emit_runtime_evidence(
+            "retirement_failed",
+            request_id=deferred.request_id,
+            plan_id=deferred.previous_plan.version,
+            outcome="failed",
+            error_type=type(error).__name__,
+            error_message=str(error),
+        )
         with self._condition:
             record = self._records.get(deferred.request_id)
             if record is not None:
@@ -1236,6 +1263,11 @@ class ReconfigurationController:
 
     def _process_pending_retirement(self, deferred: _PendingRetirement) -> None:
         retirement_started_at_ns = self._clock()
+        emit_runtime_evidence(
+            "retirement_started",
+            request_id=deferred.request_id,
+            plan_id=deferred.previous_plan.version,
+        )
 
         # Idempotent guard: skip if this plan version was already cleaned.
         if deferred.previous_plan.version in self._cleaned_plans:
@@ -1285,11 +1317,23 @@ class ReconfigurationController:
                     self._records[deferred.request_id] = updated_record
                     self._record_measurement(updated_record)
                     self._condition.notify_all()
+            emit_runtime_evidence(
+                "retirement_failed",
+                request_id=deferred.request_id,
+                plan_id=deferred.previous_plan.version,
+                outcome="stalled",
+                error_message="grace period timed out",
+            )
             return
 
         self._executor.update_plan_lifecycle(
             deferred.previous_plan.version,
             PlanLifecycleState.QUIESCENT,
+        )
+        emit_runtime_evidence(
+            "plan_quiescent",
+            request_id=deferred.request_id,
+            plan_id=deferred.previous_plan.version,
         )
 
         # ── Cleanup superseded processors ──
@@ -1369,6 +1413,13 @@ class ReconfigurationController:
                 self._records[deferred.request_id] = updated_record
                 self._record_measurement(updated_record)
                 self._condition.notify_all()
+        emit_runtime_evidence(
+            "retirement_completed" if is_success else "retirement_failed",
+            request_id=deferred.request_id,
+            plan_id=deferred.previous_plan.version,
+            outcome=ret_status.value,
+            error_message=retirement_reason,
+        )
 
     def _record_measurement(self, record: ReconfigurationRecord) -> None:
         candidate_cleanup_failure_count = (

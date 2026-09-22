@@ -87,13 +87,11 @@ class TestFactoryFailure:
         # Build an initial plan with a working registry
         good_registry = stateless_registry(LifecycleLog())
         initial = compile_initial(compiler, good_registry, source_only())
-        executor = PipelineExecutor(initial.plan)
+        executor = PipelineExecutor(initial.plan, clock=IncrementingClock())
 
         # Now use a registry whose pass factory raises
         failing_registry = stateless_registry(log, fail_pass_factory=True)
-        controller = ReconfigurationController(
-            executor, compiler, failing_registry, clock=IncrementingClock()
-        )
+        controller = ReconfigurationController(executor, compiler, failing_registry)
         try:
             controller.submit(_request("fail-factory", 1, linear()))
             terminal = controller.wait_for_terminal("fail-factory", timeout_seconds=2.0)
@@ -165,12 +163,10 @@ class TestFactoryFailure:
         compiler1 = WorkflowCompiler("test")
         registry1 = stateless_registry(LifecycleLog())
         initial1 = compile_initial(compiler1, registry1, source_only())
-        executor1 = PipelineExecutor(initial1.plan)
+        executor1 = PipelineExecutor(initial1.plan, clock=IncrementingClock())
 
         failing_registry = stateless_registry(good_log, fail_pass_factory=True)
-        controller1 = ReconfigurationController(
-            executor1, compiler1, failing_registry, clock=IncrementingClock()
-        )
+        controller1 = ReconfigurationController(executor1, compiler1, failing_registry)
         try:
             controller1.submit(_request("fail", 1, linear()))
             terminal = controller1.wait_for_terminal("fail", timeout_seconds=2.0)
@@ -184,10 +180,8 @@ class TestFactoryFailure:
         compiler2 = WorkflowCompiler("test")
         working_registry = stateless_registry(good_log)
         initial2 = compile_initial(compiler2, working_registry, source_only())
-        executor2 = PipelineExecutor(initial2.plan)
-        controller2 = ReconfigurationController(
-            executor2, compiler2, working_registry, clock=IncrementingClock()
-        )
+        executor2 = PipelineExecutor(initial2.plan, clock=IncrementingClock())
+        controller2 = ReconfigurationController(executor2, compiler2, working_registry)
         try:
             controller2.submit(_request("ok", 1, linear()))
             ready = controller2.wait_for_status(
@@ -230,12 +224,10 @@ class TestSetupFailure:
         compiler = WorkflowCompiler("test")
         good_registry = stateless_registry(LifecycleLog())
         initial = compile_initial(compiler, good_registry, source_only())
-        executor = PipelineExecutor(initial.plan)
+        executor = PipelineExecutor(initial.plan, clock=IncrementingClock())
 
         failing_registry = stateless_registry(log, pass_failure=InjectedFailurePoint.SETUP)
-        controller = ReconfigurationController(
-            executor, compiler, failing_registry, clock=IncrementingClock()
-        )
+        controller = ReconfigurationController(executor, compiler, failing_registry)
         try:
             controller.submit(_request("setup-fail", 1, linear()))
             terminal = controller.wait_for_terminal("setup-fail", timeout_seconds=2.0)
@@ -260,12 +252,10 @@ class TestSetupFailure:
         compiler = WorkflowCompiler("test")
         good_registry = stateless_registry(LifecycleLog())
         initial = compile_initial(compiler, good_registry, source_only())
-        executor = PipelineExecutor(initial.plan)
+        executor = PipelineExecutor(initial.plan, clock=IncrementingClock())
 
         failing_registry = stateless_registry(log, pass_failure=InjectedFailurePoint.SETUP)
-        controller = ReconfigurationController(
-            executor, compiler, failing_registry, clock=IncrementingClock()
-        )
+        controller = ReconfigurationController(executor, compiler, failing_registry)
         try:
             controller.submit(_request("no-candidate", 1, linear()))
             controller.wait_for_terminal("no-candidate", timeout_seconds=2.0)
@@ -306,12 +296,10 @@ class TestHealthcheckFailure:
         compiler = WorkflowCompiler("test")
         good_registry = stateless_registry(LifecycleLog())
         initial = compile_initial(compiler, good_registry, source_only())
-        executor = PipelineExecutor(initial.plan)
+        executor = PipelineExecutor(initial.plan, clock=IncrementingClock())
 
         failing_registry = stateless_registry(log, pass_failure=InjectedFailurePoint.HEALTHCHECK)
-        controller = ReconfigurationController(
-            executor, compiler, failing_registry, clock=IncrementingClock()
-        )
+        controller = ReconfigurationController(executor, compiler, failing_registry)
         try:
             controller.submit(_request("hc-fail", 1, linear()))
             terminal = controller.wait_for_terminal("hc-fail", timeout_seconds=2.0)
@@ -504,9 +492,7 @@ class TestPredicateFailure:
         compiler = WorkflowCompiler("test")
         initial = compile_initial(compiler, registry, tracker_only(TRACKER_RAISING_DESCRIPTOR.type_name))
         executor = PipelineExecutor(initial.plan, clock=IncrementingClock())
-        controller = ReconfigurationController(
-            executor, compiler, registry, clock=IncrementingClock()
-        )
+        controller = ReconfigurationController(executor, compiler, registry)
         try:
             controller.admit_frame(admitted_at_ns=1, frame_id=0)
             # Submit a reconfiguration of the same spec; the predicate will raise
@@ -527,9 +513,7 @@ class TestPredicateFailure:
         initial = compile_initial(compiler, registry, tracker_only(TRACKER_RAISING_DESCRIPTOR.type_name))
         original_processor = initial.plan.steps[0].processor_ref
         executor = PipelineExecutor(initial.plan, clock=IncrementingClock())
-        controller = ReconfigurationController(
-            executor, compiler, registry, clock=IncrementingClock()
-        )
+        controller = ReconfigurationController(executor, compiler, registry)
         try:
             controller.admit_frame(admitted_at_ns=1, frame_id=0)
             controller.submit(_request("predicate-fail2", 1, tracker_only(TRACKER_RAISING_DESCRIPTOR.type_name)))
@@ -555,10 +539,8 @@ class TestStaleCandidate:
         compiler = WorkflowCompiler("test")
         good_registry = stateless_registry(LifecycleLog())
         initial = compile_initial(compiler, good_registry, source_only())
-        executor = PipelineExecutor(initial.plan)
-        controller = ReconfigurationController(
-            executor, compiler, good_registry, clock=IncrementingClock()
-        )
+        executor = PipelineExecutor(initial.plan, clock=IncrementingClock())
+        controller = ReconfigurationController(executor, compiler, good_registry)
         try:
             controller.submit(_request("stale", 1, linear()))
             ready = controller.wait_for_status(
@@ -585,10 +567,8 @@ class TestStaleCandidate:
         compiler = WorkflowCompiler("test")
         good_registry = stateless_registry(log)
         initial = compile_initial(compiler, good_registry, source_only())
-        executor = PipelineExecutor(initial.plan)
-        controller = ReconfigurationController(
-            executor, compiler, good_registry, clock=IncrementingClock()
-        )
+        executor = PipelineExecutor(initial.plan, clock=IncrementingClock())
+        controller = ReconfigurationController(executor, compiler, good_registry)
         try:
             controller.submit(_request("stale-clean", 1, linear()))
             ready = controller.wait_for_status(
@@ -616,10 +596,8 @@ class TestStaleCandidate:
         compiler = WorkflowCompiler("test")
         registry = stateless_registry(log)
         initial = compile_initial(compiler, registry, source_only())
-        executor = PipelineExecutor(initial.plan)
-        controller = ReconfigurationController(
-            executor, compiler, registry, clock=IncrementingClock()
-        )
+        executor = PipelineExecutor(initial.plan, clock=IncrementingClock())
+        controller = ReconfigurationController(executor, compiler, registry)
         try:
             controller.submit(_request("stale-active", 1, linear()))
             controller.wait_for_status(
@@ -653,10 +631,8 @@ class TestAbortCleanup:
         compiler = WorkflowCompiler("test")
         registry = stateless_registry(log)
         initial = compile_initial(compiler, registry, source_only())
-        executor = PipelineExecutor(initial.plan)
-        controller = ReconfigurationController(
-            executor, compiler, registry, clock=IncrementingClock()
-        )
+        executor = PipelineExecutor(initial.plan, clock=IncrementingClock())
+        controller = ReconfigurationController(executor, compiler, registry)
         try:
             controller.submit(_request("abort", 1, linear()))
             controller.wait_for_status(
@@ -677,10 +653,8 @@ class TestAbortCleanup:
         compiler = WorkflowCompiler("test")
         registry = stateless_registry(log)
         initial = compile_initial(compiler, registry, source_only())
-        executor = PipelineExecutor(initial.plan)
-        controller = ReconfigurationController(
-            executor, compiler, registry, clock=IncrementingClock()
-        )
+        executor = PipelineExecutor(initial.plan, clock=IncrementingClock())
+        controller = ReconfigurationController(executor, compiler, registry)
         try:
             controller.submit(_request("abort-no-commit", 1, linear()))
             controller.wait_for_status(
@@ -700,10 +674,8 @@ class TestAbortCleanup:
         compiler = WorkflowCompiler("test")
         registry = stateless_registry(log)
         initial = compile_initial(compiler, registry, source_only())
-        executor = PipelineExecutor(initial.plan)
-        controller = ReconfigurationController(
-            executor, compiler, registry, clock=IncrementingClock()
-        )
+        executor = PipelineExecutor(initial.plan, clock=IncrementingClock())
+        controller = ReconfigurationController(executor, compiler, registry)
         try:
             controller.submit(_request("abort-reuse", 1, linear()))
             controller.wait_for_status(

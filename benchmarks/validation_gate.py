@@ -6,8 +6,6 @@ Exit code 0 = PASS, exit code 1 = FAIL (with JSON report).
 
 from __future__ import annotations
 
-from __future__ import annotations
-
 import csv
 import json
 import os
@@ -165,56 +163,32 @@ def _validate_reconfiguration(report: ValidationReport, run_dir: str) -> None:
 
 
 def _validate_conformance(report: ValidationReport, run_dir: str) -> None:
-    path = os.path.join(run_dir, "conformance-results.csv")
-    if not os.path.exists(path):
-        _add(report, "conformance_exists", False, f"Missing: {path}")
-        return
-    _add(report, "conformance_exists", True, path)
+    from benchmarks.conformance_trace import validate_conformance_directory
 
+    path = os.path.join(run_dir, "conformance")
+    required = frozenset(
+        {
+            "randomized_consistency",
+            "failure_atomicity",
+            "state_policy",
+            "stateless_publication",
+            "mutable_handoff",
+            "candidate_failure",
+            "cleanup_failure",
+            "frame_exception",
+            "successive_generation_ownership",
+        }
+    )
     try:
-        with open(path, newline="", encoding="utf-8") as f:
-            rows = list(csv.DictReader(f))
-    except Exception as e:
-        report.errors.append(f"conformance CSV read error: {e}")
+        reports = validate_conformance_directory(
+            path,
+            required,
+            (42, 314159, 271828, 161803, 20260922),
+        )
+    except Exception as error:
+        _add(report, "conformance_replay", False, str(error))
         return
-
-    _add(report, "conformance_not_empty", len(rows) > 0, f"{len(rows)} rows")
-
-    # Check terminal status
-    non_pass = [r for r in rows if r.get("terminal_status", "") != "PASS"]
-    _add(report, "conformance_all_pass", len(non_pass) == 0,
-         f"{len(non_pass)} non-PASS rows: {[r['campaign_id'] for r in non_pass]}", 0, len(non_pass))
-
-    # Required campaigns must be present
-    required_campaigns = [
-        "frame_consistency_stress",
-        "failure_atomicity",
-        "stateful_conformance",
-        "grace_period_deterministic",
-        "stateful_handoff_deterministic",
-        "candidate_memory_failure",
-        "cleanup_failure",
-        "frame_exception_lease_release",
-    ]
-    present_campaigns = {r["campaign_id"] for r in rows}
-    missing_campaigns = [c for c in required_campaigns if c not in present_campaigns]
-    _add(report, "conformance_all_campaigns_present", len(missing_campaigns) == 0,
-         f"Missing: {missing_campaigns}", len(required_campaigns),
-         len(required_campaigns) - len(missing_campaigns))
-
-    # Check specific counters
-    for r in rows:
-        cid = r.get("campaign_id", "")
-        # grace_period_safety_violations must be 0
-        gp = int(r.get("grace_period_safety_violations", 0))
-        if gp > 0:
-            _add(report, f"conformance_{cid}_grace_period_violations", False,
-                 f"{gp} grace period safety violations in {cid}", 0, gp)
-        # stateful_handoff_ordering_failures must be 0
-        sh = int(r.get("stateful_handoff_ordering_failures", 0))
-        if sh > 0:
-            _add(report, f"conformance_{cid}_handoff_failures", False,
-                 f"{sh} handoff ordering failures in {cid}", 0, sh)
+    _add(report, "conformance_replay", True, f"{len(reports)} raw traces replayed")
 
 
 def _validate_realworld_video(report: ValidationReport, run_dir: str) -> None:
@@ -295,11 +269,24 @@ def validate_benchmark_directory(run_dir: str) -> ValidationReport:
     if os.path.exists(fail_path):
         _add(report, "no_failure_json", False, "failure.json present — run failed")
 
-    # Per-CSV validation
-    _validate_steady_state(report, run_dir)
-    _validate_reconfiguration(report, run_dir)
-    _validate_conformance(report, run_dir)
-    _validate_realworld_video(report, run_dir)
+    selected_suites: set[str] = set()
+    run_json = os.path.join(run_dir, "run.json")
+    if os.path.exists(run_json):
+        try:
+            with open(run_json, "r", encoding="utf-8") as file:
+                metadata: dict[str, Any] = json.load(file)
+            selected_suites = {str(value) for value in metadata.get("selected_suites", [])}
+        except Exception as error:
+            report.errors.append(f"run.json read error: {error}")
+
+    if "steady-state" in selected_suites:
+        _validate_steady_state(report, run_dir)
+    if "reconfiguration" in selected_suites or "reconfiguration-stress" in selected_suites:
+        _validate_reconfiguration(report, run_dir)
+    if "conformance" in selected_suites:
+        _validate_conformance(report, run_dir)
+    if "realworld-video" in selected_suites:
+        _validate_realworld_video(report, run_dir)
 
     return report
 

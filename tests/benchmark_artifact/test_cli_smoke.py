@@ -42,8 +42,18 @@ def test_cli_smoke_run_and_verify() -> None:
             assert r.instrumented_phase_sum_ns is not None
             assert r.unattributed_request_time_ns is not None
 
+        # A run directory holds raw evidence only; analysis is a separate step.
+        assert not os.path.exists(os.path.join(run_dir, "summary.csv"))
+        assert not os.path.exists(os.path.join(run_dir, "tables"))
+        assert not os.path.exists(os.path.join(run_dir, "figures"))
+
         # Verify artifact
         verify_cmd(run_dir)
 
-        # Re-run report generation
-        report_cmd(run_dir)
+        analysis_dir = os.path.join(tmp_dir, "analysis")
+        report_cmd(run_dir, analysis_dir)
+
+        assert os.path.exists(os.path.join(analysis_dir, "summary.csv"))
+        assert os.path.isdir(os.path.join(analysis_dir, "tables"))
+        assert os.path.isdir(os.path.join(analysis_dir, "figures"))
+        assert not os.path.exists(os.path.join(run_dir, "summary.csv"))

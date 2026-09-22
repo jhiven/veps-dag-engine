@@ -4,20 +4,25 @@ from __future__ import annotations
 
 import random
 import time
+import os
 from threading import Event, Lock, Thread
 
 from dataclasses import dataclass
 
 from benchmarks.model import ConformanceResultRow
+from benchmarks.conformance_trace import ConformanceTrace
 from benchmarks.scenarios import (
     PassOutput,
     apply_reconfiguration_edit,
     make_reconfiguration_base_spec,
 )
-from benchmarks.storage import append_conformance_rows, write_conformance_header
 from nedo_vision_dag_engine.compiler import CompiledCandidate, StateDirective, WorkflowCompiler
 from nedo_vision_dag_engine.executor import FrameResult, PipelineExecutor
-from nedo_vision_dag_engine.instrumentation import FrameStatus, RetirementStatus
+from nedo_vision_dag_engine.instrumentation import (
+    FrameStatus,
+    RetirementStatus,
+    install_runtime_evidence_sink,
+)
 from nedo_vision_dag_engine.plan import ExecutionPlan
 from nedo_vision_dag_engine.processor import (
     FrameContext,
@@ -61,54 +66,260 @@ __all__ = ["run_conformance_suite"]
 
 def run_conformance_suite(
     run_id: str,
-    output_csv_path: str,
+    output_directory: str,
     profile: str,
-    seed: int = 42,
+    seeds: tuple[int, ...] = (42, 314159, 271828, 161803, 20260922),
 ) -> tuple[ConformanceResultRow, ...]:
-    write_conformance_header(output_csv_path)
+    os.makedirs(output_directory, exist_ok=True)
     all_rows: list[ConformanceResultRow] = []
 
-    # 16.1 Frame-Consistency Stress Campaign
-    row_stress = _run_frame_consistency_stress_campaign(run_id, profile, seed)
-    all_rows.append(row_stress)
-    append_conformance_rows(output_csv_path, [row_stress])
+    def run_traced(
+        campaign_id: str,
+        seed: int,
+        campaign: object,
+    ) -> None:
+        path = os.path.join(output_directory, f"{campaign_id}-seed-{seed}.jsonl")
+        with ConformanceTrace(path, run_id, campaign_id, seed) as trace:
+            previous = install_runtime_evidence_sink(trace.emit)
+            trace.emit("campaign_started", {"outcome": "running"})
+            try:
+                if not callable(campaign):
+                    raise TypeError("campaign must be callable")
+                row = campaign()
+                if not isinstance(row, ConformanceResultRow):
+                    raise TypeError("campaign returned an invalid result")
+                outcome = "passed" if row.terminal_status == "PASS" else "failed"
+                trace.emit("campaign_completed", {"outcome": outcome})
+                if outcome != "passed":
+                    raise RuntimeError(f"conformance campaign {campaign_id!r} failed")
+                all_rows.append(row)
+            except BaseException as error:
+                trace.emit(
+                    "campaign_failed",
+                    {
+                        "outcome": "failed",
+                        "error_type": type(error).__name__,
+                        "error_message": str(error),
+                    },
+                )
+                raise
+            finally:
+                install_runtime_evidence_sink(previous)
 
-    # 16.2 Failure-Atomicity Campaign
-    row_failure = _run_failure_atomicity_campaign(run_id, profile)
-    all_rows.append(row_failure)
-    append_conformance_rows(output_csv_path, [row_failure])
+    for random_seed in seeds:
+        run_traced(
+            "randomized_consistency",
+            random_seed,
+            lambda s=random_seed: _run_frame_consistency_stress_campaign(run_id, profile, s),
+        )
 
-    # 16.3 Stateful Conformance Campaign
-    row_stateful = _run_stateful_conformance_campaign(run_id, profile)
-    all_rows.append(row_stateful)
-    append_conformance_rows(output_csv_path, [row_stateful])
-
-    # 16.4 Grace-Period Deterministic Campaign (reviewer P0.4 Scenario A)
-    row_gp = _run_grace_period_deterministic_campaign(run_id)
-    all_rows.append(row_gp)
-    append_conformance_rows(output_csv_path, [row_gp])
-
-    # 16.5 Stateful-Handoff Deterministic Campaign (reviewer P0.4 Scenario B)
-    row_sh = _run_stateful_handoff_deterministic_campaign(run_id)
-    all_rows.append(row_sh)
-    append_conformance_rows(output_csv_path, [row_sh])
-
-    # 16.6 Candidate Memory-Failure Campaign (reviewer P0.4 Scenario C)
-    row_mem = _run_candidate_memory_failure_campaign(run_id)
-    all_rows.append(row_mem)
-    append_conformance_rows(output_csv_path, [row_mem])
-
-    # 16.7 Cleanup-Failure Campaign (reviewer P0.4 Scenario D)
-    row_cleanup = _run_cleanup_failure_campaign(run_id)
-    all_rows.append(row_cleanup)
-    append_conformance_rows(output_csv_path, [row_cleanup])
-
-    # 16.8 Frame-Exception Lease-Release Campaign (reviewer P0.4 Scenario E)
-    row_lease = _run_frame_exception_lease_release_campaign(run_id)
-    all_rows.append(row_lease)
-    append_conformance_rows(output_csv_path, [row_lease])
+    primary_seed = seeds[0]
+    deterministic_campaigns = (
+        ("failure_atomicity", lambda: _run_failure_atomicity_campaign(run_id, profile)),
+        ("state_policy", lambda: _run_stateful_conformance_campaign(run_id, profile)),
+        ("stateless_publication", lambda: _run_grace_period_deterministic_campaign(run_id)),
+        ("mutable_handoff", lambda: _run_stateful_handoff_deterministic_campaign(run_id)),
+        ("candidate_failure", lambda: _run_candidate_memory_failure_campaign(run_id)),
+        ("cleanup_failure", lambda: _run_cleanup_failure_campaign(run_id)),
+        ("frame_exception", lambda: _run_frame_exception_lease_release_campaign(run_id)),
+        ("successive_generation_ownership", lambda: _run_successive_generation_ownership_campaign(run_id)),
+    )
+    for campaign_id, campaign in deterministic_campaigns:
+        run_traced(campaign_id, primary_seed, campaign)
 
     return tuple(all_rows)
+
+
+def _run_successive_generation_ownership_campaign(run_id: str) -> ConformanceResultRow:
+    """Preserve twice, remove once, while first-generation cleanup is blocked."""
+    from nedo_vision_dag_engine.processor import Processor
+    from tests.support.processors import (
+        PassOutput,
+        STATELESS_PASS_DESCRIPTOR,
+        STATELESS_SOURCE_DESCRIPTOR,
+        make_source_processor,
+    )
+    from tests.support.tracker import (
+        SYNTHETIC_TRACKER_DESCRIPTOR,
+        SYNTHETIC_TRACKER_STATEFUL_DESCRIPTOR,
+        SyntheticTracker,
+        make_synthetic_tracker,
+    )
+    from tests.support.workflows import source_only
+
+    cleanup_entered = Event()
+    cleanup_release = Event()
+    cleanup_count = 0
+    tracker_instances: list[Processor] = []
+    lifecycle_log = LifecycleLog()
+
+    class BlockingCleanupPass:
+        descriptor = STATELESS_PASS_DESCRIPTOR
+
+        def setup(self, context: SetupContext) -> None:
+            pass
+
+        def process(self, inputs: object, context: FrameContext) -> object:
+            return PassOutput(value=context.frame_id)
+
+        def healthcheck(self) -> None:
+            pass
+
+        def cleanup(self) -> None:
+            nonlocal cleanup_count
+            cleanup_count += 1
+            cleanup_entered.set()
+            if not cleanup_release.wait(timeout=10.0):
+                raise TimeoutError("blocked cleanup was never released")
+
+    def cleanup_attempts() -> int:
+        return cleanup_count
+
+    def tracker_factory() -> Processor:
+        tracker = make_synthetic_tracker()
+        tracker_instances.append(tracker)
+        return tracker
+
+    builder = RegistryBuilder()
+    builder.register(
+        RegisteredProcessorType(
+            SYNTHETIC_TRACKER_DESCRIPTOR,
+            tracker_factory,
+            SYNTHETIC_TRACKER_STATEFUL_DESCRIPTOR,
+        )
+    )
+    builder.register(RegisteredProcessorType(STATELESS_PASS_DESCRIPTOR, BlockingCleanupPass))
+    builder.register(
+        RegisteredProcessorType(
+            STATELESS_SOURCE_DESCRIPTOR,
+            lambda: make_source_processor(lifecycle_log, label="replacement"),
+        )
+    )
+    registry = builder.snapshot()
+    compiler = WorkflowCompiler("0.1.0")
+    initial = compiler.compile(
+        tracker_then_pass(SYNTHETIC_TRACKER_DESCRIPTOR.type_name), registry
+    )
+    assert isinstance(initial, CompiledCandidate)
+    tracker = initial.plan.step_by_node_id("tracker")
+    assert tracker is not None
+    original_tracker = tracker.processor_ref
+    executor = PipelineExecutor(initial.plan)
+    controller = ReconfigurationController(executor, compiler, registry)
+    violations = 0
+
+    try:
+        controller.submit(
+            ReconfigurationRequest(
+                "preserve-1",
+                1,
+                tracker_only(SYNTHETIC_TRACKER_DESCRIPTOR.type_name),
+                StateDirective(),
+                time.monotonic_ns(),
+            )
+        )
+        if controller.wait_for_status(
+            "preserve-1", frozenset({ReconfigurationStatus.READY}), 5.0
+        ) is None:
+            raise TimeoutError("first preserve candidate was not ready")
+        first = controller.admit_frame(time.monotonic_ns(), 1)
+        if first.status is not FrameStatus.COMPLETED:
+            violations += 1
+        if not cleanup_entered.wait(timeout=5.0):
+            raise TimeoutError("superseded cleanup did not block")
+
+        plan_two_tracker = controller.active_plan.step_by_node_id("tracker")
+        if plan_two_tracker is None or plan_two_tracker.processor_ref is not original_tracker:
+            violations += 1
+
+        controller.submit(
+            ReconfigurationRequest(
+                "preserve-2",
+                2,
+                tracker_only(SYNTHETIC_TRACKER_DESCRIPTOR.type_name),
+                StateDirective(),
+                time.monotonic_ns(),
+            )
+        )
+        if controller.wait_for_status(
+            "preserve-2", frozenset({ReconfigurationStatus.READY}), 5.0
+        ) is None:
+            raise TimeoutError("second preserve candidate was not ready")
+        second = controller.admit_frame(time.monotonic_ns(), 2)
+        if second.status is not FrameStatus.COMPLETED or second.plan_version != 3:
+            violations += 1
+        plan_three_tracker = controller.active_plan.step_by_node_id("tracker")
+        if plan_three_tracker is None or plan_three_tracker.processor_ref is not original_tracker:
+            violations += 1
+
+        controller.submit(
+            ReconfigurationRequest(
+                "remove",
+                3,
+                source_only(),
+                StateDirective(),
+                time.monotonic_ns(),
+            )
+        )
+        if controller.wait_for_status(
+            "remove", frozenset({ReconfigurationStatus.READY}), 5.0
+        ) is None:
+            raise TimeoutError("remove candidate was not ready")
+        replacement = controller.admit_frame(time.monotonic_ns(), 3)
+        if replacement.status is not FrameStatus.COMPLETED or replacement.plan_version != 4:
+            violations += 1
+        if controller.active_plan.step_by_node_id("tracker") is not None:
+            violations += 1
+
+        # Frames on generations 3 and 4 completed while generation-1 cleanup
+        # was still blocked, proving retirement is off the serving path.
+        if cleanup_release.is_set():
+            violations += 1
+        cleanup_release.set()
+        for request_id in ("preserve-1", "remove"):
+            record = controller.wait_for_retirement(request_id, 5.0)
+            if record is None or record.retirement_status is not RetirementStatus.COMPLETED:
+                violations += 1
+        if cleanup_attempts() != 1:
+            violations += 1
+        only_tracker = tracker_instances[0] if len(tracker_instances) == 1 else None
+        if (
+            not isinstance(only_tracker, SyntheticTracker)
+            or only_tracker.snapshot_state().cleanup_count != 1
+        ):
+            violations += 1
+    finally:
+        cleanup_release.set()
+        controller.close()
+
+    frame_events = executor.instrumentation.frame_events()
+    completed = sum(1 for event in frame_events if event.status is FrameStatus.COMPLETED)
+    return ConformanceResultRow(
+        run_id=run_id,
+        campaign_id="successive_generation_ownership",
+        scenario_id="conformance_successive_generation_ownership",
+        scenario_type="ownership",
+        frames_submitted=len(frame_events),
+        frames_completed=completed,
+        reconfigurations_requested=3,
+        reconfigurations_committed=3,
+        reconfigurations_rejected=0,
+        reconfigurations_failed=0,
+        mixed_plan_frames=0,
+        missing_frames=0,
+        duplicate_frames=0,
+        retired_plan_executions=0,
+        invalid_routing_events=0,
+        state_continuity_failures=violations,
+        unexpected_state_resets=0,
+        active_plan_changed_after_failed_candidate=0,
+        candidate_resource_leaks=0,
+        processor_instance_leaks=0,
+        grace_period_safety_violations=0,
+        stateful_handoff_ordering_failures=0,
+        resource_lifetime_violations=violations,
+        terminal_status="PASS" if violations == 0 else "FAIL",
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -234,24 +445,29 @@ def _run_frame_consistency_stress_campaign(
     frames_admitted = 0
     duplicate_frames = 0
     results_by_frame_id: dict[int, tuple[int, tuple[str, ...], FrameStatus]] = {}
+    producer_errors: list[BaseException] = []
 
     def frame_producer() -> None:
         nonlocal frames_admitted, duplicate_frames
-        fid = 0
-        while not frame_worker_stop.is_set() and fid < target_frames:
-            result = controller.admit_frame(admitted_at_ns=0, frame_id=fid)
+        try:
+            fid = 0
+            while not frame_worker_stop.is_set() and fid < target_frames:
+                result = controller.admit_frame(admitted_at_ns=0, frame_id=fid)
+                with progress_lock:
+                    if fid in seen_frame_ids:
+                        duplicate_frames += 1
+                    seen_frame_ids.add(fid)
+                    results_by_frame_id[fid] = (
+                        result.plan_version,
+                        result.executed_node_ids,
+                        result.status,
+                    )
+                    frames_admitted += 1
+                fid += 1
+                time.sleep(0.0001)
+        except BaseException as error:
             with progress_lock:
-                if fid in seen_frame_ids:
-                    duplicate_frames += 1
-                seen_frame_ids.add(fid)
-                results_by_frame_id[fid] = (
-                    result.plan_version,
-                    result.executed_node_ids,
-                    result.status,
-                )
-                frames_admitted += 1
-            fid += 1
-            time.sleep(0.0001)
+                producer_errors.append(error)
 
     producer_thread = Thread(target=frame_producer, daemon=True)
     producer_thread.start()
@@ -291,15 +507,30 @@ def _run_frame_consistency_stress_campaign(
 
         time.sleep(0.001)
 
-    frame_worker_stop.set()
-    producer_thread.join()
+    producer_thread.join(timeout=120.0)
+    if producer_thread.is_alive():
+        frame_worker_stop.set()
+        producer_thread.join(timeout=5.0)
+        controller.close()
+        raise TimeoutError(
+            f"randomized campaign did not reach its {target_frames}-frame target"
+        )
 
     with progress_lock:
         observed_frame_ids = set(seen_frame_ids)
         frame_results = dict(results_by_frame_id)
         duplicate_frame_count = duplicate_frames
+        captured_producer_errors = tuple(producer_errors)
     with observation_lock:
         recorded_observations = tuple(observations)
+    if captured_producer_errors:
+        controller.close()
+        raise RuntimeError("randomized conformance producer failed") from captured_producer_errors[0]
+    if len(frame_results) != target_frames:
+        controller.close()
+        raise RuntimeError(
+            f"randomized campaign produced {len(frame_results)} frames; expected {target_frames}"
+        )
 
     frames_completed = sum(
         1 for _, _, status in frame_results.values() if status is FrameStatus.COMPLETED

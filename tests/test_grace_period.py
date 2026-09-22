@@ -314,10 +314,8 @@ def test_plan_lifecycle_active_to_superseded_to_retired() -> None:
     registry = _stateless_registry(events)
     compiler = WorkflowCompiler("test")
     initial = _compile_initial(compiler, registry, _linear_specification())
-    executor = PipelineExecutor(initial.plan)
-    controller = ReconfigurationController(
-        executor, compiler, registry, clock=IncrementingClock()
-    )
+    executor = PipelineExecutor(initial.plan, clock=IncrementingClock())
+    controller = ReconfigurationController(executor, compiler, registry)
 
     try:
         # Submit a reconfiguration that replaces the consumer
@@ -392,10 +390,8 @@ def test_grace_period_timestamps_recorded_on_retirement() -> None:
     registry = _stateless_registry(events)
     compiler = WorkflowCompiler("test")
     initial = _compile_initial(compiler, registry, _linear_specification())
-    executor = PipelineExecutor(initial.plan)
-    controller = ReconfigurationController(
-        executor, compiler, registry, clock=IncrementingClock()
-    )
+    executor = PipelineExecutor(initial.plan, clock=IncrementingClock())
+    controller = ReconfigurationController(executor, compiler, registry)
 
     try:
         new_spec = _source_only_specification()
@@ -434,10 +430,8 @@ def test_retirement_not_required_when_no_processors_retired() -> None:
     registry = _stateless_registry(events)
     compiler = WorkflowCompiler("test")
     initial = _compile_initial(compiler, registry, _linear_specification())
-    executor = PipelineExecutor(initial.plan)
-    controller = ReconfigurationController(
-        executor, compiler, registry, clock=IncrementingClock()
-    )
+    executor = PipelineExecutor(initial.plan, clock=IncrementingClock())
+    controller = ReconfigurationController(executor, compiler, registry)
 
     try:
         # Submit the same specification — all processors reused
@@ -473,10 +467,8 @@ def test_retirement_is_idempotent_via_cleaned_plans_guard() -> None:
     registry = _stateless_registry(events)
     compiler = WorkflowCompiler("test")
     initial = _compile_initial(compiler, registry, _linear_specification())
-    executor = PipelineExecutor(initial.plan)
-    controller = ReconfigurationController(
-        executor, compiler, registry, clock=IncrementingClock()
-    )
+    executor = PipelineExecutor(initial.plan, clock=IncrementingClock())
+    controller = ReconfigurationController(executor, compiler, registry)
 
     try:
         new_spec = _source_only_specification()
@@ -513,10 +505,8 @@ def test_handoff_required_when_stateful_processor_preserved() -> None:
     initial = _compile_initial(
         compiler, registry, _linear_specification(consumer_type="tracker")
     )
-    executor = PipelineExecutor(initial.plan)
-    controller = ReconfigurationController(
-        executor, compiler, registry, clock=IncrementingClock()
-    )
+    executor = PipelineExecutor(initial.plan, clock=IncrementingClock())
+    controller = ReconfigurationController(executor, compiler, registry)
 
     try:
         # Admit one frame first so the tracker gets state
@@ -552,10 +542,8 @@ def test_handoff_not_required_when_only_stateless_processors_reused() -> None:
     registry = _stateless_registry(events)
     compiler = WorkflowCompiler("test")
     initial = _compile_initial(compiler, registry, _linear_specification())
-    executor = PipelineExecutor(initial.plan)
-    controller = ReconfigurationController(
-        executor, compiler, registry, clock=IncrementingClock()
-    )
+    executor = PipelineExecutor(initial.plan, clock=IncrementingClock())
+    controller = ReconfigurationController(executor, compiler, registry)
 
     try:
         # Submit the exact same spec — stateless reuse only
@@ -587,10 +575,8 @@ def test_boundary_commit_result_includes_handoff_info() -> None:
     initial = _compile_initial(
         compiler, registry, _linear_specification(consumer_type="tracker")
     )
-    executor = PipelineExecutor(initial.plan)
-    controller = ReconfigurationController(
-        executor, compiler, registry, clock=IncrementingClock()
-    )
+    executor = PipelineExecutor(initial.plan, clock=IncrementingClock())
+    controller = ReconfigurationController(executor, compiler, registry)
 
     try:
         controller.admit_frame(1)
@@ -631,10 +617,8 @@ def test_stateful_preservation_does_not_mix_old_and_new_state() -> None:
     initial = _compile_initial(
         compiler, registry, _linear_specification(consumer_type="tracker")
     )
-    executor = PipelineExecutor(initial.plan)
-    controller = ReconfigurationController(
-        executor, compiler, registry, clock=IncrementingClock()
-    )
+    executor = PipelineExecutor(initial.plan, clock=IncrementingClock())
+    controller = ReconfigurationController(executor, compiler, registry)
 
     try:
         # Admit a frame on the initial plan (version 1)
@@ -707,9 +691,7 @@ def test_stateful_handoff_drains_old_access_before_publication() -> None:
     initial = _compile_initial(compiler, registry, specification)
     tracker = initial.plan.steps[0].processor_ref
     executor = ObservingExecutor(initial.plan)
-    controller = ReconfigurationController(
-        executor, compiler, registry, clock=IncrementingClock()
-    )
+    controller = ReconfigurationController(executor, compiler, registry)
     commit_results: list[BoundaryCommitResult | None] = []
     new_frame_results: list[FrameResult] = []
 
@@ -792,10 +774,8 @@ def test_handoff_drain_timeout_fails_the_request_and_keeps_the_active_plan() -> 
     specification = _source_only_specification("tracker")
     initial = _compile_initial(compiler, registry, specification)
     tracker = initial.plan.steps[0].processor_ref
-    executor = PipelineExecutor(initial.plan)
-    controller = ReconfigurationController(
-        executor, compiler, registry, clock=IncrementingClock()
-    )
+    executor = PipelineExecutor(initial.plan, clock=IncrementingClock())
+    controller = ReconfigurationController(executor, compiler, registry)
     commit_results: list[BoundaryCommitResult | None] = []
 
     with patch.object(reconfiguration, "HANDOFF_DRAIN_TIMEOUT_SECONDS", 0.05):
@@ -1013,9 +993,7 @@ def test_cleanup_deferred_until_old_frame_completes_end_to_end() -> None:
     assert isinstance(cand, CompiledCandidate)
     clock = IncrementingClock()
     executor = PipelineExecutor(cand.plan, clock=clock)
-    controller = ReconfigurationController(
-        executor, compiler, registry, clock=clock
-    )
+    controller = ReconfigurationController(executor, compiler, registry)
 
     try:
         # Admit a frame through the controller. It blocks inside process()
@@ -1101,10 +1079,8 @@ def test_memory_error_in_factory_cleans_candidate_and_keeps_active_plan() -> Non
     registry = _stateless_registry(events)
     compiler = WorkflowCompiler("test")
     initial = _compile_initial(compiler, registry, _linear_specification())
-    executor = PipelineExecutor(initial.plan)
-    controller = ReconfigurationController(
-        executor, compiler, registry, clock=IncrementingClock()
-    )
+    executor = PipelineExecutor(initial.plan, clock=IncrementingClock())
+    controller = ReconfigurationController(executor, compiler, registry)
 
     try:
         # Build a replacement spec that references a bad factory
@@ -1265,10 +1241,8 @@ def test_cleanup_exception_does_not_uncommit_plan() -> None:
     registry = builder.snapshot()
     compiler = WorkflowCompiler("test")
     initial = _compile_initial(compiler, registry, _linear_specification())
-    executor = PipelineExecutor(initial.plan)
-    controller = ReconfigurationController(
-        executor, compiler, registry, clock=IncrementingClock()
-    )
+    executor = PipelineExecutor(initial.plan, clock=IncrementingClock())
+    controller = ReconfigurationController(executor, compiler, registry)
 
     try:
         # Admit one frame on the initial plan

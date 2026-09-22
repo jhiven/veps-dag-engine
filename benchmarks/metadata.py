@@ -29,6 +29,7 @@ class RunMetadata:
     run_id: str
     utc_start_datetime: str
     benchmark_command: str
+    exact_argument_vector: tuple[str, ...]
     selected_suites: tuple[str, ...]
     selected_scenarios: tuple[str, ...]
     git_commit: str
@@ -59,6 +60,7 @@ class RunMetadata:
     equivalence_margins: dict[str, float]
     scenario_ordering_policy: str
     workload_calibration: dict[str, Any]
+    provenance: dict[str, Any]
 
     @classmethod
     def create(
@@ -78,13 +80,16 @@ class RunMetadata:
         registry_snapshot_identifiers: dict[str, str],
         compiler_version: str,
         workload_calibration: dict[str, Any],
+        exact_argument_vector: tuple[str, ...] = (),
+        provenance: dict[str, Any] | None = None,
     ) -> RunMetadata:
         return cls(
-            artifact_schema_version="1.6.0",
+            artifact_schema_version="2.0.0",
             benchmark_suite_version="0.1.0",
             run_id=run_id,
             utc_start_datetime=utc_start_datetime,
             benchmark_command=benchmark_command,
+            exact_argument_vector=exact_argument_vector,
             selected_suites=selected_suites,
             selected_scenarios=selected_scenarios,
             git_commit=env.git_commit,
@@ -115,6 +120,7 @@ class RunMetadata:
             equivalence_margins={"relative_margin": 0.01},
             scenario_ordering_policy="counterbalanced_seeded_random",
             workload_calibration=workload_calibration,
+            provenance={} if provenance is None else provenance,
         )
 
 
@@ -166,6 +172,7 @@ def load_run_json(path: str) -> RunMetadata:
         run_id=str(d["run_id"]),
         utc_start_datetime=str(d["utc_start_datetime"]),
         benchmark_command=str(d["benchmark_command"]),
+        exact_argument_vector=tuple(str(value) for value in d["exact_argument_vector"]),
         selected_suites=tuple(str(x) for x in d["selected_suites"]),
         selected_scenarios=tuple(str(x) for x in d["selected_scenarios"]),
         git_commit=str(d["git_commit"]),
@@ -205,6 +212,7 @@ def load_run_json(path: str) -> RunMetadata:
             str(k): _parse_workload_calibration(v)
             for k, v in d["workload_calibration"].items()
         },
+        provenance={str(k): v for k, v in d.get("provenance", {}).items()},
     )
 
 

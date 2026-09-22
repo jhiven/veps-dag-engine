@@ -7,6 +7,7 @@ from enum import Enum
 
 from nedo_vision_dag_engine.plan import ExecutionPlan
 from nedo_vision_dag_engine.processor import Processor
+from nedo_vision_dag_engine.instrumentation import emit_runtime_evidence
 
 __all__ = [
     "CleanupReason",
@@ -210,10 +211,24 @@ def _cleanup_targets(
             continue
         seen_processor_identities.add(processor_identity)
         attempted_node_ids.append(target.node_id)
+        emit_runtime_evidence(
+            "processor_cleanup_attempted",
+            node_id=target.node_id,
+            processor_instance_id=f"0x{processor_identity:x}",
+            outcome=reason.value,
+        )
 
         try:
             target.processor_ref.cleanup()
         except Exception as error:
+            emit_runtime_evidence(
+                "processor_cleanup_failed",
+                node_id=target.node_id,
+                processor_instance_id=f"0x{processor_identity:x}",
+                outcome=reason.value,
+                error_type=type(error).__name__,
+                error_message=str(error),
+            )
             failures.append(
                 ProcessorCleanupFailure(
                     node_id=target.node_id,
@@ -224,6 +239,12 @@ def _cleanup_targets(
             )
         else:
             cleaned_node_ids.append(target.node_id)
+            emit_runtime_evidence(
+                "processor_cleanup_completed",
+                node_id=target.node_id,
+                processor_instance_id=f"0x{processor_identity:x}",
+                outcome=reason.value,
+            )
 
     return CleanupReport(
         reason=reason,

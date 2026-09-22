@@ -310,26 +310,18 @@ class FileVideoSource(FrameSource):
             is_measured = self._inside_measurement_window
 
             if is_measured:
-                # Decide which phase counter to increment
                 if self._pre_request_source_frames_received < self._pre_request_target:
                     self._pre_request_source_frames_received += 1
                 elif not self._first_candidate_output_completed:
                     self._transition_source_frames_received += 1
                 else:
-                    if self._post_effect_source_frames_received >= self._post_effect_target:
-                        self._measurement_stopped = True
-                        self._measurement_end_timestamp_ns = time.monotonic_ns()
-                        return None
                     self._post_effect_source_frames_received += 1
-                    if self._post_effect_source_frames_received == self._post_effect_target:
-                        self._measurement_stopped = True
-                        self._measurement_end_timestamp_ns = time.monotonic_ns()
 
-                self._measurement_source_frames_received = (
-                    self._pre_request_source_frames_received
-                    + self._transition_source_frames_received
-                    + self._post_effect_source_frames_received
-                )
+                self._measurement_source_frames_received += 1
+                if self._measurement_source_frames_received >= self._measurement_source_frame_target:
+                    self._measurement_stopped = True
+                    self._inside_measurement_window = False
+                    self._measurement_end_timestamp_ns = time.monotonic_ns()
 
         if self._is_synthetic or self._vframes is None:
             if self._current_frame_id >= 1000:
@@ -353,7 +345,7 @@ class FileVideoSource(FrameSource):
                 inside_measurement_window=is_measured,
                 media_pts_ns=pts,
                 receiver_ingress_timestamp_ns=now_ns,
-                enqueue_decision_timestamp_ns=now_ns,
+                enqueue_decision_timestamp_ns=None,
                 media_frame_index=self._current_frame_id,
             )
 
@@ -379,7 +371,7 @@ class FileVideoSource(FrameSource):
             inside_measurement_window=is_measured,
             media_pts_ns=pts,
             receiver_ingress_timestamp_ns=now_ns,
-            enqueue_decision_timestamp_ns=now_ns,
+            enqueue_decision_timestamp_ns=None,
             media_frame_index=self._current_frame_id,
         )
 
@@ -590,26 +582,18 @@ class RTSPVideoSource(FrameSource):
                     if is_measured and self._measurement_start_timestamp_ns is None:
                         self._measurement_start_timestamp_ns = time.monotonic_ns()
                     if is_measured:
-                        # Decide which phase counter to increment
                         if self._pre_request_source_frames_received < self._pre_request_target:
                             self._pre_request_source_frames_received += 1
                         elif not self._first_candidate_output_completed:
                             self._transition_source_frames_received += 1
                         else:
-                            if self._post_effect_source_frames_received >= self._post_effect_target:
-                                self._measurement_stopped = True
-                                self._measurement_end_timestamp_ns = time.monotonic_ns()
-                                return None
                             self._post_effect_source_frames_received += 1
-                            if self._post_effect_source_frames_received == self._post_effect_target:
-                                self._measurement_stopped = True
-                                self._measurement_end_timestamp_ns = time.monotonic_ns()
 
-                        self._measurement_source_frames_received = (
-                            self._pre_request_source_frames_received
-                            + self._transition_source_frames_received
-                            + self._post_effect_source_frames_received
-                        )
+                        self._measurement_source_frames_received += 1
+                        if self._measurement_source_frames_received >= self._measurement_source_frame_target:
+                            self._measurement_stopped = True
+                            self._inside_measurement_window = False
+                            self._measurement_end_timestamp_ns = time.monotonic_ns()
 
                     self._current_frame_id = fid
 

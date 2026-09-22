@@ -205,6 +205,14 @@ def append_reconfiguration_rows(
             _format_optional_int(row.handoff_wait_ns),
             _format_optional_int(row.cleanup_duration_ns),
             _format_optional_int(row.last_old_frame_completed_ns),
+            str(row.frames_offered),
+            str(row.frames_completed),
+            str(row.frames_failed_execution),
+            str(row.frames_ingress_overflow),
+            str(row.frames_intentionally_cancelled),
+            str(row.frames_admission_rejected),
+            str(row.frames_still_queued_or_in_flight),
+            str(row.frame_accounting_residual),
         ]
         for row in rows
     ]
@@ -276,6 +284,14 @@ def read_reconfiguration_rows(path: str) -> tuple[ReconfigurationSampleRow, ...]
                     handoff_wait_ns=_parse_optional_int(d.get("handoff_wait_ns")),
                     cleanup_duration_ns=_parse_optional_int(d.get("cleanup_duration_ns")),
                     last_old_frame_completed_ns=_parse_optional_int(d.get("last_old_frame_completed_ns")),
+                    frames_offered=int(d.get("frames_offered", 0)),
+                    frames_completed=int(d.get("frames_completed", 0)),
+                    frames_failed_execution=int(d.get("frames_failed_execution", 0)),
+                    frames_ingress_overflow=int(d.get("frames_ingress_overflow", 0)),
+                    frames_intentionally_cancelled=int(d.get("frames_intentionally_cancelled", 0)),
+                    frames_admission_rejected=int(d.get("frames_admission_rejected", 0)),
+                    frames_still_queued_or_in_flight=int(d.get("frames_still_queued_or_in_flight", 0)),
+                    frame_accounting_residual=int(d.get("frame_accounting_residual", 0)),
                 )
             )
     return tuple(rows)

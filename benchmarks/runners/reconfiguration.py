@@ -8,6 +8,14 @@ from dataclasses import dataclass
 from queue import Full, Queue
 from threading import Event, Lock, Thread
 
+from benchmarks.admission import (
+    AdmissionGate,
+    FrameAccountingSnapshot,
+    OfferedFrameAccounting,
+    WorkerErrors,
+    drain_queue,
+    wait_until,
+)
 from benchmarks.model import (
     ReconfigurationSampleRow,
     compute_critical_path_decomposition,
@@ -192,80 +200,99 @@ def _run_reconfig_repetition(
 
     stop_producer = Event()
     stop_worker = Event()
-    worker_paused = Event()
+    admission_gate = AdmissionGate()
+    worker_errors = WorkerErrors()
+    accounting = OfferedFrameAccounting()
+    operation_timeout_seconds = 10.0
+    intentional_cancellation_count = 0
 
     dropped_frame_count = 0
     drop_lock = Lock()
 
     def producer_loop() -> None:
         nonlocal dropped_frame_count
-        fid = 0
-        while not stop_producer.is_set():
-            arr_ns = time.perf_counter_ns()
-            try:
-                frame_queue.put_nowait((fid, arr_ns))
+        try:
+            fid = 0
+            while not stop_producer.is_set():
+                arr_ns = time.perf_counter_ns()
+                offered_id = fid
                 fid += 1
-            except Full:
-                with drop_lock:
-                    dropped_frame_count += 1
-            time.sleep(inter_arrival_s)
+                accounting.offer(offered_id)
+                try:
+                    frame_queue.put_nowait((offered_id, arr_ns))
+                except Full:
+                    accounting.classify(offered_id, "ingress_overflow")
+                    with drop_lock:
+                        dropped_frame_count += 1
+                time.sleep(inter_arrival_s)
+        except BaseException as error:
+            worker_errors.capture(error)
+            stop_worker.set()
 
     t_producer = Thread(target=producer_loop, daemon=True)
     t_producer.start()
+
+    def finish_accounting() -> FrameAccountingSnapshot:
+        pending = drain_queue(frame_queue)
+        return accounting.snapshot({frame_id for frame_id, _ in pending})
 
     if baseline == "stop_rebuild_restart":
         current_executor = PipelineExecutor(initial_plan=initial_plan)
 
         def worker_loop_restart() -> None:
-            nonlocal current_executor
-            while not stop_worker.is_set():
-                if worker_paused.is_set():
-                    time.sleep(0.0001)
-                    continue
-                try:
-                    fid, arr_ns = frame_queue.get(timeout=0.005)
-                except Exception:
-                    continue
-                # Double-check: the main thread may have paused us while we
-                # were blocked inside get().  Skip this dequeued frame so
-                # that no old-plan frame is admitted after the pause signal.
-                if worker_paused.is_set():
-                    continue
-                t_adm = time.perf_counter_ns()
-                res = current_executor.admit_frame(admitted_at_ns=arr_ns, frame_id=fid)
-                t_comp = time.perf_counter_ns()
-                with log_lock:
-                    frame_log.append(
-                        FrameLogEntry(
-                            frame_id=fid,
-                            plan_version=res.plan_version,
-                            arrival_ns=arr_ns,
-                            admission_ns=t_adm,
-                            completion_ns=t_comp,
-                            status=res.status,
-                            error=res.error,
+            nonlocal current_executor, intentional_cancellation_count
+            try:
+                while not stop_worker.is_set():
+                    try:
+                        fid, arr_ns = frame_queue.get(timeout=0.005)
+                    except Exception:
+                        continue
+                    if not admission_gate.try_enter():
+                        accounting.classify(fid, "intentional_queue_cancellation")
+                        with drop_lock:
+                            intentional_cancellation_count += 1
+                        continue
+                    try:
+                        t_adm = time.perf_counter_ns()
+                        res = current_executor.admit_frame(admitted_at_ns=arr_ns, frame_id=fid)
+                        t_comp = time.perf_counter_ns()
+                    finally:
+                        admission_gate.leave()
+                    with log_lock:
+                        frame_log.append(
+                            FrameLogEntry(
+                                frame_id=fid,
+                                plan_version=res.plan_version,
+                                arrival_ns=arr_ns,
+                                admission_ns=t_adm,
+                                completion_ns=t_comp,
+                                status=res.status,
+                                error=res.error,
+                            )
                         )
+                    accounting.classify(
+                        fid,
+                        "completed" if res.status is FrameStatus.COMPLETED else "failed_execution",
                     )
+            except BaseException as error:
+                worker_errors.capture(error)
+                stop_producer.set()
 
         t_worker = Thread(target=worker_loop_restart, daemon=True)
         t_worker.start()
 
-        # Warmup: wait for 5 frames
-        while True:
-            with log_lock:
-                if len(frame_log) >= 5:
-                    break
-            time.sleep(0.0001)
+        wait_until(lambda: len(frame_log) >= 5, timeout_seconds=operation_timeout_seconds,
+                   description="Stop warm-up frames", errors=worker_errors)
 
         t_request = time.perf_counter_ns()
 
         t_adm_stop_start = time.perf_counter_ns()
-        worker_paused.set()
-        while True:
-            try:
-                frame_queue.get_nowait()
-            except Exception:
-                break
+        admission_gate.close_and_drain(operation_timeout_seconds)
+        cancelled = drain_queue(frame_queue)
+        for cancelled_id, _ in cancelled:
+            accounting.classify(cancelled_id, "intentional_queue_cancellation")
+        with drop_lock:
+            intentional_cancellation_count += len(cancelled)
         t_adm_stop_end = time.perf_counter_ns()
 
         # The same compiler instance that produced the base plan, compiled
@@ -311,29 +338,29 @@ def _run_reconfig_repetition(
         t_pub_end = time.perf_counter_ns()
 
         t_restart_start = time.perf_counter_ns()
-        worker_paused.clear()
+        admission_gate.open()
         t_restart_end = time.perf_counter_ns()
 
         old_plan_version = initial_plan.version
         new_plan_version = initial_plan.version + 1
 
-        while True:
-            with log_lock:
-                if any(e.plan_version == cand.plan.version for e in frame_log):
-                    break
-            time.sleep(0.0001)
+        wait_until(lambda: any(e.plan_version == cand.plan.version for e in frame_log),
+                   timeout_seconds=operation_timeout_seconds,
+                   description="Stop first new-plan frame", errors=worker_errors)
 
         target_total = len(frame_log) + 5
-        while True:
-            with log_lock:
-                if len(frame_log) >= target_total:
-                    break
-            time.sleep(0.0001)
+        wait_until(lambda: len(frame_log) >= target_total,
+                   timeout_seconds=operation_timeout_seconds,
+                   description="Stop target frames", errors=worker_errors)
 
         stop_producer.set()
         stop_worker.set()
-        t_producer.join()
-        t_worker.join()
+        t_producer.join(timeout=operation_timeout_seconds)
+        t_worker.join(timeout=operation_timeout_seconds)
+        if t_producer.is_alive() or t_worker.is_alive():
+            raise TimeoutError("Stop benchmark threads did not terminate")
+        worker_errors.raise_if_any()
+        accounting_snapshot = finish_accounting()
         _require_all_frames_completed(frame_log, scenario_id, baseline)
 
         adm_stop_ns = t_adm_stop_end - t_adm_stop_start
@@ -457,6 +484,14 @@ def _run_reconfig_repetition(
             unattributed_request_time_ns=decomp.unattributed_critical_path_ns,
             instrumented_duration_overlap_ns=decomp.instrumented_duration_overlap_ns,
             instrumented_duration_outside_effect_window_ns=decomp.instrumented_duration_outside_effect_window_ns,
+            frames_offered=accounting_snapshot.offered,
+            frames_completed=accounting_snapshot.completed,
+            frames_failed_execution=accounting_snapshot.failed_execution,
+            frames_ingress_overflow=accounting_snapshot.ingress_overflow,
+            frames_intentionally_cancelled=accounting_snapshot.intentional_queue_cancellation,
+            frames_admission_rejected=accounting_snapshot.admission_rejection,
+            frames_still_queued_or_in_flight=accounting_snapshot.still_queued_or_in_flight,
+            frame_accounting_residual=accounting_snapshot.residual,
         )
         validate_reconfiguration_sample(row)
         return row
@@ -465,54 +500,59 @@ def _run_reconfig_repetition(
         current_executor = PipelineExecutor(initial_plan=initial_plan)
 
         def worker_loop_pause() -> None:
-            while not stop_worker.is_set():
-                if worker_paused.is_set():
-                    time.sleep(0.0001)
-                    continue
-                try:
-                    fid, arr_ns = frame_queue.get(timeout=0.005)
-                except Exception:
-                    continue
-                # Double-check: the main thread may have paused us while we
-                # were blocked inside get().  Skip this dequeued frame so
-                # that no old-plan frame is admitted after the pause signal.
-                if worker_paused.is_set():
-                    continue
-                t_adm = time.perf_counter_ns()
-                res = current_executor.admit_frame(admitted_at_ns=arr_ns, frame_id=fid)
-                t_comp = time.perf_counter_ns()
-                with log_lock:
-                    frame_log.append(
-                        FrameLogEntry(
-                            frame_id=fid,
-                            plan_version=res.plan_version,
-                            arrival_ns=arr_ns,
-                            admission_ns=t_adm,
-                            completion_ns=t_comp,
-                            status=res.status,
-                            error=res.error,
+            nonlocal intentional_cancellation_count
+            try:
+                while not stop_worker.is_set():
+                    try:
+                        fid, arr_ns = frame_queue.get(timeout=0.005)
+                    except Exception:
+                        continue
+                    if not admission_gate.try_enter():
+                        accounting.classify(fid, "intentional_queue_cancellation")
+                        with drop_lock:
+                            intentional_cancellation_count += 1
+                        continue
+                    try:
+                        t_adm = time.perf_counter_ns()
+                        res = current_executor.admit_frame(admitted_at_ns=arr_ns, frame_id=fid)
+                        t_comp = time.perf_counter_ns()
+                    finally:
+                        admission_gate.leave()
+                    with log_lock:
+                        frame_log.append(
+                            FrameLogEntry(
+                                frame_id=fid,
+                                plan_version=res.plan_version,
+                                arrival_ns=arr_ns,
+                                admission_ns=t_adm,
+                                completion_ns=t_comp,
+                                status=res.status,
+                                error=res.error,
+                            )
                         )
+                    accounting.classify(
+                        fid,
+                        "completed" if res.status is FrameStatus.COMPLETED else "failed_execution",
                     )
+            except BaseException as error:
+                worker_errors.capture(error)
+                stop_producer.set()
 
         t_worker = Thread(target=worker_loop_pause, daemon=True)
         t_worker.start()
 
-        # Warmup: wait for 5 frames
-        while True:
-            with log_lock:
-                if len(frame_log) >= 5:
-                    break
-            time.sleep(0.0001)
+        wait_until(lambda: len(frame_log) >= 5, timeout_seconds=operation_timeout_seconds,
+                   description="Pause warm-up frames", errors=worker_errors)
 
         t_request = time.perf_counter_ns()
 
         t_adm_stop_start = time.perf_counter_ns()
-        worker_paused.set()
-        while True:
-            try:
-                frame_queue.get_nowait()
-            except Exception:
-                break
+        admission_gate.close_and_drain(operation_timeout_seconds)
+        cancelled = drain_queue(frame_queue)
+        for cancelled_id, _ in cancelled:
+            accounting.classify(cancelled_id, "intentional_queue_cancellation")
+        with drop_lock:
+            intentional_cancellation_count += len(cancelled)
         t_adm_stop_end = time.perf_counter_ns()
 
         t_val_start = time.perf_counter_ns()
@@ -539,29 +579,29 @@ def _run_reconfig_repetition(
             raise RuntimeError(f"pause_compile_resume processor retirement failed: {retire_report.failures}")
 
         t_restart_start = time.perf_counter_ns()
-        worker_paused.clear()
+        admission_gate.open()
         t_restart_end = time.perf_counter_ns()
 
         old_plan_version = initial_plan.version
         new_plan_version = cand.plan.version
 
-        while True:
-            with log_lock:
-                if any(e.plan_version == cand.plan.version for e in frame_log):
-                    break
-            time.sleep(0.0001)
+        wait_until(lambda: any(e.plan_version == cand.plan.version for e in frame_log),
+                   timeout_seconds=operation_timeout_seconds,
+                   description="Pause first new-plan frame", errors=worker_errors)
 
         target_total = len(frame_log) + 5
-        while True:
-            with log_lock:
-                if len(frame_log) >= target_total:
-                    break
-            time.sleep(0.0001)
+        wait_until(lambda: len(frame_log) >= target_total,
+                   timeout_seconds=operation_timeout_seconds,
+                   description="Pause target frames", errors=worker_errors)
 
         stop_producer.set()
         stop_worker.set()
-        t_producer.join()
-        t_worker.join()
+        t_producer.join(timeout=operation_timeout_seconds)
+        t_worker.join(timeout=operation_timeout_seconds)
+        if t_producer.is_alive() or t_worker.is_alive():
+            raise TimeoutError("Pause benchmark threads did not terminate")
+        worker_errors.raise_if_any()
+        accounting_snapshot = finish_accounting()
         _require_all_frames_completed(frame_log, scenario_id, baseline)
 
         adm_stop_ns = t_adm_stop_end - t_adm_stop_start
@@ -674,6 +714,14 @@ def _run_reconfig_repetition(
             unattributed_request_time_ns=decomp.unattributed_critical_path_ns,
             instrumented_duration_overlap_ns=decomp.instrumented_duration_overlap_ns,
             instrumented_duration_outside_effect_window_ns=decomp.instrumented_duration_outside_effect_window_ns,
+            frames_offered=accounting_snapshot.offered,
+            frames_completed=accounting_snapshot.completed,
+            frames_failed_execution=accounting_snapshot.failed_execution,
+            frames_ingress_overflow=accounting_snapshot.ingress_overflow,
+            frames_intentionally_cancelled=accounting_snapshot.intentional_queue_cancellation,
+            frames_admission_rejected=accounting_snapshot.admission_rejection,
+            frames_still_queued_or_in_flight=accounting_snapshot.still_queued_or_in_flight,
+            frame_accounting_residual=accounting_snapshot.residual,
         )
         validate_reconfiguration_sample(row)
         return row
@@ -683,36 +731,40 @@ def _run_reconfig_repetition(
         controller = ReconfigurationController(executor=current_executor, compiler=init_compiler, registry=registry)
 
         def worker_loop_prepare() -> None:
-            while not stop_worker.is_set():
-                try:
-                    fid, arr_ns = frame_queue.get(timeout=0.005)
-                except Exception:
-                    continue
-                t_adm = time.perf_counter_ns()
-                res = controller.admit_frame(admitted_at_ns=t_adm, frame_id=fid)
-                t_comp = time.perf_counter_ns()
-                with log_lock:
-                    frame_log.append(
-                        FrameLogEntry(
-                            frame_id=fid,
-                            plan_version=res.plan_version,
-                            arrival_ns=arr_ns,
-                            admission_ns=t_adm,
-                            completion_ns=t_comp,
-                            status=res.status,
-                            error=res.error,
+            try:
+                while not stop_worker.is_set():
+                    try:
+                        fid, arr_ns = frame_queue.get(timeout=0.005)
+                    except Exception:
+                        continue
+                    t_adm = time.perf_counter_ns()
+                    res = controller.admit_frame(admitted_at_ns=t_adm, frame_id=fid)
+                    t_comp = time.perf_counter_ns()
+                    with log_lock:
+                        frame_log.append(
+                            FrameLogEntry(
+                                frame_id=fid,
+                                plan_version=res.plan_version,
+                                arrival_ns=arr_ns,
+                                admission_ns=t_adm,
+                                completion_ns=t_comp,
+                                status=res.status,
+                                error=res.error,
+                            )
                         )
+                    accounting.classify(
+                        fid,
+                        "completed" if res.status is FrameStatus.COMPLETED else "failed_execution",
                     )
+            except BaseException as error:
+                worker_errors.capture(error)
+                stop_producer.set()
 
         t_worker = Thread(target=worker_loop_prepare, daemon=True)
         t_worker.start()
 
-        # Warmup: wait for 5 frames
-        while True:
-            with log_lock:
-                if len(frame_log) >= 5:
-                    break
-            time.sleep(0.0001)
+        wait_until(lambda: len(frame_log) >= 5, timeout_seconds=operation_timeout_seconds,
+                   description="VEPS warm-up frames", errors=worker_errors)
 
         t_request = time.perf_counter_ns()
 
@@ -745,16 +797,18 @@ def _run_reconfig_repetition(
 
         # Wait for 5 more frames after effect
         target_total = len(frame_log) + 5
-        while True:
-            with log_lock:
-                if len(frame_log) >= target_total:
-                    break
-            time.sleep(0.0001)
+        wait_until(lambda: len(frame_log) >= target_total,
+                   timeout_seconds=operation_timeout_seconds,
+                   description="VEPS target frames", errors=worker_errors)
 
         stop_producer.set()
         stop_worker.set()
-        t_producer.join()
-        t_worker.join()
+        t_producer.join(timeout=operation_timeout_seconds)
+        t_worker.join(timeout=operation_timeout_seconds)
+        if t_producer.is_alive() or t_worker.is_alive():
+            raise TimeoutError("VEPS benchmark threads did not terminate")
+        worker_errors.raise_if_any()
+        accounting_snapshot = finish_accounting()
         _require_all_frames_completed(frame_log, scenario_id, baseline)
         controller.close()
 
@@ -947,6 +1001,14 @@ def _run_reconfig_repetition(
             unattributed_request_time_ns=decomp_prep.unattributed_critical_path_ns,
             instrumented_duration_overlap_ns=decomp_prep.instrumented_duration_overlap_ns,
             instrumented_duration_outside_effect_window_ns=decomp_prep.instrumented_duration_outside_effect_window_ns,
+            frames_offered=accounting_snapshot.offered,
+            frames_completed=accounting_snapshot.completed,
+            frames_failed_execution=accounting_snapshot.failed_execution,
+            frames_ingress_overflow=accounting_snapshot.ingress_overflow,
+            frames_intentionally_cancelled=accounting_snapshot.intentional_queue_cancellation,
+            frames_admission_rejected=accounting_snapshot.admission_rejection,
+            frames_still_queued_or_in_flight=accounting_snapshot.still_queued_or_in_flight,
+            frame_accounting_residual=accounting_snapshot.residual,
             grace_period_ns=grace_period_ns_val,
             handoff_wait_ns=handoff_wait_ns_val,
             cleanup_duration_ns=cleanup_duration_ns_val,

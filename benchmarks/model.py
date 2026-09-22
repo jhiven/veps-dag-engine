@@ -94,6 +94,14 @@ class ReconfigurationSampleRow:
     handoff_wait_ns: int | None = None
     cleanup_duration_ns: int | None = None
     last_old_frame_completed_ns: int | None = None
+    frames_offered: int = 0
+    frames_completed: int = 0
+    frames_failed_execution: int = 0
+    frames_ingress_overflow: int = 0
+    frames_intentionally_cancelled: int = 0
+    frames_admission_rejected: int = 0
+    frames_still_queued_or_in_flight: int = 0
+    frame_accounting_residual: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,6 +193,19 @@ def compute_critical_path_decomposition(
 
 
 def validate_reconfiguration_sample(row: ReconfigurationSampleRow, tolerance_ns: int = 10_000_000) -> None:
+    if row.frames_offered:
+        accounted = (
+            row.frames_completed
+            + row.frames_failed_execution
+            + row.frames_ingress_overflow
+            + row.frames_intentionally_cancelled
+            + row.frames_admission_rejected
+            + row.frames_still_queued_or_in_flight
+        )
+        if row.frames_offered - accounted != row.frame_accounting_residual:
+            raise ValueError("offered-frame accounting residual is inconsistent")
+        if row.frame_accounting_residual != 0:
+            raise ValueError("offered-frame accounting residual must be zero")
     durations = (
         row.validation_ns,
         row.preparation_ns,
@@ -614,6 +635,14 @@ RECONFIGURATION_HEADERS: tuple[str, ...] = (
     "handoff_wait_ns",
     "cleanup_duration_ns",
     "last_old_frame_completed_ns",
+    "frames_offered",
+    "frames_completed",
+    "frames_failed_execution",
+    "frames_ingress_overflow",
+    "frames_intentionally_cancelled",
+    "frames_admission_rejected",
+    "frames_still_queued_or_in_flight",
+    "frame_accounting_residual",
 )
 
 ABLATION_HEADERS: tuple[str, ...] = (
