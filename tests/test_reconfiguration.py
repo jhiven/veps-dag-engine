@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass, replace
 from threading import Event, Lock, Thread
 
@@ -19,7 +18,7 @@ from nedo_vision_dag_engine.processor import (
     StatefulProcessorDescriptor,
     TransitionContext,
 )
-from nedo_vision_dag_engine.instrumentation import RetirementStatus
+from nedo_vision_dag_engine.instrumentation import FrameStatus, RetirementStatus
 from nedo_vision_dag_engine.reconfiguration import (
     ReconfigurationController,
     ReconfigurationInProgress,
@@ -343,6 +342,75 @@ def test_ready_candidate_commits_before_next_frame_and_records_effect() -> None:
         controller.close()
 
 
+def test_first_effect_requires_a_successful_new_plan_frame() -> None:
+    flaky_descriptor = ProcessorDescriptor(
+        type_name="flaky_source",
+        input_schema=object,
+        output_schema=ValueOutput,
+        config_schema=EmptyConfig,
+        state_policy=StatePolicy.STATELESS,
+        state_schema_version=None,
+    )
+
+    class FlakySource(RecordingProcessor):
+        def __init__(self) -> None:
+            super().__init__(flaky_descriptor, [], "flaky")
+            self._attempts = 0
+
+        def process(self, inputs: object, context: FrameContext) -> object:
+            self._attempts += 1
+            if self._attempts == 1:
+                raise RuntimeError("injected first-frame failure")
+            return ValueOutput(1)
+
+    builder = RegistryBuilder()
+    builder.register(
+        RegisteredProcessorType(
+            descriptor=SOURCE_DESCRIPTOR,
+            factory=lambda: RecordingProcessor(SOURCE_DESCRIPTOR, [], "source"),
+        )
+    )
+    builder.register(
+        RegisteredProcessorType(
+            descriptor=flaky_descriptor,
+            factory=FlakySource,
+        )
+    )
+    registry = builder.snapshot()
+    compiler = WorkflowCompiler("test")
+    initial = _compile_initial(compiler, registry, _source_only_specification())
+    clock = IncrementingClock()
+    executor = PipelineExecutor(initial.plan, clock=clock)
+    controller = ReconfigurationController(executor, compiler, registry, clock=clock)
+
+    try:
+        controller.submit(
+            _request("flaky", 1, _source_only_specification("flaky_source"))
+        )
+        ready = controller.wait_for_status(
+            "flaky",
+            frozenset({ReconfigurationStatus.READY}),
+            timeout_seconds=2.0,
+        )
+        assert ready is not None
+
+        failed = controller.admit_frame(10, 10)
+        assert failed.status is FrameStatus.FAILED
+        after_failure = controller.record("flaky")
+        assert after_failure.first_new_frame_admitted_ns is None
+        assert after_failure.first_new_frame_completed_ns is None
+        assert controller.wait_for_effect("flaky", timeout_seconds=0.01) is None
+
+        completed = controller.admit_frame(11, 11)
+        assert completed.status is FrameStatus.COMPLETED
+        effect = controller.wait_for_effect("flaky", timeout_seconds=1.0)
+        assert effect is not None
+        assert effect.first_new_frame_admitted_ns == 11
+        assert effect.first_new_frame_completed_ns is not None
+    finally:
+        controller.close()
+
+
 def test_stale_candidate_is_cleaned_without_replacing_active_plan() -> None:
     events: list[str] = []
     registry = _stateless_registry(events)
@@ -622,7 +690,7 @@ def test_second_request_is_rejected_while_first_is_ready() -> None:
         controller.close()
 
 
-def test_executor_plan_swap_waits_for_in_flight_frame() -> None:
+def test_executor_plan_swap_completes_while_old_frame_is_in_flight() -> None:
     entered = Event()
     release = Event()
     processor = BlockingProcessor(entered, release)
@@ -654,9 +722,9 @@ def test_executor_plan_swap_waits_for_in_flight_frame() -> None:
     frame_thread.start()
     assert entered.wait(timeout=1.0)
     commit_thread.start()
-    time.sleep(0.05)
-
-    assert not swap_finished.is_set()
+    assert swap_finished.wait(timeout=1.0)
+    assert not release.is_set()
+    assert executor.active_plan.version == 2
     release.set()
     frame_thread.join(timeout=1.0)
     commit_thread.join(timeout=1.0)
@@ -674,14 +742,13 @@ def test_submit_does_not_block_during_frame_execution() -> None:
     controller = ReconfigurationController(executor, compiler, registry, clock=IncrementingClock())
 
     try:
-        # We need a blocking frame to simulate an in-flight execution.
-        # If we just acquire `_execution_lock`, `submit` should still succeed immediately
-        # because `submit` only acquires `_plan_lock` indirectly via `active_plan_snapshot`.
-        execution_lock = getattr(executor, "_execution_lock")
-        with execution_lock:
+        # Candidate submission only needs a plan snapshot. It must not depend
+        # on the lock that protects processor execution and the workspace pool.
+        frame_execution_lock = getattr(executor, "_frame_execution_lock")
+        with frame_execution_lock:
             # We are currently executing a frame
             controller.submit(_request("nonblocking", 1, _linear_specification()))
-            # If submit blocked on _execution_lock, it would deadlock here.
+            # If submit blocked on the frame-execution lock, it would deadlock here.
             # Thus, the test will hang if it's broken.
     finally:
         controller.close()
@@ -766,7 +833,7 @@ def test_old_token_invalid_after_controller_recreated() -> None:
         controller_b.close()
 
 
-def test_claim_management_waits_for_unmanaged_frame() -> None:
+def test_claim_management_does_not_invalidate_an_already_admitted_frame() -> None:
     frame_started = Event()
     frame_release = Event()
 
@@ -809,8 +876,8 @@ def test_claim_management_waits_for_unmanaged_frame() -> None:
     t_claim = Thread(target=claim_worker, daemon=True)
     t_claim.start()
 
-    time.sleep(0.05)
-    assert not claim_done.is_set()
+    assert claim_done.wait(timeout=1.0)
+    assert not frame_release.is_set()
 
     frame_release.set()
     t.join()

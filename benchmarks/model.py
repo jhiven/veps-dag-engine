@@ -230,8 +230,16 @@ def validate_reconfiguration_sample(row: ReconfigurationSampleRow, tolerance_ns:
             raise ValueError("prepare_and_commit executor_restart_ns must be 0")
         if row.publication_ns is not None and row.commit_ns is not None and row.publication_ns != row.commit_ns:
             raise ValueError("prepare_and_commit publication_ns must equal commit_ns")
-        if row.total_synchronous_ns is not None and row.publication_ns is not None and row.total_synchronous_ns != row.publication_ns:
-            raise ValueError("prepare_and_commit total_synchronous_ns must equal publication_ns")
+        # Synchronized admission work is publication plus, when a mutable
+        # processor is preserved, the pre-publication drain. The two intervals
+        # are disjoint, so neither may be counted inside the other.
+        if row.total_synchronous_ns is not None and row.publication_ns is not None:
+            expected_synchronous_ns = row.publication_ns + (row.handoff_wait_ns or 0)
+            if row.total_synchronous_ns != expected_synchronous_ns:
+                raise ValueError(
+                    "prepare_and_commit total_synchronous_ns must equal "
+                    "publication_ns plus handoff_wait_ns"
+                )
         if not row.phases_may_overlap:
             raise ValueError("prepare_and_commit phases_may_overlap must be True")
 

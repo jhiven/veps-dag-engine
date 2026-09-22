@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import gc
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from queue import Full, Queue
 from threading import Event, Lock, Thread
 
@@ -22,7 +22,7 @@ from benchmarks.scenarios import (
 from benchmarks.storage import append_reconfiguration_rows, write_reconfiguration_header
 from nedo_vision_dag_engine.compiler import CompiledCandidate, CompilationFailure, StateDirective, WorkflowCompiler
 from nedo_vision_dag_engine.executor import PipelineExecutor
-from nedo_vision_dag_engine.instrumentation import RetirementStatus
+from nedo_vision_dag_engine.instrumentation import FrameStatus, RetirementStatus
 from nedo_vision_dag_engine.lifecycle import retire_superseded_processors
 from nedo_vision_dag_engine.reconfiguration import (
     ReconfigurationController,
@@ -41,6 +41,28 @@ class FrameLogEntry:
     arrival_ns: int
     admission_ns: int
     completion_ns: int
+    status: FrameStatus
+    error: str | None
+
+
+def _require_all_frames_completed(
+    frame_log: list[FrameLogEntry],
+    scenario_id: str,
+    baseline: str,
+) -> None:
+    """Abort the run if any frame errored instead of producing an output.
+
+    A mis-wired scenario graph makes every frame fail while the timing
+    instrumentation keeps reporting plausible numbers, so the failure is
+    invisible unless it is checked explicitly.
+    """
+    failed = [entry for entry in frame_log if entry.status is not FrameStatus.COMPLETED]
+    if not failed:
+        return
+    raise RuntimeError(
+        f"{len(failed)} of {len(frame_log)} frames failed in scenario "
+        f"{scenario_id!r} under baseline {baseline!r}; first error: {failed[0].error}"
+    )
 
 
 def _compute_maximum_output_gap_ns(frame_log: list[FrameLogEntry]) -> int | None:
@@ -220,6 +242,8 @@ def _run_reconfig_repetition(
                             arrival_ns=arr_ns,
                             admission_ns=t_adm,
                             completion_ns=t_comp,
+                            status=res.status,
+                            error=res.error,
                         )
                     )
 
@@ -244,24 +268,23 @@ def _run_reconfig_repetition(
                 break
         t_adm_stop_end = time.perf_counter_ns()
 
-        compiler = WorkflowCompiler("0.1.0")
-
+        # The same compiler instance that produced the base plan, compiled
+        # against that plan: all three mechanisms must apply one compatibility
+        # and state policy, so Stop differs only by where the work happens.
         t_val_start = time.perf_counter_ns()
-        validated = compiler.validate(target_spec, registry)
+        validated = init_compiler.validate(target_spec, registry)
         t_val_end = time.perf_counter_ns()
         if isinstance(validated, CompilationFailure):
             raise RuntimeError(f"Validation failed: {validated.reason}")
 
         t_prep_start = time.perf_counter_ns()
-        cand = compiler.compile_validated(validated, previous_plan=None, state_directive=state_directive)
+        cand = init_compiler.compile_validated(
+            validated, previous_plan=initial_plan, state_directive=state_directive
+        )
         t_prep_end = time.perf_counter_ns()
 
         if not isinstance(cand, CompiledCandidate):
             raise RuntimeError("Candidate compilation failed.")
-
-        new_version = initial_plan.version + 1
-        new_plan = replace(cand.plan, version=new_version)
-        cand = replace(cand, plan=new_plan)
 
         # Executor teardown: the synthetic benchmark has no external resources
         # (GPU, file descriptors) to release; teardown is the cost of abandoning
@@ -311,6 +334,7 @@ def _run_reconfig_repetition(
         stop_worker.set()
         t_producer.join()
         t_worker.join()
+        _require_all_frames_completed(frame_log, scenario_id, baseline)
 
         adm_stop_ns = t_adm_stop_end - t_adm_stop_start
         val_ns = t_val_end - t_val_start
@@ -465,6 +489,8 @@ def _run_reconfig_repetition(
                             arrival_ns=arr_ns,
                             admission_ns=t_adm,
                             completion_ns=t_comp,
+                            status=res.status,
+                            error=res.error,
                         )
                     )
 
@@ -536,6 +562,7 @@ def _run_reconfig_repetition(
         stop_worker.set()
         t_producer.join()
         t_worker.join()
+        _require_all_frames_completed(frame_log, scenario_id, baseline)
 
         adm_stop_ns = t_adm_stop_end - t_adm_stop_start
         val_ns = t_val_end - t_val_start
@@ -672,6 +699,8 @@ def _run_reconfig_repetition(
                             arrival_ns=arr_ns,
                             admission_ns=t_adm,
                             completion_ns=t_comp,
+                            status=res.status,
+                            error=res.error,
                         )
                     )
 
@@ -726,6 +755,7 @@ def _run_reconfig_repetition(
         stop_worker.set()
         t_producer.join()
         t_worker.join()
+        _require_all_frames_completed(frame_log, scenario_id, baseline)
         controller.close()
 
         val_ns = (
@@ -744,9 +774,20 @@ def _run_reconfig_repetition(
             if record.commit_started_ns and record.ready_ns
             else 0
         )
+        handoff_wait_ns_val: int | None = None
+        if record.handoff_wait_start_ns is not None and record.handoff_wait_complete_ns is not None:
+            handoff_wait_ns_val = max(0, record.handoff_wait_complete_ns - record.handoff_wait_start_ns)
+        # commit_started_ns precedes the conditional handoff drain, so measuring
+        # publication from it would report the drain twice once the drain is
+        # added back as its own synchronized phase.
+        publication_start_ns = (
+            record.handoff_wait_complete_ns
+            if record.handoff_wait_complete_ns is not None
+            else record.commit_started_ns
+        )
         pub_ns = (
-            record.commit_ns - record.commit_started_ns
-            if record.commit_ns and record.commit_started_ns
+            max(0, record.commit_ns - publication_start_ns)
+            if record.commit_ns and publication_start_ns
             else 0
         )
         commit_ns = pub_ns
@@ -830,8 +871,10 @@ def _run_reconfig_repetition(
             phase_intervals_prep.append((record.preparation_started_ns, record.preparation_completed_ns))
         if record.ready_ns and record.commit_started_ns:
             phase_intervals_prep.append((record.ready_ns, record.commit_started_ns))
-        if record.commit_started_ns and record.commit_ns:
-            phase_intervals_prep.append((record.commit_started_ns, record.commit_ns))
+        if record.handoff_wait_start_ns and record.handoff_wait_complete_ns:
+            phase_intervals_prep.append((record.handoff_wait_start_ns, record.handoff_wait_complete_ns))
+        if publication_start_ns and record.commit_ns:
+            phase_intervals_prep.append((publication_start_ns, record.commit_ns))
         if record.commit_ns and first_new_frame.admission_ns >= record.commit_ns:
             phase_intervals_prep.append((record.commit_ns, first_new_frame.admission_ns))
         phase_intervals_prep.append((first_new_frame.admission_ns, first_new_frame.completion_ns))
@@ -844,16 +887,15 @@ def _run_reconfig_repetition(
             phase_intervals=phase_intervals_prep,
         )
 
-        total_sync_ns = pub_ns
+        # Synchronized admission work: the drain (when a mutable processor is
+        # preserved) plus publication. The two intervals are disjoint.
+        total_sync_ns = pub_ns + (handoff_wait_ns_val or 0)
         phases_may_overlap = True
 
         # Extract new grace-period and handoff engine instrumentation
         grace_period_ns_val: int | None = None
         if record.grace_period_start_ns is not None and record.grace_period_complete_ns is not None:
             grace_period_ns_val = max(0, record.grace_period_complete_ns - record.grace_period_start_ns)
-        handoff_wait_ns_val: int | None = None
-        if record.handoff_wait_start_ns is not None and record.handoff_wait_complete_ns is not None:
-            handoff_wait_ns_val = max(0, record.handoff_wait_complete_ns - record.handoff_wait_start_ns)
         cleanup_duration_ns_val: int | None = None
         if record.cleanup_start_ns is not None and record.cleanup_end_ns is not None:
             cleanup_duration_ns_val = max(0, record.cleanup_end_ns - record.cleanup_start_ns)

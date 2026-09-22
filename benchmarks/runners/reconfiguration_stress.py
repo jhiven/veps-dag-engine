@@ -46,7 +46,7 @@ from nedo_vision_dag_engine.compiler import (
     WorkflowCompiler,
 )
 from nedo_vision_dag_engine.executor import PipelineExecutor
-from nedo_vision_dag_engine.instrumentation import RetirementStatus
+from nedo_vision_dag_engine.instrumentation import FrameStatus, RetirementStatus
 from nedo_vision_dag_engine.lifecycle import retire_superseded_processors
 from nedo_vision_dag_engine.reconfiguration import (
     ReconfigurationController,
@@ -105,6 +105,28 @@ class FrameLogEntry:
     arrival_ns: int
     admission_ns: int
     completion_ns: int
+    status: FrameStatus
+    error: str | None
+
+
+def _require_all_frames_completed(
+    frame_log: list[FrameLogEntry],
+    scenario_id: str,
+    baseline: str,
+) -> None:
+    """Abort the run if any frame errored instead of producing an output.
+
+    A mis-wired scenario graph makes every frame fail while the timing
+    instrumentation keeps reporting plausible numbers, so the failure is
+    invisible unless it is checked explicitly.
+    """
+    failed = [entry for entry in frame_log if entry.status is not FrameStatus.COMPLETED]
+    if not failed:
+        return
+    raise RuntimeError(
+        f"{len(failed)} of {len(frame_log)} frames failed in scenario "
+        f"{scenario_id!r} under baseline {baseline!r}; first error: {failed[0].error}"
+    )
 
 
 def _compute_maximum_output_gap_ns(frame_log: list[FrameLogEntry]) -> int | None:
@@ -220,6 +242,8 @@ def _run_stress_repetition(
                             arrival_ns=arr_ns,
                             admission_ns=t_adm,
                             completion_ns=t_comp,
+                            status=res.status,
+                            error=res.error,
                         )
                     )
 
@@ -302,6 +326,7 @@ def _run_stress_repetition(
         stop_worker.set()
         t_producer.join()
         t_worker.join()
+        _require_all_frames_completed(frame_log, scenario_id, baseline)
 
         adm_stop_ns = t_adm_stop_end - t_adm_stop_start
         val_ns = t_val_end - t_val_start
@@ -446,6 +471,8 @@ def _run_stress_repetition(
                             arrival_ns=arr_ns,
                             admission_ns=t_adm,
                             completion_ns=t_comp,
+                            status=res.status,
+                            error=res.error,
                         )
                     )
 
@@ -514,6 +541,7 @@ def _run_stress_repetition(
         stop_worker.set()
         t_producer.join()
         t_worker.join()
+        _require_all_frames_completed(frame_log, scenario_id, baseline)
 
         adm_stop_ns = t_adm_stop_end - t_adm_stop_start
         val_ns = t_val_end - t_val_start
@@ -643,6 +671,8 @@ def _run_stress_repetition(
                             arrival_ns=arr_ns,
                             admission_ns=t_adm,
                             completion_ns=t_comp,
+                            status=res.status,
+                            error=res.error,
                         )
                     )
 
@@ -691,6 +721,7 @@ def _run_stress_repetition(
         stop_worker.set()
         t_producer.join()
         t_worker.join()
+        _require_all_frames_completed(frame_log, scenario_id, baseline)
         controller.close()
 
         val_ns = (

@@ -273,8 +273,7 @@ class BlockingSourceProcessor:
 
     Used to test frame-boundary concurrency: a test can start a frame,
     then attempt a plan commit from another thread while process is
-    blocked, and verify that the commit does not happen until the frame
-    exits.
+    blocked, and verify lease-protected publication and retirement ordering.
     """
 
     __slots__ = (

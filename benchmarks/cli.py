@@ -304,6 +304,9 @@ def run_benchmarks(
             )
             row_counts["interference-samples.csv"] = _count_csv_data_rows(interference_csv)
             sha256_dict["interference-samples.csv"] = _calculate_file_sha256(interference_csv)
+            interference_frame_csv = os.path.join(run_dir, "interference-frame-samples.csv")
+            row_counts["interference-frame-samples.csv"] = _count_csv_data_rows(interference_frame_csv)
+            sha256_dict["interference-frame-samples.csv"] = _calculate_file_sha256(interference_frame_csv)
 
         if "realworld-video" in selected_suites:
             from usecases.video_analytics.contracts import ExecutionMode
@@ -324,6 +327,9 @@ def run_benchmarks(
             )
             row_counts["realworld-video-samples.csv"] = _count_csv_data_rows(rw_video_csv)
             sha256_dict["realworld-video-samples.csv"] = _calculate_file_sha256(rw_video_csv)
+            rw_video_frame_csv = os.path.join(run_dir, "realworld-video-frame-samples.csv")
+            row_counts["realworld-video-frame-samples.csv"] = _count_csv_data_rows(rw_video_frame_csv)
+            sha256_dict["realworld-video-frame-samples.csv"] = _calculate_file_sha256(rw_video_frame_csv)
 
         # Generate summary, tables, and figures for selected suite data
         summary_csv = os.path.join(run_dir, "summary.csv")
