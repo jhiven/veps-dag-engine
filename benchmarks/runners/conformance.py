@@ -334,6 +334,7 @@ class _NodeObservation:
 def _observing_reconfiguration_registry(
     observations: list[_NodeObservation],
     observation_lock: Lock,
+    jitter: _ScheduleJitter,
 ) -> RegistrySnapshot:
     """Registry whose processors record the plan version they executed under.
 
@@ -357,27 +358,67 @@ def _observing_reconfiguration_registry(
             RegisteredProcessorType(
                 descriptor=descriptor,
                 factory=lambda d=descriptor: _ObservingWorkloadProcessor(
-                    d, observations, observation_lock
+                    d, observations, observation_lock, jitter
                 ),
             )
         )
     return builder.snapshot()
 
 
+class _ScheduleJitter:
+    """Seeded delays that let a frame stay in flight across a publication.
+
+    Synthetic processors finish in microseconds, so an admitted frame almost
+    never still holds its lease when another thread reaches the admission gate.
+    Stretching a small, seeded fraction of invocations past the commit path is
+    what makes the campaign sample the post-publication boundary instead of only
+    the quiet interval between frames.
+    """
+
+    __slots__ = ("_delayed_invocations", "_lock", "_maximum_seconds", "_probability", "_random")
+
+    def __init__(
+        self,
+        seed: int,
+        probability: float = 0.08,
+        maximum_seconds: float = 0.0015,
+    ) -> None:
+        self._random = random.Random(seed)
+        self._lock = Lock()
+        self._probability = probability
+        self._maximum_seconds = maximum_seconds
+        self._delayed_invocations = 0
+
+    def wait(self) -> None:
+        with self._lock:
+            if self._random.random() >= self._probability:
+                return
+            delay = self._random.uniform(self._maximum_seconds / 5.0, self._maximum_seconds)
+            self._delayed_invocations += 1
+        time.sleep(delay)
+
+    @property
+    def delayed_invocations(self) -> int:
+        with self._lock:
+            return self._delayed_invocations
+
+
 class _ObservingWorkloadProcessor:
     """A pass-through processor that records every invocation it performs."""
 
-    __slots__ = ("_lock", "_node_id", "_observations", "descriptor")
+    __slots__ = ("_jitter", "_lock", "_node_id", "_observations", "descriptor")
 
     def __init__(
         self,
         descriptor: ProcessorDescriptor,
         observations: list[_NodeObservation],
         observation_lock: Lock,
+        jitter: _ScheduleJitter,
     ) -> None:
         self.descriptor = descriptor
         self._observations = observations
         self._lock = observation_lock
+        self._jitter = jitter
         self._node_id = ""
 
     def setup(self, context: SetupContext) -> None:
@@ -392,6 +433,7 @@ class _ObservingWorkloadProcessor:
                     plan_version=context.plan_version,
                 )
             )
+        self._jitter.wait()
         return PassOutput(value=context.frame_id)
 
     def healthcheck(self) -> None:
@@ -407,10 +449,22 @@ def _run_frame_consistency_stress_campaign(
     target_frames = 500 if profile == "smoke" else 100000
     target_reconfigs = 20 if profile == "smoke" else 1000
 
+    # Publication happens on whichever thread next reaches the admission gate.
+    # With a single admitting thread it can never overlap that thread's own
+    # frame, so the boundary is only reachable with concurrent admitters.
+    frame_worker_count = 4
+
+    # A delayed processor holds the executor's frame lock, so the delay rate is
+    # scaled to the campaign size: enough wall-clock time inside a leased frame
+    # for publications to land there, without serializing the whole campaign
+    # behind sleeps.
+    jitter_probability = 0.08 if profile == "smoke" else 0.004
+
     base_spec = make_reconfiguration_base_spec()
     observations: list[_NodeObservation] = []
     observation_lock = Lock()
-    registry = _observing_reconfiguration_registry(observations, observation_lock)
+    jitter = _ScheduleJitter(seed, probability=jitter_probability)
+    registry = _observing_reconfiguration_registry(observations, observation_lock, jitter)
 
     compiler = WorkflowCompiler("0.1.0")
     init_cand = compiler.compile(base_spec, registry)
@@ -447,11 +501,14 @@ def _run_frame_consistency_stress_campaign(
     results_by_frame_id: dict[int, tuple[int, tuple[str, ...], FrameStatus]] = {}
     producer_errors: list[BaseException] = []
 
-    def frame_producer() -> None:
+    def frame_producer(worker_index: int) -> None:
         nonlocal frames_admitted, duplicate_frames
         try:
-            fid = 0
-            while not frame_worker_stop.is_set() and fid < target_frames:
+            # Each worker owns a disjoint stride of frame ids so identities stay
+            # unique and the duplicate oracle keeps its meaning.
+            for fid in range(worker_index, target_frames, frame_worker_count):
+                if frame_worker_stop.is_set():
+                    return
                 result = controller.admit_frame(admitted_at_ns=0, frame_id=fid)
                 with progress_lock:
                     if fid in seen_frame_ids:
@@ -463,14 +520,17 @@ def _run_frame_consistency_stress_campaign(
                         result.status,
                     )
                     frames_admitted += 1
-                fid += 1
                 time.sleep(0.0001)
         except BaseException as error:
             with progress_lock:
                 producer_errors.append(error)
 
-    producer_thread = Thread(target=frame_producer, daemon=True)
-    producer_thread.start()
+    producer_threads = [
+        Thread(target=frame_producer, args=(index,), daemon=True)
+        for index in range(frame_worker_count)
+    ]
+    for thread in producer_threads:
+        thread.start()
 
     for r in range(target_reconfigs):
         with progress_lock:
@@ -490,7 +550,10 @@ def _run_frame_consistency_stress_campaign(
         )
 
         controller.submit(req)
-        rec = controller.wait_for_terminal(req.request_id, timeout_seconds=5.0)
+        # Wait for the effect, not merely a terminal status: a committed plan
+        # has not taken effect until a frame has run on it, and the controller
+        # refuses the next request until then.
+        rec = controller.wait_for_effect(req.request_id, timeout_seconds=10.0)
 
         if rec is not None:
             if rec.status == ReconfigurationStatus.COMMITTED:
@@ -507,10 +570,12 @@ def _run_frame_consistency_stress_campaign(
 
         time.sleep(0.001)
 
-    producer_thread.join(timeout=120.0)
-    if producer_thread.is_alive():
+    for thread in producer_threads:
+        thread.join(timeout=120.0)
+    if any(thread.is_alive() for thread in producer_threads):
         frame_worker_stop.set()
-        producer_thread.join(timeout=5.0)
+        for thread in producer_threads:
+            thread.join(timeout=5.0)
         controller.close()
         raise TimeoutError(
             f"randomized campaign did not reach its {target_frames}-frame target"
