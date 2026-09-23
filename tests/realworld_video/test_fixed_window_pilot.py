@@ -258,3 +258,31 @@ def test_a_boundary_without_enough_baseline_positions_is_refused() -> None:
 def test_a_negative_cutoff_is_refused() -> None:
     with pytest.raises(ValueError, match="cutoff_deadline_ns"):
         _metrics(_all_completed(), cutoff_ns=-1)
+
+
+def test_a_trigger_one_position_late_leaves_the_last_position_unobservable() -> None:
+    """Pins the off-by-one that cost 8 of 30 GPU repetitions.
+
+    The source produces exactly `WINDOW` measured positions, numbered from zero.
+    Anchoring the window on a polled counter that had already advanced past the
+    boundary shifts it one position beyond the last frame that will ever exist,
+    so that position can never be observed and the accounting cannot reconcile.
+    """
+    rows = _all_completed()
+
+    on_boundary = _metrics(rows)
+    assert on_boundary["fixed_window_start_media_frame_index"] == 0
+    assert on_boundary["fixed_window_accounting_residual"] == 0
+    assert on_boundary["fixed_window_accounting_valid"] is True
+
+    one_late = compute_fixed_window_metrics(
+        frame_rows=rows,
+        request_trigger_receiver_position=TRIGGER + 1,
+        cutoff_deadline_ns=CUTOFF_NS,
+        baseline_frame_count=BASELINE,
+        transition_frame_count=TRANSITION,
+    )
+    assert one_late["fixed_window_start_media_frame_index"] == 1
+    assert one_late["fixed_window_receiver_observed_frames"] == WINDOW - 1
+    assert one_late["fixed_window_accounting_residual"] == 1
+    assert one_late["fixed_window_accounting_valid"] is False

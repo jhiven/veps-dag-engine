@@ -996,8 +996,15 @@ def run_realworld_video_suite(
 
                         if not swap_requested and getattr(source_obj, "measurement_source_frames_received") >= reconfiguration_trigger_frame_offset:
                             swap_requested = True
-                            _request_trigger_receiver_position = int(
-                                getattr(source_obj, "measurement_source_frames_received")
+                            # The boundary is defined by the source's phase
+                            # accounting, which caps the pre-request phase at
+                            # exactly this many positions. Reading the polled
+                            # counter instead would record 61 whenever the
+                            # ingress thread advanced between the check and the
+                            # read, shifting the window one position past the
+                            # last frame the source will ever produce.
+                            _request_trigger_receiver_position = (
+                                reconfiguration_trigger_frame_offset
                             )
 
                             # Before-prep snapshot
