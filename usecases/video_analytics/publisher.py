@@ -135,22 +135,38 @@ class FFmpegRTSPPublisher(RTSPPublisherProtocol):
                     f"FFmpeg publisher exited prematurely with code {self._process.returncode}. Stderr:\n{self._captured_stderr}"
                 )
 
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(0.5)
-            try:
-                s.connect((host, port))
+            # The server's port is open from the moment it starts, so a TCP
+            # connect says nothing about this stream. Ask for the path itself:
+            # until the publisher has registered it, DESCRIBE answers 404 and a
+            # decoder attaching now would exit immediately.
+            if self._describe_succeeds(host, port, timeout_seconds=0.5):
                 ready = True
-                s.close()
                 break
-            except Exception:
-                s.close()
-                time.sleep(0.1)
+            time.sleep(0.1)
 
         if not ready:
             self.stop()
             raise RuntimeError(
-                f"Timed out waiting {timeout_seconds}s for RTSP stream at {self._rtsp_url!r} to become readable."
+                f"Timed out waiting {timeout_seconds}s for RTSP stream at {self._rtsp_url!r} "
+                "to become readable. The server did not answer DESCRIBE with 200 OK."
             )
+
+    def _describe_succeeds(self, host: str, port: int, timeout_seconds: float) -> bool:
+        """Return True when the server answers DESCRIBE for this exact path."""
+        try:
+            with socket.create_connection((host, port), timeout=timeout_seconds) as sock:
+                sock.settimeout(timeout_seconds)
+                request = (
+                    f"DESCRIBE {self._rtsp_url} RTSP/1.0\r\n"
+                    "CSeq: 1\r\n"
+                    "Accept: application/sdp\r\n"
+                    "\r\n"
+                ).encode("ascii")
+                sock.sendall(request)
+                response = sock.recv(4096).decode("ascii", errors="replace")
+        except Exception:
+            return False
+        return response.startswith("RTSP/1.0 200")
 
     def stop(self) -> None:
         """Terminate the FFmpeg publisher process cleanly with timeout and kill fallback."""

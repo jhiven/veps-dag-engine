@@ -410,6 +410,7 @@ def run_benchmarks(
                 ),
                 reconfiguration_trigger_frame_offset=baseline_receiver_frames,
                 drain_timeout_seconds=drain_timeout_seconds,
+                operation_timeout_seconds=operation_timeout_seconds,
                 queue_capacity=queue_capacity,
                 use_fake_backends=(profile == "smoke"),
                 random_seed=seed,

@@ -553,6 +553,9 @@ def run_realworld_video_suite(
     measurement_source_frames: int = 180,
     reconfiguration_trigger_frame_offset: int = 60,
     drain_timeout_seconds: float = 2.0,
+    # Upper bound on any single blocking stage of a sub-run. A stalled RTSP
+    # stream must fail the run, never hold it open indefinitely.
+    operation_timeout_seconds: float = 120.0,
     queue_capacity: int = 4,
     use_fake_backends: bool = False,
     random_seed: int = 42,
@@ -896,7 +899,14 @@ def run_realworld_video_suite(
                     warmup_completed = 0
                     warmup_admitted = 0
                     from nedo_vision_dag_engine.instrumentation import FrameStatus
+                    warmup_deadline = time.monotonic() + operation_timeout_seconds
                     while warmup_completed < warmup_completed_frames:
+                        if time.monotonic() >= warmup_deadline:
+                            raise TimeoutError(
+                                f"{mech} rep {rep}: only {warmup_completed} of "
+                                f"{warmup_completed_frames} warm-up frames completed within "
+                                f"{operation_timeout_seconds:.0f}s ({warmup_admitted} admitted)"
+                            )
                         now_ns = time.monotonic_ns()
                         app_controller_warmup: Any = getattr(app, "_controller")
                         res = app_controller_warmup.admit_frame(
@@ -972,9 +982,17 @@ def run_realworld_video_suite(
                     typed_mech = cast(Literal["VEPS", "Pause", "Stop"], mech)
 
                     # Measured window loop
+                    measurement_deadline = time.monotonic() + operation_timeout_seconds
                     while True:
                         if getattr(source_obj, "measurement_stopped", False):
                             break
+                        if time.monotonic() >= measurement_deadline:
+                            raise TimeoutError(
+                                f"{mech} rep {rep}: measurement window did not close within "
+                                f"{operation_timeout_seconds:.0f}s "
+                                f"({getattr(source_obj, 'measurement_source_frames_received', 0)} of "
+                                f"{measurement_source_frames} receiver positions observed)"
+                            )
 
                         if not swap_requested and getattr(source_obj, "measurement_source_frames_received") >= reconfiguration_trigger_frame_offset:
                             swap_requested = True
@@ -1114,7 +1132,13 @@ def run_realworld_video_suite(
                                 app_controller.submit(reconfig_req)
 
                                 if typed_mech == "VEPS":
+                                    readiness_deadline = time.monotonic() + operation_timeout_seconds
                                     while True:
+                                        if time.monotonic() >= readiness_deadline:
+                                            raise TimeoutError(
+                                                f"VEPS rep {rep}: candidate did not reach a terminal "
+                                                f"status within {operation_timeout_seconds:.0f}s"
+                                            )
                                         rec: Any = app_controller.record(req_id)
                                         if rec.status in (
                                             ReconfigurationStatus.READY,
