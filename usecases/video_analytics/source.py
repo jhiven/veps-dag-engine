@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from dataclasses import replace
 from typing import IO, Any, Callable
 
 import numpy as np
@@ -355,6 +356,7 @@ class FileVideoSource(FrameSource):
                 receiver_ingress_timestamp_ns=now_ns,
                 enqueue_decision_timestamp_ns=None,
                 media_frame_index=self._current_frame_id,
+                dequeue_timestamp_ns=now_ns,
             )
 
         if self._current_frame_id >= self._metadata.frame_count:  # type: ignore[operator]
@@ -381,6 +383,7 @@ class FileVideoSource(FrameSource):
             receiver_ingress_timestamp_ns=now_ns,
             enqueue_decision_timestamp_ns=None,
             media_frame_index=self._current_frame_id,
+            dequeue_timestamp_ns=now_ns,
         )
 
     def close(self) -> None:
@@ -686,7 +689,7 @@ class RTSPVideoSource(FrameSource):
 
         pkt = self._ingress.read()
         if pkt is not None:
-            return pkt
+            return replace(pkt, dequeue_timestamp_ns=time.monotonic_ns())
 
         # If queue is momentarily empty due to RTSP handshake/thread timing, wait up to 50ms
         start_t = time.monotonic()
@@ -694,7 +697,7 @@ class RTSPVideoSource(FrameSource):
             time.sleep(0.002)
             pkt = self._ingress.read()
             if pkt is not None:
-                return pkt
+                return replace(pkt, dequeue_timestamp_ns=time.monotonic_ns())
 
         # An empty queue means "not yet" only while the decoder is alive. Once
         # it has exited no frame can ever arrive, so returning None would invite

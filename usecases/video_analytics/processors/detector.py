@@ -87,7 +87,14 @@ class DetectorProcessor(Processor):
         batch = DetectionBatch(
             frame_id=frame_packet.frame_id,
             source_timestamp_ns=frame_packet.source_timestamp_ns,
-            admission_timestamp_ns=context.admitted_at_ns,
+            # The packet's own admission instant, not the slot request that
+            # preceded it: when the consumer outruns the source, the slot is
+            # requested before the packet it will carry has even arrived.
+            admission_timestamp_ns=(
+                frame_packet.dequeue_timestamp_ns
+                if frame_packet.dequeue_timestamp_ns is not None
+                else context.admitted_at_ns
+            ),
             detector_id=self.backend.model_id,
             plan_version=context.plan_version,
             detections=detections,

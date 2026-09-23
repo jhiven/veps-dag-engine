@@ -15,6 +15,7 @@ import time
 
 import pytest
 
+from usecases.video_analytics.contracts import FramePacket
 from usecases.video_analytics.source import RTSPVideoSource
 
 
@@ -43,7 +44,7 @@ class _EmptyIngress:
         self.queue = _EmptyIngress._Queue()
         self.source_frames_received = 0
 
-    def read(self) -> None:
+    def read(self) -> "FramePacket | None":
         return None
 
     def start(self) -> None:
@@ -138,3 +139,64 @@ def test_open_refuses_a_path_that_is_not_published() -> None:
     elapsed = time.monotonic() - started
     assert elapsed < 30.0, f"a missing RTSP path took {elapsed:.1f}s to fail"
     assert "No frame arrived" in str(failure.value)
+
+
+def test_dequeued_packet_carries_its_own_admission_instant() -> None:
+    """ingress <= enqueue <= admission must hold for every recorded frame.
+
+    The runtime admits a frame *slot* before it knows which packet will fill it.
+    When the consumer outruns the source -- the normal case on a GPU, where
+    inference is faster than the 30 fps arrival rate -- the queue is empty at
+    that moment and the packet arrives afterwards. Recording the slot's
+    timestamp as the packet's admission then reports a frame admitted before it
+    existed, which is what invalidated a full T4 campaign.
+    """
+    import time as _time
+
+    import numpy as np
+
+    class _OneShotIngress(_EmptyIngress):
+        def __init__(self) -> None:
+            super().__init__()
+            self._served = False
+
+        def read(self) -> FramePacket | None:
+            if self._served:
+                return None
+            self._served = True
+            # Enqueued now, i.e. strictly after any earlier slot request.
+            now = _time.monotonic_ns()
+            return FramePacket(
+                frame_id=1,
+                source_timestamp_ns=now,
+                image_bgr=np.zeros((4, 4, 3), dtype=np.uint8),
+                width=4,
+                height=4,
+                receiver_ingress_timestamp_ns=now,
+                enqueue_decision_timestamp_ns=now,
+            )
+
+    class _RunningProcess:
+        returncode = None
+        stdout = None
+
+        def poll(self) -> None:
+            return None
+
+    slot_requested_ns = _time.monotonic_ns()
+
+    source = RTSPVideoSource(rtsp_url="rtsp://127.0.0.1:8554/live", video_path="sample_video.mp4")
+    setattr(source, "_ingress", _OneShotIngress())
+    setattr(source, "_decoder_proc", _RunningProcess())
+
+    packet = source.read()
+    assert packet is not None
+    assert packet.dequeue_timestamp_ns is not None
+
+    # The packet reached the queue after the slot was requested ...
+    assert packet.enqueue_decision_timestamp_ns is not None
+    assert packet.enqueue_decision_timestamp_ns >= slot_requested_ns
+    # ... and its own admission instant still follows its arrival.
+    assert packet.dequeue_timestamp_ns >= packet.enqueue_decision_timestamp_ns
+    assert packet.receiver_ingress_timestamp_ns is not None
+    assert packet.dequeue_timestamp_ns >= packet.receiver_ingress_timestamp_ns

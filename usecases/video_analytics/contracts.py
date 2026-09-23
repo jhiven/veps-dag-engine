@@ -101,6 +101,11 @@ class FramePacket:
     enqueue_decision_timestamp_ns: int | None = None
     drop_decision_timestamp_ns: int | None = None
     media_frame_index: int | None = None
+    #: When this packet was taken off the ingress queue to be executed. The
+    #: runtime admits a frame *slot* before it knows which packet will fill it,
+    #: so the slot's timestamp can precede the packet's arrival whenever the
+    #: consumer outruns the source. This is the packet's own admission instant.
+    dequeue_timestamp_ns: int | None = None
 
 
     def __post_init__(self) -> None:
