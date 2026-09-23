@@ -445,7 +445,11 @@ class RTSPVideoSource(FrameSource):
                 and self._current_frame_id >= start_media_frame_index
             ):
                 raise RuntimeError(
-                    "Cannot arm a measurement boundary that the receiver has already passed"
+                    "Cannot arm a measurement boundary that the receiver has already passed: "
+                    f"asked to start at media frame {start_media_frame_index}, but the receiver "
+                    f"has already decoded {self._current_frame_id}. The stream runs in real time, "
+                    "so warm-up must finish before the receiver reaches that index. A host whose "
+                    "detector cannot keep up with the source frame rate will always overshoot it."
                 )
             self._inside_measurement_window = True
             self._measurement_start_media_frame_index = start_media_frame_index

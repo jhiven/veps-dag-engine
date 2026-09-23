@@ -92,6 +92,26 @@ def _calculate_file_sha256(filepath: str) -> str:
     return h.hexdigest()
 
 
+def _align_torch_threads_with_affinity(applied_cpu_affinity: tuple[int, ...]) -> None:
+    """Size Torch's thread pool to the cores this run may actually use.
+
+    Torch fixes its pool when it is imported, which happens while the benchmark
+    modules load -- before CPU affinity is narrowed. Left alone it keeps one
+    thread per host core and then contends for the two pinned cores, which on a
+    CPU host slowed detector inference from 0.65 s to roughly 12 s per frame.
+    """
+    if not applied_cpu_affinity:
+        return
+    torch_module = sys.modules.get("torch")
+    if torch_module is None:
+        return
+    try:
+        torch_module.set_num_threads(len(applied_cpu_affinity))  # pyright: ignore[reportUnknownMemberType]
+    except Exception:
+        # Thread-pool sizing is an optimization; never fail a run over it.
+        pass
+
+
 def run_benchmarks(
     suite: str,
     profile: str = "smoke",
@@ -168,6 +188,7 @@ def run_benchmarks(
     requested_cpu_count = 1 if selected_suites == ("steady-state",) else min(2, len(available_cpus))
     pin_cpus = available_cpus[:requested_cpu_count]
     env = collect_system_environment(pin_cpus=pin_cpus)
+    _align_torch_threads_with_affinity(env.applied_cpu_affinity)
 
     # Model checkpoints must be on disk before provenance can resolve their
     # revisions, otherwise a first run on a clean host fails its own preflight
