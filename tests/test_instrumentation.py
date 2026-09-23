@@ -288,7 +288,7 @@ def test_controller_records_latest_measurement_and_state_reuse() -> None:
         instrumentation=instrumentation,
         clock=clock,
     )
-    controller = ReconfigurationController(executor, compiler, registry, clock=clock)
+    controller = ReconfigurationController(executor, compiler, registry)
 
     try:
         request = ReconfigurationRequest(

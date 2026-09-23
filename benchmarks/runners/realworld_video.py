@@ -145,7 +145,7 @@ REALWORLD_VIDEO_HEADERS = (
     "pre_request_source_frame_target",
     "pre_request_source_frames_received",
     "transition_source_frames_received",
-    "post_effect_source_frame_target",
+    "post_request_source_frame_target",
     "post_effect_source_frames_received",
     "total_measurement_source_frames_received",
     "source_frames_before_request",
@@ -170,6 +170,7 @@ REALWORLD_VIDEO_HEADERS = (
     "fixed_window_ingress_dropped_frames",
     "fixed_window_admission_rejected_frames",
     "fixed_window_execution_cancelled_frames",
+    "fixed_window_queued_frames",
     "fixed_window_frames_in_flight_at_window_end",
     "fixed_window_duplicated_frames",
     "fixed_window_old_plan_completions",
@@ -204,6 +205,7 @@ REALWORLD_VIDEO_FRAME_HEADERS = (
     "enqueue_decision_timestamp_ns",
     "drop_decision_timestamp_ns",
     "media_frame_index",
+    "receiver_position",
 )
 
 
@@ -284,7 +286,7 @@ class RealworldVideoSampleRow:
     pre_request_source_frame_target: int
     pre_request_source_frames_received: int
     transition_source_frames_received: int
-    post_effect_source_frame_target: int
+    post_request_source_frame_target: int
     post_effect_source_frames_received: int
     total_measurement_source_frames_received: int
     source_frames_before_request: int
@@ -313,6 +315,7 @@ class RealworldVideoSampleRow:
     fixed_window_ingress_dropped_frames: int = 0
     fixed_window_admission_rejected_frames: int = 0
     fixed_window_execution_cancelled_frames: int = 0
+    fixed_window_queued_frames: int = 0
     fixed_window_frames_in_flight_at_window_end: int = 0
     fixed_window_duplicated_frames: int = 0
     fixed_window_old_plan_completions: int = 0
@@ -348,6 +351,7 @@ class RealworldVideoFrameSampleRow:
     enqueue_decision_timestamp_ns: int | None
     drop_decision_timestamp_ns: int | None
     media_frame_index: int | None
+    receiver_position: int | None = None
 
 
 def _calculate_file_hash(path: str) -> str:
@@ -383,34 +387,40 @@ def _probe_video_frame_count(path: str) -> int:
 
 def compute_fixed_window_metrics(
     frame_rows: list[RealworldVideoFrameSampleRow],
-    request_trigger_media_frame_index: int,
+    request_trigger_receiver_position: int,
+    cutoff_deadline_ns: int,
     baseline_frame_count: int = 60,
     transition_frame_count: int = 150,
 ) -> dict[str, int | bool | float]:
-    """Compute source-frame-index-based fixed-window metrics.
+    """Classify one mechanism-independent receiver-position window at cutoff.
 
     Accounting equation (reviewer P0.6):
-        expected_source_frames
-        = source_frames_missing_before_receiver
-        + completed_frames
+        expected_receiver_positions
+        = completed_frames
         + ingress_dropped_frames
         + admission_rejected_frames
         + execution_cancelled_frames
+        + queued_frames
         + frames_in_flight_at_window_end
 
-    Window: indices [trigger - 60, trigger + 150), 210 expected total.
-    Uses media_frame_index as the source of truth across all mechanisms.
+    The exclusive endpoint is fixed after exactly 210 measured receiver
+    positions.  Final-drain outcomes never rewrite the cutoff classification.
     """
-    window_start = max(0, request_trigger_media_frame_index - baseline_frame_count)
-    window_end = request_trigger_media_frame_index + transition_frame_count
-    expected_frames = baseline_frame_count + transition_frame_count  # 210
+    if cutoff_deadline_ns < 0:
+        raise ValueError("cutoff_deadline_ns must be non-negative")
+    window_start = request_trigger_receiver_position - baseline_frame_count
+    window_end = request_trigger_receiver_position + transition_frame_count
+    expected_frames = baseline_frame_count + transition_frame_count
+    if window_start < 0:
+        raise ValueError("request boundary does not have enough baseline receiver positions")
 
-    # Build a map of media_frame_index → list of frame rows
+    # Build a map of receiver position → list of rows.  Sender/media identity
+    # is deliberately not inferred through FFmpeg/RTSP.
     indexed: dict[int, list[RealworldVideoFrameSampleRow]] = {}
     for row in frame_rows:
-        mfi = row.media_frame_index
-        if mfi is not None:
-            indexed.setdefault(mfi, []).append(row)
+        position = row.receiver_position
+        if position is not None and window_start <= position < window_end:
+            indexed.setdefault(position, []).append(row)
 
     # Determine old vs new plan version
     old_plan_version: int | None = None
@@ -425,23 +435,23 @@ def compute_fixed_window_metrics(
 
     # Walk every expected media frame index and classify
     receiver_observed = 0
-    missing_before_receiver = 0
     admitted = 0
     completed = 0
     ingress_dropped = 0
     admission_rejected = 0
     execution_cancelled = 0
+    queued = 0
     in_flight = 0
     duplicated = 0
     old_plan_completions = 0
     new_plan_completions = 0
 
-    for mfi in range(window_start, window_end):
-        rows = indexed.get(mfi, [])
+    for position in range(window_start, window_end):
+        rows = indexed.get(position, [])
 
         if not rows:
-            # Source frame never reached the receiver at all
-            missing_before_receiver += 1
+            # The fixed endpoint is defined by receiver positions, so a
+            # missing position means the run failed to reach its target.
             continue
 
         receiver_observed += 1
@@ -452,8 +462,9 @@ def compute_fixed_window_metrics(
 
             terminal = (row.terminal_status or "").lower()
             drop_reason = (row.drop_reason or "").lower()
+            decision_ns = row.drop_decision_timestamp_ns or row.enqueue_decision_timestamp_ns
 
-            if row.dropped:
+            if row.dropped and decision_ns is not None and decision_ns <= cutoff_deadline_ns:
                 if "ingress" in drop_reason or "overflow" in drop_reason:
                     ingress_dropped += 1
                 elif "reject" in terminal or "reject" in drop_reason:
@@ -463,23 +474,29 @@ def compute_fixed_window_metrics(
                 else:
                     # Unknown drop reason — classify as ingress for safety
                     ingress_dropped += 1
-            else:
+            elif (
+                row.admission_timestamp_ns is not None
+                and row.admission_timestamp_ns <= cutoff_deadline_ns
+            ):
                 admitted += 1
-                if row.completion_timestamp_ns is not None:
+                if (
+                    row.completion_timestamp_ns is not None
+                    and row.completion_timestamp_ns <= cutoff_deadline_ns
+                ):
                     completed += 1
                     if row.plan_version is not None:
                         if old_plan_version is not None and row.plan_version == old_plan_version:
                             old_plan_completions += 1
                         elif new_plan_version is not None and row.plan_version == new_plan_version:
                             new_plan_completions += 1
+                else:
+                    in_flight += 1
+            else:
+                queued += 1
 
-    in_flight = admitted - completed
-
-    # Accounting residual:
-    #   expected = missing + completed + ingress + rejected + cancelled + in_flight
     accounted = (
-        missing_before_receiver + completed + ingress_dropped
-        + admission_rejected + execution_cancelled + in_flight
+        completed + ingress_dropped + admission_rejected
+        + execution_cancelled + queued + in_flight
     )
     residual = expected_frames - accounted
 
@@ -487,8 +504,7 @@ def compute_fixed_window_metrics(
     #   - expected == accounted (residual == 0)
     #   - no duplicated frames
     #   - receiver_observed = expected - missing_before_receiver
-    receiver_check = receiver_observed == (expected_frames - missing_before_receiver)
-    accounting_valid = (residual == 0 and duplicated == 0 and receiver_check)
+    accounting_valid = residual == 0 and duplicated == 0 and receiver_observed == expected_frames
 
     # Ingress drop rate: ingress_dropped / receiver_observed
     ingress_drop_rate = (
@@ -505,12 +521,13 @@ def compute_fixed_window_metrics(
         "fixed_window_end_media_frame_index": window_end,
         "fixed_window_expected_source_frames": expected_frames,
         "fixed_window_receiver_observed_frames": receiver_observed,
-        "fixed_window_source_frames_missing_before_receiver": missing_before_receiver,
+        "fixed_window_source_frames_missing_before_receiver": 0,
         "fixed_window_admitted_frames": admitted,
         "fixed_window_completed_frames": completed,
         "fixed_window_ingress_dropped_frames": ingress_dropped,
         "fixed_window_admission_rejected_frames": admission_rejected,
         "fixed_window_execution_cancelled_frames": execution_cancelled,
+        "fixed_window_queued_frames": queued,
         "fixed_window_frames_in_flight_at_window_end": in_flight,
         "fixed_window_duplicated_frames": duplicated,
         "fixed_window_old_plan_completions": old_plan_completions,
@@ -536,6 +553,9 @@ def run_realworld_video_suite(
     measurement_source_frames: int = 180,
     reconfiguration_trigger_frame_offset: int = 60,
     drain_timeout_seconds: float = 2.0,
+    # Upper bound on any single blocking stage of a sub-run. A stalled RTSP
+    # stream must fail the run, never hold it open indefinitely.
+    operation_timeout_seconds: float = 120.0,
     queue_capacity: int = 4,
     use_fake_backends: bool = False,
     random_seed: int = 42,
@@ -711,6 +731,12 @@ def run_realworld_video_suite(
                     total_frames_to_process=measurement_source_frames + warmup_completed_frames + 50,
                 )
 
+                # Reset before any backend is constructed: a detector registers
+                # itself on construction, and resetting afterwards would discard
+                # that registration and leave the live counts permanently at zero.
+                CoexistenceTracker.reset()
+                CoexistenceTracker.plan_created(1) # initial version 1
+
                 init_backend: DetectorBackend | None = None
                 cand_backend: DetectorBackend | None = None
                 trk_backend: TrackerBackend | None = None
@@ -730,9 +756,6 @@ def run_realworld_video_suite(
                 # Reset peaks and synchronize at the start of each sub-run to get repetition-local peak stats
                 memory_sampler.synchronize()
                 memory_sampler.reset_peak_stats()
-
-                CoexistenceTracker.reset()
-                CoexistenceTracker.plan_created(1) # initial version 1
 
                 rep_frame_rows: list[RealworldVideoFrameSampleRow] = []
                 seen_frame_ids: set[int] = set()
@@ -876,7 +899,14 @@ def run_realworld_video_suite(
                     warmup_completed = 0
                     warmup_admitted = 0
                     from nedo_vision_dag_engine.instrumentation import FrameStatus
+                    warmup_deadline = time.monotonic() + operation_timeout_seconds
                     while warmup_completed < warmup_completed_frames:
+                        if time.monotonic() >= warmup_deadline:
+                            raise TimeoutError(
+                                f"{mech} rep {rep}: only {warmup_completed} of "
+                                f"{warmup_completed_frames} warm-up frames completed within "
+                                f"{operation_timeout_seconds:.0f}s ({warmup_admitted} admitted)"
+                            )
                         now_ns = time.monotonic_ns()
                         app_controller_warmup: Any = getattr(app, "_controller")
                         res = app_controller_warmup.admit_frame(
@@ -895,6 +925,7 @@ def run_realworld_video_suite(
                     _measurement_end_media_pts_ns: int | None = None
                     _request_trigger_media_frame_index: int | None = None
                     _request_trigger_media_pts_ns: int | None = None
+                    _request_trigger_receiver_position: int | None = None
                     _measurement_start_source_sequence: int | None = None
 
                     # 4. Start phase-normalized measurement window.
@@ -946,19 +977,30 @@ def run_realworld_video_suite(
                     t_prep_start = None
                     t_prep_end = None
                     t_pub = None
+                    pending_veps_request_id: str | None = None
 
                     typed_mech = cast(Literal["VEPS", "Pause", "Stop"], mech)
 
                     # Measured window loop
+                    measurement_deadline = time.monotonic() + operation_timeout_seconds
                     while True:
                         if getattr(source_obj, "measurement_stopped", False):
                             break
+                        if time.monotonic() >= measurement_deadline:
+                            raise TimeoutError(
+                                f"{mech} rep {rep}: measurement window did not close within "
+                                f"{operation_timeout_seconds:.0f}s "
+                                f"({getattr(source_obj, 'measurement_source_frames_received', 0)} of "
+                                f"{measurement_source_frames} receiver positions observed)"
+                            )
 
                         if not swap_requested and getattr(source_obj, "measurement_source_frames_received") >= reconfiguration_trigger_frame_offset:
                             swap_requested = True
+                            _request_trigger_receiver_position = int(
+                                getattr(source_obj, "measurement_source_frames_received")
+                            )
 
                             # Before-prep snapshot
-                            memory_sampler.synchronize()
                             gpu_before_snap = memory_sampler.sample()
 
                             # Initialize candidate if not already
@@ -984,7 +1026,6 @@ def run_realworld_video_suite(
                                 t_prep_end = time.monotonic_ns()
 
                                 # Coexistence snapshot
-                                memory_sampler.synchronize()
                                 gpu_coexist_snap = memory_sampler.sample()
                                 peak_live_plan_count = max(peak_live_plan_count, CoexistenceTracker.get_live_plan_count())
                                 peak_live_detector_instance_count = max(peak_live_detector_instance_count, CoexistenceTracker.get_live_detector_count())
@@ -1034,7 +1075,6 @@ def run_realworld_video_suite(
                                 t_pub = time.monotonic_ns()
 
                                 # After-publication snapshot
-                                memory_sampler.synchronize()
                                 gpu_pub_snap = memory_sampler.sample()
                                 live_plan_count_after_publication = CoexistenceTracker.get_live_plan_count()
                                 live_detector_count_after_publication = CoexistenceTracker.get_live_detector_count()
@@ -1044,7 +1084,6 @@ def run_realworld_video_suite(
                                 retire_superseded_processors(old_plan, compiled_plan)
 
                                 # Stop retires old plan immediately
-                                memory_sampler.synchronize()
                                 gpu_ret_snap = memory_sampler.sample()
                                 live_plan_count_after_retirement = CoexistenceTracker.get_live_plan_count()
                                 live_detector_count_after_retirement = CoexistenceTracker.get_live_detector_count()
@@ -1093,7 +1132,13 @@ def run_realworld_video_suite(
                                 app_controller.submit(reconfig_req)
 
                                 if typed_mech == "VEPS":
+                                    readiness_deadline = time.monotonic() + operation_timeout_seconds
                                     while True:
+                                        if time.monotonic() >= readiness_deadline:
+                                            raise TimeoutError(
+                                                f"VEPS rep {rep}: candidate did not reach a terminal "
+                                                f"status within {operation_timeout_seconds:.0f}s"
+                                            )
                                         rec: Any = app_controller.record(req_id)
                                         if rec.status in (
                                             ReconfigurationStatus.READY,
@@ -1135,7 +1180,6 @@ def run_realworld_video_suite(
                                 CoexistenceTracker.plan_created(rec_ready.candidate_version or 2)
 
                                 # Coexistence snapshot
-                                memory_sampler.synchronize()
                                 gpu_coexist_snap = memory_sampler.sample()
                                 peak_live_plan_count = max(peak_live_plan_count, CoexistenceTracker.get_live_plan_count())
                                 peak_live_detector_instance_count = max(peak_live_detector_instance_count, CoexistenceTracker.get_live_detector_count())
@@ -1148,27 +1192,35 @@ def run_realworld_video_suite(
                                 setattr(app, "_current_plan_version", rec_committed.candidate_version or 2)
 
                                 # After publication snapshot
-                                memory_sampler.synchronize()
                                 gpu_pub_snap = memory_sampler.sample()
                                 live_plan_count_after_publication = CoexistenceTracker.get_live_plan_count()
                                 live_detector_count_after_publication = CoexistenceTracker.get_live_detector_count()
 
-                                ret_rec: Any = app_controller.wait_for_retirement(req_id, timeout_seconds=drain_timeout_seconds)
-                                if ret_rec is not None:
+                                if typed_mech == "Pause":
+                                    ret_rec: Any = app_controller.wait_for_retirement(
+                                        req_id, timeout_seconds=drain_timeout_seconds
+                                    )
+                                    if ret_rec is None:
+                                        raise TimeoutError("Pause retirement timed out")
                                     CoexistenceTracker.plan_retired(ret_rec.base_version)
-
-                                # After retirement snapshot
-                                memory_sampler.synchronize()
-                                gpu_ret_snap = memory_sampler.sample()
-                                live_plan_count_after_retirement = CoexistenceTracker.get_live_plan_count()
-                                live_detector_count_after_retirement = CoexistenceTracker.get_live_detector_count()
+                                    gpu_ret_snap = memory_sampler.sample()
+                                    live_plan_count_after_retirement = CoexistenceTracker.get_live_plan_count()
+                                    live_detector_count_after_retirement = CoexistenceTracker.get_live_detector_count()
+                                else:
+                                    pending_veps_request_id = req_id
 
                                 for step in app_executor.active_plan.steps:
                                     if hasattr(step.processor_ref, "backend"):
                                         active_detector_id_after_retirement = step.processor_ref.backend.model_id
                                         break
                                 active_plan_version_after_retirement = app_executor.active_plan.version
-                                active_detector_instance_count_after_retirement = CoexistenceTracker.get_live_detector_count()
+                                # VEPS retires off-path, so its post-retirement count is
+                                # taken once the deferred retirement is observed after the
+                                # fixed endpoint.
+                                if typed_mech == "Pause":
+                                    active_detector_instance_count_after_retirement = (
+                                        CoexistenceTracker.get_live_detector_count()
+                                    )
 
                                 if getattr(cand_backend, "is_closed", False):
                                     raise RuntimeError("Candidate detector is closed after retirement snapshot")
@@ -1184,6 +1236,27 @@ def run_realworld_video_suite(
                             frame_id=warmup_admitted + measured_admitted + 1,
                         )
                         measured_admitted += 1
+
+                    # The fixed receiver endpoint has now been captured by the
+                    # source.  Retirement observation and synchronized memory
+                    # sampling happen strictly outside the serving window.
+                    if pending_veps_request_id is not None:
+                        app_controller_after_window: Any = getattr(app, "_controller")
+                        ret_rec = app_controller_after_window.wait_for_retirement(
+                            pending_veps_request_id,
+                            timeout_seconds=drain_timeout_seconds,
+                        )
+                        if ret_rec is None:
+                            raise TimeoutError("VEPS retirement timed out after fixed endpoint")
+                        CoexistenceTracker.plan_retired(ret_rec.base_version)
+                        live_plan_count_after_retirement = CoexistenceTracker.get_live_plan_count()
+                        live_detector_count_after_retirement = CoexistenceTracker.get_live_detector_count()
+                        active_detector_instance_count_after_retirement = (
+                            CoexistenceTracker.get_live_detector_count()
+                        )
+
+                    memory_sampler.synchronize()
+                    gpu_ret_snap = memory_sampler.sample()
 
                     # 8. Perform a bounded drain
                     drain_start_timestamp_ns = time.monotonic_ns()
@@ -1465,7 +1538,12 @@ def run_realworld_video_suite(
                         pre_request_source_frame_target=reconfiguration_trigger_frame_offset,
                         pre_request_source_frames_received=pre_req_rec,
                         transition_source_frames_received=trans_rec,
-                        post_effect_source_frame_target=reconfiguration_trigger_frame_offset,
+                        # The enforced post-request allocation. How it splits
+                        # between transition and post-effect positions depends on
+                        # the mechanism and is therefore not a target.
+                        post_request_source_frame_target=(
+                            measurement_source_frames - reconfiguration_trigger_frame_offset
+                        ),
                         post_effect_source_frames_received=post_eff_rec,
                         total_measurement_source_frames_received=total_measured,
                         source_frames_before_request=s_before,
@@ -1481,10 +1559,28 @@ def run_realworld_video_suite(
                         gpu_memory_transition_max_allocated_bytes=gpu_trans_max_alloc,
                         gpu_memory_transition_max_reserved_bytes=gpu_trans_max_resv,
                     )
-                    if sample_row.request_trigger_media_frame_index is not None:
+                    measured_by_ingress = sorted(
+                        (row for row in rep_frame_rows if row.inside_measurement_window),
+                        key=lambda row: (
+                            row.receiver_ingress_timestamp_ns
+                            if row.receiver_ingress_timestamp_ns is not None
+                            else 2**63 - 1,
+                            row.frame_id,
+                        ),
+                    )
+                    positioned_rows = [
+                        replace(row, receiver_position=position)
+                        for position, row in enumerate(measured_by_ingress)
+                    ]
+                    if _request_trigger_receiver_position is not None:
                         fw = compute_fixed_window_metrics(
-                            frame_rows=rep_frame_rows,
-                            request_trigger_media_frame_index=sample_row.request_trigger_media_frame_index,
+                            frame_rows=positioned_rows,
+                            request_trigger_receiver_position=_request_trigger_receiver_position,
+                            cutoff_deadline_ns=measurement_end_timestamp_ns,
+                            baseline_frame_count=reconfiguration_trigger_frame_offset,
+                            transition_frame_count=(
+                                measurement_source_frames - reconfiguration_trigger_frame_offset
+                            ),
                         )
                         sample_row = replace(
                             sample_row,
@@ -1498,6 +1594,7 @@ def run_realworld_video_suite(
                             fixed_window_ingress_dropped_frames=int(fw["fixed_window_ingress_dropped_frames"]),  # type: ignore[arg-type]
                             fixed_window_admission_rejected_frames=int(fw["fixed_window_admission_rejected_frames"]),  # type: ignore[arg-type]
                             fixed_window_execution_cancelled_frames=int(fw["fixed_window_execution_cancelled_frames"]),  # type: ignore[arg-type]
+                            fixed_window_queued_frames=int(fw["fixed_window_queued_frames"]),  # type: ignore[arg-type]
                             fixed_window_frames_in_flight_at_window_end=int(fw["fixed_window_frames_in_flight_at_window_end"]),  # type: ignore[arg-type]
                             fixed_window_duplicated_frames=int(fw["fixed_window_duplicated_frames"]),  # type: ignore[arg-type]
                             fixed_window_old_plan_completions=int(fw["fixed_window_old_plan_completions"]),  # type: ignore[arg-type]
@@ -1508,7 +1605,7 @@ def run_realworld_video_suite(
                             fixed_window_end_to_end_frame_loss_rate=float(fw["fixed_window_end_to_end_frame_loss_rate"]),  # type: ignore[arg-type]
                         )
                     sample_rows.append(sample_row)
-                    frame_rows.extend(rep_frame_rows)
+                    frame_rows.extend(positioned_rows)
 
                 finally:
                     publisher.stop()
@@ -1615,7 +1712,7 @@ def run_realworld_video_suite(
                     r.pre_request_source_frame_target,
                     r.pre_request_source_frames_received,
                     r.transition_source_frames_received,
-                    r.post_effect_source_frame_target,
+                    r.post_request_source_frame_target,
                     r.post_effect_source_frames_received,
                     r.total_measurement_source_frames_received,
                     r.source_frames_before_request,
@@ -1640,6 +1737,7 @@ def run_realworld_video_suite(
                     r.fixed_window_ingress_dropped_frames,
                     r.fixed_window_admission_rejected_frames,
                     r.fixed_window_execution_cancelled_frames,
+                    r.fixed_window_queued_frames,
                     r.fixed_window_frames_in_flight_at_window_end,
                     r.fixed_window_duplicated_frames,
                     r.fixed_window_old_plan_completions,
@@ -1678,6 +1776,7 @@ def run_realworld_video_suite(
                     fr.enqueue_decision_timestamp_ns if fr.enqueue_decision_timestamp_ns is not None else "",
                     fr.drop_decision_timestamp_ns if fr.drop_decision_timestamp_ns is not None else "",
                     fr.media_frame_index if fr.media_frame_index is not None else "",
+                    fr.receiver_position if fr.receiver_position is not None else "",
                 ])
 
     return sample_rows, frame_rows

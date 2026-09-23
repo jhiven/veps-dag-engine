@@ -92,6 +92,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 from nedo_vision_dag_engine.lifecycle import ProcessorStagingArea
+from nedo_vision_dag_engine.instrumentation import emit_runtime_evidence
 from nedo_vision_dag_engine.plan import (
     ActivationCondition,
     ExecutionPlan,
@@ -521,6 +522,11 @@ def _build_plan(
         incoming_by_destination.setdefault((edge.destination_node_id, edge.destination_pin), []).append(edge)
 
     staging = ProcessorStagingArea()
+    active_processor_identities: frozenset[int] = (
+        frozenset(id(step.processor_ref) for step in previous_plan.steps)
+        if previous_plan is not None
+        else frozenset[int]()
+    )
     reused_node_ids: set[str] = set()
     pending_transitions: list[PendingStateTransition] = []
     steps: list[ExecutionStep] = []
@@ -561,6 +567,13 @@ def _build_plan(
                     )
                 processor_ref = previous_step.processor_ref
                 reused_node_ids.add(node_id)
+                emit_runtime_evidence(
+                    "processor_reused",
+                    node_id=node_id,
+                    plan_id=new_version,
+                    processor_instance_id=f"0x{id(processor_ref):x}",
+                    outcome="candidate_reuse",
+                )
             else:
                 try:
                     processor_ref = registration.factory()
@@ -570,6 +583,13 @@ def _build_plan(
                         f"(type {node.type_name!r}) failed: {error!r}"
                     )
 
+                if id(processor_ref) in active_processor_identities:
+                    return fail(
+                        f"processor factory for node {node_id!r} returned an instance that is "
+                        "still owned by the previous active plan; active processors cannot be "
+                        "staged, set up, or cleaned as candidate-owned resources."
+                    )
+
                 try:
                     staging.register(node_id, processor_ref)
                 except Exception as error:
@@ -577,6 +597,13 @@ def _build_plan(
                         f"registering staged processor for node {node_id!r} "
                         f"(type {node.type_name!r}) failed: {error!r}"
                     )
+                emit_runtime_evidence(
+                    "processor_staged",
+                    node_id=node_id,
+                    plan_id=new_version,
+                    processor_instance_id=f"0x{id(processor_ref):x}",
+                    outcome="staged",
+                )
 
                 if processor_ref.descriptor != registration.descriptor:
                     return fail(
@@ -775,6 +802,15 @@ class WorkflowCompiler:
                     kind=CompilationFailureKind.FAILED,
                 )
 
+        directive_failure = _validate_state_directive(
+            directive,
+            specification,
+            previous_specification,
+            registry,
+        )
+        if directive_failure is not None:
+            return directive_failure
+
         classification_result = _classify_nodes(specification, previous_specification, previous_plan, registry, directive)
         if isinstance(classification_result, CompilationFailure):
             return classification_result
@@ -822,3 +858,53 @@ class WorkflowCompiler:
             previous_plan=previous_plan,
             state_directive=state_directive,
         )
+
+
+def _validate_state_directive(
+    directive: StateDirective,
+    specification: WorkflowSpecification,
+    previous_specification: WorkflowSpecification | None,
+    registry: RegistrySnapshot,
+) -> CompilationFailure | None:
+    """Reject every reset directive that cannot be applied exactly."""
+    target_nodes = {node.node_id: node for node in specification.nodes}
+    previous_node_ids: frozenset[str] = (
+        frozenset(node.node_id for node in previous_specification.nodes)
+        if previous_specification is not None
+        else frozenset[str]()
+    )
+    for node_id in sorted(directive.reset_node_ids):
+        node = target_nodes.get(node_id)
+        if node is None:
+            return CompilationFailure(
+                errors=(),
+                reason=f"reset directive references node {node_id!r}, which is absent from the target graph.",
+            )
+        registration = registry.resolve(node.type_name)
+        if registration is None:
+            return CompilationFailure(
+                errors=(),
+                reason=f"reset directive references node {node_id!r} with an unregistered processor type.",
+            )
+        descriptor = registration.descriptor
+        if descriptor.state_policy is StatePolicy.STATELESS:
+            return CompilationFailure(
+                errors=(),
+                reason=f"reset directive references stateless node {node_id!r}.",
+            )
+        stateful_descriptor = registration.stateful_descriptor
+        if (
+            stateful_descriptor is None
+            or StateTransitionPolicy.RESET
+            not in stateful_descriptor.supported_transition_policies
+        ):
+            return CompilationFailure(
+                errors=(),
+                reason=f"node {node_id!r} was asked to reset, but its processor type does not support RESET.",
+            )
+        if node_id not in previous_node_ids:
+            return CompilationFailure(
+                errors=(),
+                reason=f"reset directive references newly added node {node_id!r}, which has no previous state to reset.",
+            )
+    return None

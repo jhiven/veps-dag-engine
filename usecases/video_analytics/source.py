@@ -5,15 +5,23 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import tempfile
 import threading
 import time
-from typing import Any, Callable
+from typing import IO, Any, Callable
 
 import numpy as np
 
 from usecases.video_analytics.config import FileVideoSourceConfig
 from usecases.video_analytics.contracts import BackendKind, DropReason, FramePacket, FrameSource, VideoMetadata
 from usecases.video_analytics.ingress import RTSPCaptureIngress
+
+#: How long :meth:`RTSPVideoSource.open` waits for the first decoded frame
+#: before declaring the stream unusable. The decoder cannot emit anything until
+#: the next keyframe, which is a whole GOP away in the worst case, so this is
+#: deliberately generous: a decoder that has died is detected immediately by its
+#: exit status, and only an alive-but-silent stream waits out the full bound.
+FIRST_FRAME_TIMEOUT_SECONDS = 60.0
 from usecases.video_analytics.pacing import Clock, FramePacer
 
 __all__ = [
@@ -310,26 +318,18 @@ class FileVideoSource(FrameSource):
             is_measured = self._inside_measurement_window
 
             if is_measured:
-                # Decide which phase counter to increment
                 if self._pre_request_source_frames_received < self._pre_request_target:
                     self._pre_request_source_frames_received += 1
                 elif not self._first_candidate_output_completed:
                     self._transition_source_frames_received += 1
                 else:
-                    if self._post_effect_source_frames_received >= self._post_effect_target:
-                        self._measurement_stopped = True
-                        self._measurement_end_timestamp_ns = time.monotonic_ns()
-                        return None
                     self._post_effect_source_frames_received += 1
-                    if self._post_effect_source_frames_received == self._post_effect_target:
-                        self._measurement_stopped = True
-                        self._measurement_end_timestamp_ns = time.monotonic_ns()
 
-                self._measurement_source_frames_received = (
-                    self._pre_request_source_frames_received
-                    + self._transition_source_frames_received
-                    + self._post_effect_source_frames_received
-                )
+                self._measurement_source_frames_received += 1
+                if self._measurement_source_frames_received >= self._measurement_source_frame_target:
+                    self._measurement_stopped = True
+                    self._inside_measurement_window = False
+                    self._measurement_end_timestamp_ns = time.monotonic_ns()
 
         if self._is_synthetic or self._vframes is None:
             if self._current_frame_id >= 1000:
@@ -353,7 +353,7 @@ class FileVideoSource(FrameSource):
                 inside_measurement_window=is_measured,
                 media_pts_ns=pts,
                 receiver_ingress_timestamp_ns=now_ns,
-                enqueue_decision_timestamp_ns=now_ns,
+                enqueue_decision_timestamp_ns=None,
                 media_frame_index=self._current_frame_id,
             )
 
@@ -379,7 +379,7 @@ class FileVideoSource(FrameSource):
             inside_measurement_window=is_measured,
             media_pts_ns=pts,
             receiver_ingress_timestamp_ns=now_ns,
-            enqueue_decision_timestamp_ns=now_ns,
+            enqueue_decision_timestamp_ns=None,
             media_frame_index=self._current_frame_id,
         )
 
@@ -409,6 +409,7 @@ class RTSPVideoSource(FrameSource):
         self._metadata: VideoMetadata | None = None
         self._ingress: RTSPCaptureIngress | None = None
         self._decoder_proc: subprocess.Popen[bytes] | None = None
+        self._decoder_stderr: IO[bytes] | None = None
         self._current_frame_id: int = 0
         self._is_closed: bool = False
         self._lock: threading.Lock = threading.Lock()
@@ -444,7 +445,11 @@ class RTSPVideoSource(FrameSource):
                 and self._current_frame_id >= start_media_frame_index
             ):
                 raise RuntimeError(
-                    "Cannot arm a measurement boundary that the receiver has already passed"
+                    "Cannot arm a measurement boundary that the receiver has already passed: "
+                    f"asked to start at media frame {start_media_frame_index}, but the receiver "
+                    f"has already decoded {self._current_frame_id}. The stream runs in real time, "
+                    "so warm-up must finish before the receiver reaches that index. A host whose "
+                    "detector cannot keep up with the source frame rate will always overshoot it."
                 )
             self._inside_measurement_window = True
             self._measurement_start_media_frame_index = start_media_frame_index
@@ -558,16 +563,18 @@ class RTSPVideoSource(FrameSource):
             "-",
         ]
 
+        # Keep the decoder's diagnostics. Discarding them turns "the RTSP path
+        # was not published yet" into an unexplained absence of frames.
+        self._decoder_stderr = tempfile.TemporaryFile()
         try:
             self._decoder_proc = subprocess.Popen(
                 ffmpeg_cmd,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
+                stderr=self._decoder_stderr,
                 bufsize=10 * frame_bytes,
             )
         except Exception as err:
             raise RuntimeError(f"Failed to launch FFmpeg RTSP decoder process for {self._rtsp_url}: {err}") from err
-
         proc = self._decoder_proc
 
         def frame_decoder() -> FramePacket | None:
@@ -590,26 +597,18 @@ class RTSPVideoSource(FrameSource):
                     if is_measured and self._measurement_start_timestamp_ns is None:
                         self._measurement_start_timestamp_ns = time.monotonic_ns()
                     if is_measured:
-                        # Decide which phase counter to increment
                         if self._pre_request_source_frames_received < self._pre_request_target:
                             self._pre_request_source_frames_received += 1
                         elif not self._first_candidate_output_completed:
                             self._transition_source_frames_received += 1
                         else:
-                            if self._post_effect_source_frames_received >= self._post_effect_target:
-                                self._measurement_stopped = True
-                                self._measurement_end_timestamp_ns = time.monotonic_ns()
-                                return None
                             self._post_effect_source_frames_received += 1
-                            if self._post_effect_source_frames_received == self._post_effect_target:
-                                self._measurement_stopped = True
-                                self._measurement_end_timestamp_ns = time.monotonic_ns()
 
-                        self._measurement_source_frames_received = (
-                            self._pre_request_source_frames_received
-                            + self._transition_source_frames_received
-                            + self._post_effect_source_frames_received
-                        )
+                        self._measurement_source_frames_received += 1
+                        if self._measurement_source_frames_received >= self._measurement_source_frame_target:
+                            self._measurement_stopped = True
+                            self._inside_measurement_window = False
+                            self._measurement_end_timestamp_ns = time.monotonic_ns()
 
                     self._current_frame_id = fid
 
@@ -639,14 +638,46 @@ class RTSPVideoSource(FrameSource):
         )
         self._ingress.start()
 
-        # Wait until the background RTSP capture thread has established connection and received the first frame
-        start_t = time.monotonic()
-        while time.monotonic() - start_t < 5.0:
+        # A decoder that attaches before the publisher has registered its path
+        # exits immediately, and an exited decoder is silent. Require the first
+        # frame here so that condition surfaces as an error instead of an
+        # endless supply of empty reads.
+        deadline = time.monotonic() + FIRST_FRAME_TIMEOUT_SECONDS
+        while time.monotonic() < deadline:
             if self._ingress.source_frames_received > 0 or self._ingress.queue.size() > 0:
+                return self._metadata
+            if self._decoder_proc.poll() is not None:
                 break
             time.sleep(0.01)
 
+        if self._ingress.source_frames_received == 0 and self._ingress.queue.size() == 0:
+            raise RuntimeError(
+                f"No frame arrived from {self._rtsp_url} within "
+                f"{FIRST_FRAME_TIMEOUT_SECONDS:.1f}s. {self._decoder_diagnosis()}"
+            )
+
         return self._metadata
+
+    def _decoder_diagnosis(self) -> str:
+        """Describe the decoder's exit state, including what FFmpeg reported."""
+        if self._decoder_proc is None:
+            return "The decoder process was never started."
+        code = self._decoder_proc.poll()
+        if code is None:
+            return "The decoder process is still running but produced no frames."
+        detail = self._read_decoder_stderr() or "(no FFmpeg output was captured)"
+        return f"The decoder process exited with code {code}. FFmpeg reported: {detail}"
+
+    def _read_decoder_stderr(self) -> str:
+        if self._decoder_stderr is None:
+            return ""
+        try:
+            self._decoder_stderr.seek(0)
+            # Bounded: a failing decoder writes a short message, and a healthy
+            # one that later dies must not drag an unbounded log into the error.
+            return self._decoder_stderr.read(8192).decode("utf-8", errors="replace").strip()
+        except Exception:
+            return ""
 
     def read(self) -> FramePacket | None:
         """Pop the latest frame non-blockingly from the bounded drop-oldest ingress queue."""
@@ -664,6 +695,15 @@ class RTSPVideoSource(FrameSource):
             pkt = self._ingress.read()
             if pkt is not None:
                 return pkt
+
+        # An empty queue means "not yet" only while the decoder is alive. Once
+        # it has exited no frame can ever arrive, so returning None would invite
+        # the caller to retry forever.
+        if self._decoder_proc is not None and self._decoder_proc.poll() is not None:
+            raise RuntimeError(
+                f"RTSP decoder for {self._rtsp_url} is no longer running. "
+                f"{self._decoder_diagnosis()}"
+            )
 
         return None
 

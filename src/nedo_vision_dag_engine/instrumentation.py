@@ -28,11 +28,63 @@ __all__ = [
     "RuntimeEventEnvelope",
     "RuntimeMetricsSnapshot",
     "RuntimeInstrumentation",
+    "RuntimeEvidenceSink",
+    "emit_runtime_evidence",
+    "install_runtime_evidence_sink",
+    "runtime_evidence_sink",
 ]
 
 
 type NanosecondClock = Callable[[], int]
 type JsonValue = None | bool | int | float | str | tuple[JsonValue, ...] | Mapping[str, JsonValue]
+type RuntimeEvidenceSink = Callable[[str, Mapping[str, JsonValue]], None]
+
+_evidence_lock = Lock()
+_evidence_sink: RuntimeEvidenceSink | None = None
+
+
+def install_runtime_evidence_sink(
+    sink: RuntimeEvidenceSink | None,
+) -> RuntimeEvidenceSink | None:
+    """Install a process-wide evidence sink and return the previous sink.
+
+    Conformance campaigns are serialized.  A process-wide sink intentionally
+    captures events from their worker and retirement threads as well.
+
+    The lock serializes installers against each other so the returned previous
+    sink is coherent. Readers do not take it: a campaign installs its sink
+    before it starts and removes it after it ends, so a reader never needs to
+    observe an installation that is still in progress.
+    """
+    global _evidence_sink
+    with _evidence_lock:
+        previous = _evidence_sink
+        _evidence_sink = sink
+        return previous
+
+
+def runtime_evidence_sink() -> RuntimeEvidenceSink | None:
+    """Return the installed sink, or None.
+
+    Reading the global is a single atomic load under both the default and the
+    free-threaded builds, so this takes no lock. Callers on a per-frame path
+    read it once and branch on the result rather than calling
+    :func:`emit_runtime_evidence` per node: building the keyword payload costs
+    far more than the event is worth when nothing is listening.
+    """
+    return _evidence_sink
+
+
+def emit_runtime_evidence(kind: str, **fields: JsonValue) -> None:
+    """Emit one evidence event when a sink is installed.
+
+    This is for paths that run once per request or per transition. Per-node and
+    per-frame paths must use :func:`runtime_evidence_sink` instead so that an
+    idle runtime pays nothing.
+    """
+    sink = _evidence_sink
+    if sink is not None:
+        sink(kind, fields)
 
 
 class FrameStatus(Enum):
@@ -356,6 +408,23 @@ class RuntimeInstrumentation:
         self,
         event: ReconfigurationEvent,
     ) -> RuntimeEventEnvelope:
+        event_kind = {
+            ReconfigurationStatus.RECEIVED: "request_received",
+            ReconfigurationStatus.VALIDATING: "request_validated",
+            ReconfigurationStatus.PREPARING: "request_prepared",
+            ReconfigurationStatus.READY: "request_ready",
+            ReconfigurationStatus.COMMITTED: "request_committed",
+            ReconfigurationStatus.REJECTED: "request_rejected",
+            ReconfigurationStatus.FAILED: "request_failed",
+            ReconfigurationStatus.STALE: "request_rejected",
+            ReconfigurationStatus.ABORTED: "request_aborted",
+        }[event.status]
+        emit_runtime_evidence(
+            event_kind,
+            request_id=event.request_id,
+            outcome=event.status.value,
+            error_message=event.reason,
+        )
         return self._append(RuntimeEventKind.RECONFIGURATION_TRANSITION, event)
 
     def record_reconfiguration_measurement(
@@ -370,9 +439,21 @@ class RuntimeInstrumentation:
         self,
         event: StateTransitionEvent,
     ) -> RuntimeEventEnvelope:
+        emit_runtime_evidence(
+            "processor_reset",
+            node_id=event.node_id,
+            plan_id=event.new_plan_version,
+            outcome=event.policy.value,
+        )
         return self._append(RuntimeEventKind.STATE_TRANSITION, event)
 
     def record_state_reuse(self, event: StateReuseEvent) -> RuntimeEventEnvelope:
+        emit_runtime_evidence(
+            "processor_reused",
+            node_id=event.node_id,
+            plan_id=event.new_plan_version,
+            outcome="reused",
+        )
         return self._append(RuntimeEventKind.STATE_REUSE, event)
 
     def event_log(self) -> tuple[RuntimeEventEnvelope, ...]:

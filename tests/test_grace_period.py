@@ -9,13 +9,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from threading import Event, Lock, Thread
+from unittest.mock import patch
+
+import pytest
 
 from nedo_vision_dag_engine.compiler import (
     CompiledCandidate,
     StateDirective,
     WorkflowCompiler,
 )
-from nedo_vision_dag_engine.executor import PipelineExecutor
+from nedo_vision_dag_engine.executor import FrameResult, PipelineExecutor
 from nedo_vision_dag_engine.instrumentation import RetirementStatus
 from nedo_vision_dag_engine.lifecycle import PlanLifecycleState
 from nedo_vision_dag_engine.processor import (
@@ -25,7 +28,9 @@ from nedo_vision_dag_engine.processor import (
     StatefulProcessorDescriptor,
     TransitionContext,
 )
+from nedo_vision_dag_engine import reconfiguration
 from nedo_vision_dag_engine.reconfiguration import (
+    BoundaryCommitResult,
     ReconfigurationController,
     ReconfigurationRequest,
     ReconfigurationStatus,
@@ -46,6 +51,7 @@ from nedo_vision_dag_engine.type_system import (
     StatePolicy,
     StateTransitionPolicy,
 )
+from nedo_vision_dag_engine.workspace import Workspace, WorkspacePool
 
 
 # ---------------------------------------------------------------------------
@@ -308,10 +314,8 @@ def test_plan_lifecycle_active_to_superseded_to_retired() -> None:
     registry = _stateless_registry(events)
     compiler = WorkflowCompiler("test")
     initial = _compile_initial(compiler, registry, _linear_specification())
-    executor = PipelineExecutor(initial.plan)
-    controller = ReconfigurationController(
-        executor, compiler, registry, clock=IncrementingClock()
-    )
+    executor = PipelineExecutor(initial.plan, clock=IncrementingClock())
+    controller = ReconfigurationController(executor, compiler, registry)
 
     try:
         # Submit a reconfiguration that replaces the consumer
@@ -386,10 +390,8 @@ def test_grace_period_timestamps_recorded_on_retirement() -> None:
     registry = _stateless_registry(events)
     compiler = WorkflowCompiler("test")
     initial = _compile_initial(compiler, registry, _linear_specification())
-    executor = PipelineExecutor(initial.plan)
-    controller = ReconfigurationController(
-        executor, compiler, registry, clock=IncrementingClock()
-    )
+    executor = PipelineExecutor(initial.plan, clock=IncrementingClock())
+    controller = ReconfigurationController(executor, compiler, registry)
 
     try:
         new_spec = _source_only_specification()
@@ -416,8 +418,8 @@ def test_grace_period_timestamps_recorded_on_retirement() -> None:
         assert record.cleanup_end_ns is not None
         assert record.cleanup_end_ns >= record.cleanup_start_ns
 
-        # last_old_frame_completed_ns should be recorded
-        assert record.last_old_frame_completed_ns is not None
+        # No old-plan frame ran, so there is no fabricated completion event.
+        assert record.last_old_frame_completed_ns is None
     finally:
         controller.close()
 
@@ -428,10 +430,8 @@ def test_retirement_not_required_when_no_processors_retired() -> None:
     registry = _stateless_registry(events)
     compiler = WorkflowCompiler("test")
     initial = _compile_initial(compiler, registry, _linear_specification())
-    executor = PipelineExecutor(initial.plan)
-    controller = ReconfigurationController(
-        executor, compiler, registry, clock=IncrementingClock()
-    )
+    executor = PipelineExecutor(initial.plan, clock=IncrementingClock())
+    controller = ReconfigurationController(executor, compiler, registry)
 
     try:
         # Submit the same specification — all processors reused
@@ -467,10 +467,8 @@ def test_retirement_is_idempotent_via_cleaned_plans_guard() -> None:
     registry = _stateless_registry(events)
     compiler = WorkflowCompiler("test")
     initial = _compile_initial(compiler, registry, _linear_specification())
-    executor = PipelineExecutor(initial.plan)
-    controller = ReconfigurationController(
-        executor, compiler, registry, clock=IncrementingClock()
-    )
+    executor = PipelineExecutor(initial.plan, clock=IncrementingClock())
+    controller = ReconfigurationController(executor, compiler, registry)
 
     try:
         new_spec = _source_only_specification()
@@ -507,10 +505,8 @@ def test_handoff_required_when_stateful_processor_preserved() -> None:
     initial = _compile_initial(
         compiler, registry, _linear_specification(consumer_type="tracker")
     )
-    executor = PipelineExecutor(initial.plan)
-    controller = ReconfigurationController(
-        executor, compiler, registry, clock=IncrementingClock()
-    )
+    executor = PipelineExecutor(initial.plan, clock=IncrementingClock())
+    controller = ReconfigurationController(executor, compiler, registry)
 
     try:
         # Admit one frame first so the tracker gets state
@@ -546,10 +542,8 @@ def test_handoff_not_required_when_only_stateless_processors_reused() -> None:
     registry = _stateless_registry(events)
     compiler = WorkflowCompiler("test")
     initial = _compile_initial(compiler, registry, _linear_specification())
-    executor = PipelineExecutor(initial.plan)
-    controller = ReconfigurationController(
-        executor, compiler, registry, clock=IncrementingClock()
-    )
+    executor = PipelineExecutor(initial.plan, clock=IncrementingClock())
+    controller = ReconfigurationController(executor, compiler, registry)
 
     try:
         # Submit the exact same spec — stateless reuse only
@@ -581,10 +575,8 @@ def test_boundary_commit_result_includes_handoff_info() -> None:
     initial = _compile_initial(
         compiler, registry, _linear_specification(consumer_type="tracker")
     )
-    executor = PipelineExecutor(initial.plan)
-    controller = ReconfigurationController(
-        executor, compiler, registry, clock=IncrementingClock()
-    )
+    executor = PipelineExecutor(initial.plan, clock=IncrementingClock())
+    controller = ReconfigurationController(executor, compiler, registry)
 
     try:
         controller.admit_frame(1)
@@ -616,9 +608,8 @@ def test_stateful_preservation_does_not_mix_old_and_new_state() -> None:
     """When a stateful processor is preserved, old-plan frames finish before
     new-plan frames access the processor, so state is never mixed.
 
-    Under the current single-frame execution model, this is guaranteed by
-    _admission_lock serialization.  This test verifies that the handoff
-    instrumentation correctly reports the ordering.
+    The controller gates admission and drains old-plan leases before
+    publishing a plan that preserves mutable state.
     """
     events: list[str] = []
     registry = _tracker_registry(events)
@@ -626,10 +617,8 @@ def test_stateful_preservation_does_not_mix_old_and_new_state() -> None:
     initial = _compile_initial(
         compiler, registry, _linear_specification(consumer_type="tracker")
     )
-    executor = PipelineExecutor(initial.plan)
-    controller = ReconfigurationController(
-        executor, compiler, registry, clock=IncrementingClock()
-    )
+    executor = PipelineExecutor(initial.plan, clock=IncrementingClock())
+    controller = ReconfigurationController(executor, compiler, registry)
 
     try:
         # Admit a frame on the initial plan (version 1)
@@ -657,6 +646,222 @@ def test_stateful_preservation_does_not_mix_old_and_new_state() -> None:
         controller.close()
 
 
+def test_stateful_handoff_drains_old_access_before_publication() -> None:
+    """A preserved mutable instance cannot cross the publication boundary."""
+    old_access_entered = Event()
+    release_old_access = Event()
+    handoff_wait_started = Event()
+    commit_completed = Event()
+    new_frame_completed = Event()
+    access_events: list[str] = []
+
+    class BlockingTracker(StatefulRecordingProcessor):
+        def __init__(self) -> None:
+            super().__init__(access_events, "tracker")
+
+        def process(self, inputs: object, context: FrameContext) -> object:
+            access_events.append(f"enter:v{context.plan_version}")
+            if context.plan_version == 1:
+                old_access_entered.set()
+                if not release_old_access.wait(timeout=5.0):
+                    raise RuntimeError("old tracker access was not released")
+            access_events.append(f"exit:v{context.plan_version}")
+            return ValueOutput(context.plan_version)
+
+    class ObservingExecutor(PipelineExecutor):
+        def wait_for_plan_quiescent(
+            self,
+            plan_version: int,
+            timeout: float | None = None,
+        ) -> bool:
+            handoff_wait_started.set()
+            return super().wait_for_plan_quiescent(plan_version, timeout)
+
+    builder = RegistryBuilder()
+    builder.register(
+        RegisteredProcessorType(
+            descriptor=TRACKER_DESCRIPTOR,
+            stateful_descriptor=TRACKER_STATEFUL_DESCRIPTOR,
+            factory=BlockingTracker,
+        )
+    )
+    registry = builder.snapshot()
+    compiler = WorkflowCompiler("test")
+    specification = _source_only_specification("tracker")
+    initial = _compile_initial(compiler, registry, specification)
+    tracker = initial.plan.steps[0].processor_ref
+    executor = ObservingExecutor(initial.plan)
+    controller = ReconfigurationController(executor, compiler, registry)
+    commit_results: list[BoundaryCommitResult | None] = []
+    new_frame_results: list[FrameResult] = []
+
+    try:
+        old_frame = Thread(target=controller.admit_frame, args=(1, 1), daemon=True)
+        old_frame.start()
+        assert old_access_entered.wait(timeout=2.0)
+
+        controller.submit(_request("preserve", 1, specification))
+        ready = controller.wait_for_status(
+            "preserve",
+            frozenset({ReconfigurationStatus.READY}),
+            timeout_seconds=2.0,
+        )
+        assert ready is not None
+
+        def commit() -> None:
+            commit_results.append(controller.commit_ready())
+            commit_completed.set()
+
+        commit_thread = Thread(target=commit, daemon=True)
+        commit_thread.start()
+        assert handoff_wait_started.wait(timeout=2.0)
+        assert not commit_completed.is_set()
+        assert executor.active_plan.version == 1
+
+        def admit_new_frame() -> None:
+            new_frame_results.append(controller.admit_frame(2, 2))
+            new_frame_completed.set()
+
+        new_frame = Thread(target=admit_new_frame, daemon=True)
+        new_frame.start()
+        assert not new_frame_completed.is_set()
+
+        release_old_access.set()
+        old_frame.join(timeout=2.0)
+        commit_thread.join(timeout=2.0)
+        new_frame.join(timeout=2.0)
+
+        assert not old_frame.is_alive()
+        assert not commit_thread.is_alive()
+        assert not new_frame.is_alive()
+        assert commit_results[0] is not None
+        assert commit_results[0].handoff_required
+        assert new_frame_results[0].plan_version == 2
+        assert executor.active_plan.steps[0].processor_ref is tracker
+        assert access_events[-4:] == ["enter:v1", "exit:v1", "enter:v2", "exit:v2"]
+    finally:
+        release_old_access.set()
+        controller.close()
+
+
+def test_handoff_drain_timeout_fails_the_request_and_keeps_the_active_plan() -> None:
+    """A drain that never completes must not publish and must not stall admission."""
+    old_access_entered = Event()
+    release_old_access = Event()
+    access_events: list[str] = []
+
+    class BlockingTracker(StatefulRecordingProcessor):
+        def __init__(self) -> None:
+            super().__init__(access_events, "tracker")
+
+        def process(self, inputs: object, context: FrameContext) -> object:
+            if context.plan_version == 1:
+                old_access_entered.set()
+                if not release_old_access.wait(timeout=10.0):
+                    raise RuntimeError("old tracker access was not released")
+            return ValueOutput(context.plan_version)
+
+    builder = RegistryBuilder()
+    builder.register(
+        RegisteredProcessorType(
+            descriptor=TRACKER_DESCRIPTOR,
+            stateful_descriptor=TRACKER_STATEFUL_DESCRIPTOR,
+            factory=BlockingTracker,
+        )
+    )
+    registry = builder.snapshot()
+    compiler = WorkflowCompiler("test")
+    specification = _source_only_specification("tracker")
+    initial = _compile_initial(compiler, registry, specification)
+    tracker = initial.plan.steps[0].processor_ref
+    executor = PipelineExecutor(initial.plan, clock=IncrementingClock())
+    controller = ReconfigurationController(executor, compiler, registry)
+    commit_results: list[BoundaryCommitResult | None] = []
+
+    with patch.object(reconfiguration, "HANDOFF_DRAIN_TIMEOUT_SECONDS", 0.05):
+        try:
+            old_frame = Thread(target=controller.admit_frame, args=(1, 1), daemon=True)
+            old_frame.start()
+            assert old_access_entered.wait(timeout=2.0)
+
+            controller.submit(_request("preserve", 1, specification))
+            ready = controller.wait_for_status(
+                "preserve",
+                frozenset({ReconfigurationStatus.READY}),
+                timeout_seconds=2.0,
+            )
+            assert ready is not None
+
+            commit_results.append(controller.commit_ready())
+
+            result = commit_results[0]
+            assert result is not None
+            assert result.status is ReconfigurationStatus.FAILED
+            assert result.handoff_required
+
+            record = controller.record("preserve")
+            assert record.status is ReconfigurationStatus.FAILED
+            assert record.failure_reason is not None
+            assert "did not become exclusive" in record.failure_reason
+            assert record.commit_ns is None
+
+            # The active plan keeps serving, and admission is open again.
+            assert executor.active_plan.version == initial.plan.version
+            assert executor.active_plan.steps[0].processor_ref is tracker
+            release_old_access.set()
+            old_frame.join(timeout=2.0)
+            assert not old_frame.is_alive()
+            assert controller.admit_frame(2, 2).plan_version == initial.plan.version
+        finally:
+            release_old_access.set()
+            controller.close()
+
+
+def test_invalid_frame_id_does_not_acquire_a_plan_lease() -> None:
+    registry = _stateless_registry([])
+    compiler = WorkflowCompiler("test")
+    initial = _compile_initial(compiler, registry, _source_only_specification())
+    executor = PipelineExecutor(initial.plan)
+
+    with pytest.raises(ValueError, match="frame_id"):
+        executor.admit_frame(1, -1)
+
+    assert executor.wait_for_plan_quiescent(initial.plan.version, timeout=0.1)
+
+
+def test_workspace_acquisition_failure_releases_plan_lease() -> None:
+    class FailingAcquirePool(WorkspacePool):
+        def acquire(self, size: int) -> Workspace:
+            raise RuntimeError("injected workspace acquisition failure")
+
+    registry = _stateless_registry([])
+    compiler = WorkflowCompiler("test")
+    initial = _compile_initial(compiler, registry, _source_only_specification())
+    executor = PipelineExecutor(initial.plan, workspace_pool=FailingAcquirePool())
+
+    with pytest.raises(RuntimeError, match="acquisition failure"):
+        executor.admit_frame(1, 1)
+
+    assert executor.wait_for_plan_quiescent(initial.plan.version, timeout=0.1)
+
+
+def test_workspace_release_failure_releases_plan_lease() -> None:
+    class FailingReleasePool(WorkspacePool):
+        def release(self, workspace: Workspace) -> None:
+            super().release(workspace)
+            raise RuntimeError("injected workspace release failure")
+
+    registry = _stateless_registry([])
+    compiler = WorkflowCompiler("test")
+    initial = _compile_initial(compiler, registry, _source_only_specification())
+    executor = PipelineExecutor(initial.plan, workspace_pool=FailingReleasePool())
+
+    with pytest.raises(RuntimeError, match="release failure"):
+        executor.admit_frame(1, 1)
+
+    assert executor.wait_for_plan_quiescent(initial.plan.version, timeout=0.1)
+
+
 # ---------------------------------------------------------------------------
 # Grace period timeout / stall
 # ---------------------------------------------------------------------------
@@ -665,9 +870,8 @@ def test_stateful_preservation_does_not_mix_old_and_new_state() -> None:
 def test_grace_period_stall_when_frame_never_completes() -> None:
     """If a frame never completes, grace period times out and retirement stalls.
 
-    Under the current lock model, a frame cannot block retirement because
-    _admission_lock serializes everything. This test validates the timeout
-    path by directly calling wait_for_plan_quiescent on a live executor.
+    This test validates the timeout path by directly calling
+    wait_for_plan_quiescent on a live executor.
     """
     frame_entered = Event()
     frame_release = Event()
@@ -709,13 +913,8 @@ def test_grace_period_stall_when_frame_never_completes() -> None:
     frame_thread.start()
     assert frame_entered.wait(timeout=5.0)
 
-    # While the frame is executing (holding _execution_lock), the plan should
-    # have 1 in-flight frame.  wait_for_plan_quiescent is called from the
-    # retirement worker (not holding _execution_lock), so it will block until
-    # the frame completes or times out.
-
-    # Since the frame holds _execution_lock and we're calling from a different
-    # thread, wait_for_plan_quiescent should timeout.
+    # The admitted frame holds a plan lease, so quiescence must time out even
+    # though publication would be allowed to use the separate admission lock.
     quiescent = executor.wait_for_plan_quiescent(cand.plan.version, timeout=0.5)
     assert not quiescent  # Frame is still executing
 
@@ -792,21 +991,17 @@ def test_cleanup_deferred_until_old_frame_completes_end_to_end() -> None:
     spec = _source_only_specification()
     cand = compiler.compile(spec, registry)
     assert isinstance(cand, CompiledCandidate)
-    executor = PipelineExecutor(cand.plan)
-    controller = ReconfigurationController(
-        executor, compiler, registry, clock=IncrementingClock()
-    )
+    clock = IncrementingClock()
+    executor = PipelineExecutor(cand.plan, clock=clock)
+    controller = ReconfigurationController(executor, compiler, registry)
 
     try:
-        # Admit a frame — it blocks inside process() holding _execution_lock.
-        # Use a separate thread so the main thread can submit reconfiguration.
+        # Admit a frame through the controller. It blocks inside process()
+        # after acquiring an old-plan lease and releasing the admission gate.
         frame_completed = Event()
 
         def frame_worker() -> None:
-            # Use admit_frame_managed with the internal token so we bypass
-            # the controller's _admission_lock and only hold _execution_lock.
-            token = getattr(controller, "_executor_token")
-            executor.admit_frame_managed(token, 100, 1)
+            controller.admit_frame(100, 1)
             frame_completed.set()
 
         frame_thread = Thread(target=frame_worker, daemon=True)
@@ -824,24 +1019,24 @@ def test_cleanup_deferred_until_old_frame_completes_end_to_end() -> None:
             timeout_seconds=5.0,
         )
 
-        # commit_ready() needs _execution_lock which is held by the frame.
-        # Launch commit in a background thread — it will block cleanly.
+        # Publication must complete while the old frame is still blocked.
         commit_completed = Event()
+        commit_results: list[BoundaryCommitResult | None] = []
 
         def commit_worker() -> None:
-            controller.commit_ready()
+            commit_results.append(controller.commit_ready())
             commit_completed.set()
 
         commit_thread = Thread(target=commit_worker, daemon=True)
         commit_thread.start()
 
-        import time as _time
-        _time.sleep(0.1)
-
-        # Commit must NOT have completed — frame still holds _execution_lock
-        assert not commit_completed.is_set(), (
-            "commit completed while frame was still executing"
+        assert commit_completed.wait(timeout=5.0), (
+            "publication did not complete while the old frame was executing"
         )
+        assert commit_results[0] is not None
+        assert commit_results[0].status is ReconfigurationStatus.COMMITTED
+        assert executor.active_plan.version == cand.plan.version + 1
+        assert not frame_completed.is_set()
         # Cleanup must NOT have been called
         assert not cleanup_called.is_set(), (
             "cleanup was called while old-plan frame was still executing"
@@ -852,10 +1047,6 @@ def test_cleanup_deferred_until_old_frame_completes_end_to_end() -> None:
         assert frame_completed.wait(timeout=5.0)
         frame_thread.join(timeout=5.0)
 
-        # Commit must now have completed
-        assert commit_completed.wait(timeout=10.0), (
-            "commit did not complete after frame was released"
-        )
         commit_thread.join(timeout=5.0)
 
         # Now wait for retirement to complete
@@ -871,6 +1062,8 @@ def test_cleanup_deferred_until_old_frame_completes_end_to_end() -> None:
         # Grace period should be recorded
         assert record.grace_period_start_ns is not None
         assert record.grace_period_complete_ns is not None
+        assert record.last_old_frame_completed_ns is not None
+        assert record.last_old_frame_completed_ns <= record.grace_period_complete_ns
     finally:
         frame_release.set()
         controller.close()
@@ -886,10 +1079,8 @@ def test_memory_error_in_factory_cleans_candidate_and_keeps_active_plan() -> Non
     registry = _stateless_registry(events)
     compiler = WorkflowCompiler("test")
     initial = _compile_initial(compiler, registry, _linear_specification())
-    executor = PipelineExecutor(initial.plan)
-    controller = ReconfigurationController(
-        executor, compiler, registry, clock=IncrementingClock()
-    )
+    executor = PipelineExecutor(initial.plan, clock=IncrementingClock())
+    controller = ReconfigurationController(executor, compiler, registry)
 
     try:
         # Build a replacement spec that references a bad factory
@@ -1050,10 +1241,8 @@ def test_cleanup_exception_does_not_uncommit_plan() -> None:
     registry = builder.snapshot()
     compiler = WorkflowCompiler("test")
     initial = _compile_initial(compiler, registry, _linear_specification())
-    executor = PipelineExecutor(initial.plan)
-    controller = ReconfigurationController(
-        executor, compiler, registry, clock=IncrementingClock()
-    )
+    executor = PipelineExecutor(initial.plan, clock=IncrementingClock())
+    controller = ReconfigurationController(executor, compiler, registry)
 
     try:
         # Admit one frame on the initial plan

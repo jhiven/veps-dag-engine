@@ -29,12 +29,15 @@ class RunMetadata:
     run_id: str
     utc_start_datetime: str
     benchmark_command: str
+    exact_argument_vector: tuple[str, ...]
     selected_suites: tuple[str, ...]
     selected_scenarios: tuple[str, ...]
     git_commit: str
     dirty_working_tree: bool
     python_implementation: str
     python_version: str
+    free_threaded_build: bool
+    gil_enabled: bool
     uv_lock_sha256: str
     operating_system: str
     kernel_version: str
@@ -57,6 +60,7 @@ class RunMetadata:
     equivalence_margins: dict[str, float]
     scenario_ordering_policy: str
     workload_calibration: dict[str, Any]
+    provenance: dict[str, Any]
 
     @classmethod
     def create(
@@ -76,19 +80,24 @@ class RunMetadata:
         registry_snapshot_identifiers: dict[str, str],
         compiler_version: str,
         workload_calibration: dict[str, Any],
+        exact_argument_vector: tuple[str, ...] = (),
+        provenance: dict[str, Any] | None = None,
     ) -> RunMetadata:
         return cls(
-            artifact_schema_version="1.5.0",
+            artifact_schema_version="2.0.0",
             benchmark_suite_version="0.1.0",
             run_id=run_id,
             utc_start_datetime=utc_start_datetime,
             benchmark_command=benchmark_command,
+            exact_argument_vector=exact_argument_vector,
             selected_suites=selected_suites,
             selected_scenarios=selected_scenarios,
             git_commit=env.git_commit,
             dirty_working_tree=env.dirty_working_tree,
             python_implementation=env.python_implementation,
             python_version=env.python_version,
+            free_threaded_build=env.free_threaded_build,
+            gil_enabled=env.gil_enabled,
             uv_lock_sha256=env.uv_lock_sha256,
             operating_system=env.operating_system,
             kernel_version=env.kernel_version,
@@ -111,6 +120,7 @@ class RunMetadata:
             equivalence_margins={"relative_margin": 0.01},
             scenario_ordering_policy="counterbalanced_seeded_random",
             workload_calibration=workload_calibration,
+            provenance={} if provenance is None else provenance,
         )
 
 
@@ -162,12 +172,15 @@ def load_run_json(path: str) -> RunMetadata:
         run_id=str(d["run_id"]),
         utc_start_datetime=str(d["utc_start_datetime"]),
         benchmark_command=str(d["benchmark_command"]),
+        exact_argument_vector=tuple(str(value) for value in d["exact_argument_vector"]),
         selected_suites=tuple(str(x) for x in d["selected_suites"]),
         selected_scenarios=tuple(str(x) for x in d["selected_scenarios"]),
         git_commit=str(d["git_commit"]),
         dirty_working_tree=bool(d["dirty_working_tree"]),
         python_implementation=str(d["python_implementation"]),
         python_version=str(d["python_version"]),
+        free_threaded_build=bool(d.get("free_threaded_build", False)),
+        gil_enabled=bool(d.get("gil_enabled", True)),
         uv_lock_sha256=str(d["uv_lock_sha256"]),
         operating_system=str(d["operating_system"]),
         kernel_version=str(d["kernel_version"]),
@@ -199,6 +212,7 @@ def load_run_json(path: str) -> RunMetadata:
             str(k): _parse_workload_calibration(v)
             for k, v in d["workload_calibration"].items()
         },
+        provenance={str(k): v for k, v in d.get("provenance", {}).items()},
     )
 
 

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass, replace
 from threading import Event, Lock, Thread
 
@@ -19,7 +18,7 @@ from nedo_vision_dag_engine.processor import (
     StatefulProcessorDescriptor,
     TransitionContext,
 )
-from nedo_vision_dag_engine.instrumentation import RetirementStatus
+from nedo_vision_dag_engine.instrumentation import FrameStatus, RetirementStatus
 from nedo_vision_dag_engine.reconfiguration import (
     ReconfigurationController,
     ReconfigurationInProgress,
@@ -304,8 +303,9 @@ def test_ready_candidate_commits_before_next_frame_and_records_effect() -> None:
     registry = _stateless_registry(events)
     compiler = WorkflowCompiler("test")
     initial = _compile_initial(compiler, registry, _source_only_specification())
-    executor = PipelineExecutor(initial.plan)
-    controller = ReconfigurationController(executor, compiler, registry, clock=IncrementingClock())
+    clock = IncrementingClock()
+    executor = PipelineExecutor(initial.plan, clock=clock)
+    controller = ReconfigurationController(executor, compiler, registry)
 
     try:
         controller.submit(_request("add-consumer", 1, _linear_specification()))
@@ -317,7 +317,9 @@ def test_ready_candidate_commits_before_next_frame_and_records_effect() -> None:
         assert ready is not None
         assert executor.active_plan.version == 1
 
-        frame_result = controller.admit_frame(admitted_at_ns=10_000, frame_id=7)
+        # The admission timestamp must come from the runtime's clock domain.
+        admitted_at_ns = clock()
+        frame_result = controller.admit_frame(admitted_at_ns=admitted_at_ns, frame_id=7)
         ret_rec = controller.wait_for_retirement("add-consumer", timeout_seconds=2.0)
         assert ret_rec is not None
         # Adding a consumer only reuses the source; no processor is removed or replaced,
@@ -329,7 +331,7 @@ def test_ready_candidate_commits_before_next_frame_and_records_effect() -> None:
         assert frame_result.executed_node_ids == ("source", "consumer")
         assert record.status is ReconfigurationStatus.COMMITTED
         assert record.commit_ns is not None
-        assert record.first_new_frame_admitted_ns == 10_000
+        assert record.first_new_frame_admitted_ns == admitted_at_ns
         assert record.first_new_frame_completed_ns is not None
         assert record.retirement_status is RetirementStatus.NOT_REQUIRED
         assert tuple(event.status for event in controller.event_log()) == (
@@ -343,13 +345,82 @@ def test_ready_candidate_commits_before_next_frame_and_records_effect() -> None:
         controller.close()
 
 
+def test_first_effect_requires_a_successful_new_plan_frame() -> None:
+    flaky_descriptor = ProcessorDescriptor(
+        type_name="flaky_source",
+        input_schema=object,
+        output_schema=ValueOutput,
+        config_schema=EmptyConfig,
+        state_policy=StatePolicy.STATELESS,
+        state_schema_version=None,
+    )
+
+    class FlakySource(RecordingProcessor):
+        def __init__(self) -> None:
+            super().__init__(flaky_descriptor, [], "flaky")
+            self._attempts = 0
+
+        def process(self, inputs: object, context: FrameContext) -> object:
+            self._attempts += 1
+            if self._attempts == 1:
+                raise RuntimeError("injected first-frame failure")
+            return ValueOutput(1)
+
+    builder = RegistryBuilder()
+    builder.register(
+        RegisteredProcessorType(
+            descriptor=SOURCE_DESCRIPTOR,
+            factory=lambda: RecordingProcessor(SOURCE_DESCRIPTOR, [], "source"),
+        )
+    )
+    builder.register(
+        RegisteredProcessorType(
+            descriptor=flaky_descriptor,
+            factory=FlakySource,
+        )
+    )
+    registry = builder.snapshot()
+    compiler = WorkflowCompiler("test")
+    initial = _compile_initial(compiler, registry, _source_only_specification())
+    clock = IncrementingClock()
+    executor = PipelineExecutor(initial.plan, clock=clock)
+    controller = ReconfigurationController(executor, compiler, registry)
+
+    try:
+        controller.submit(
+            _request("flaky", 1, _source_only_specification("flaky_source"))
+        )
+        ready = controller.wait_for_status(
+            "flaky",
+            frozenset({ReconfigurationStatus.READY}),
+            timeout_seconds=2.0,
+        )
+        assert ready is not None
+
+        failed = controller.admit_frame(10, 10)
+        assert failed.status is FrameStatus.FAILED
+        after_failure = controller.record("flaky")
+        assert after_failure.first_new_frame_admitted_ns is None
+        assert after_failure.first_new_frame_completed_ns is None
+        assert controller.wait_for_effect("flaky", timeout_seconds=0.01) is None
+
+        completed = controller.admit_frame(11, 11)
+        assert completed.status is FrameStatus.COMPLETED
+        effect = controller.wait_for_effect("flaky", timeout_seconds=1.0)
+        assert effect is not None
+        assert effect.first_new_frame_admitted_ns == 11
+        assert effect.first_new_frame_completed_ns is not None
+    finally:
+        controller.close()
+
+
 def test_stale_candidate_is_cleaned_without_replacing_active_plan() -> None:
     events: list[str] = []
     registry = _stateless_registry(events)
     compiler = WorkflowCompiler("test")
     initial = _compile_initial(compiler, registry, _source_only_specification())
-    executor = PipelineExecutor(initial.plan)
-    controller = ReconfigurationController(executor, compiler, registry, clock=IncrementingClock())
+    executor = PipelineExecutor(initial.plan, clock=IncrementingClock())
+    controller = ReconfigurationController(executor, compiler, registry)
 
     try:
         controller.submit(_request("stale", 1, _linear_specification()))
@@ -385,8 +456,8 @@ def test_invalid_workflow_is_rejected_without_staging_processors() -> None:
     compiler = WorkflowCompiler("test")
     initial = _compile_initial(compiler, registry, _source_only_specification())
     initial_event_count = len(events)
-    executor = PipelineExecutor(initial.plan)
-    controller = ReconfigurationController(executor, compiler, registry, clock=IncrementingClock())
+    executor = PipelineExecutor(initial.plan, clock=IncrementingClock())
+    controller = ReconfigurationController(executor, compiler, registry)
 
     try:
         controller.submit(_request("invalid", 1, _invalid_consumer_only_specification()))
@@ -407,8 +478,8 @@ def test_setup_failure_is_failure_atomic_and_rolls_back_staging() -> None:
     registry = _stateless_registry(events, fail_consumer_setup=True)
     compiler = WorkflowCompiler("test")
     initial = _compile_initial(compiler, registry, _source_only_specification())
-    executor = PipelineExecutor(initial.plan)
-    controller = ReconfigurationController(executor, compiler, registry, clock=IncrementingClock())
+    executor = PipelineExecutor(initial.plan, clock=IncrementingClock())
+    controller = ReconfigurationController(executor, compiler, registry)
 
     try:
         controller.submit(_request("setup-failure", 1, _linear_specification("fail")))
@@ -450,8 +521,8 @@ def test_compatible_stateful_processor_is_reused_across_commit() -> None:
     compiler = WorkflowCompiler("test")
     initial = _compile_initial(compiler, registry, _source_only_specification("tracker"))
     initial_tracker = initial.plan.steps[0].processor_ref
-    executor = PipelineExecutor(initial.plan)
-    controller = ReconfigurationController(executor, compiler, registry, clock=IncrementingClock())
+    executor = PipelineExecutor(initial.plan, clock=IncrementingClock())
+    controller = ReconfigurationController(executor, compiler, registry)
 
     try:
         first = controller.admit_frame(admitted_at_ns=1)
@@ -504,8 +575,8 @@ def test_explicit_reset_uses_new_stateful_instance_and_emits_event() -> None:
     initial_specification = _source_only_specification("tracker")
     initial = _compile_initial(compiler, registry, initial_specification)
     old_tracker = initial.plan.steps[0].processor_ref
-    executor = PipelineExecutor(initial.plan)
-    controller = ReconfigurationController(executor, compiler, registry, clock=IncrementingClock())
+    executor = PipelineExecutor(initial.plan, clock=IncrementingClock())
+    controller = ReconfigurationController(executor, compiler, registry)
 
     try:
         controller.admit_frame(admitted_at_ns=1)
@@ -549,8 +620,8 @@ def test_wait_for_retirement_returns_none_before_commit() -> None:
     registry = _stateless_registry([])
     compiler = WorkflowCompiler("test")
     initial = _compile_initial(compiler, registry, _source_only_specification())
-    executor = PipelineExecutor(initial.plan)
-    controller = ReconfigurationController(executor, compiler, registry, clock=IncrementingClock())
+    executor = PipelineExecutor(initial.plan, clock=IncrementingClock())
+    controller = ReconfigurationController(executor, compiler, registry)
 
     try:
         controller.submit(_request("ready-req", 1, _linear_specification()))
@@ -572,8 +643,8 @@ def test_abort_ready_candidate_cleans_staged_resources() -> None:
     registry = _stateless_registry(events)
     compiler = WorkflowCompiler("test")
     initial = _compile_initial(compiler, registry, _source_only_specification())
-    executor = PipelineExecutor(initial.plan)
-    controller = ReconfigurationController(executor, compiler, registry, clock=IncrementingClock())
+    executor = PipelineExecutor(initial.plan, clock=IncrementingClock())
+    controller = ReconfigurationController(executor, compiler, registry)
 
     try:
         controller.submit(_request("abort-ready", 1, _linear_specification()))
@@ -604,7 +675,6 @@ def test_second_request_is_rejected_while_first_is_ready() -> None:
         PipelineExecutor(initial.plan),
         compiler,
         registry,
-        clock=IncrementingClock(),
     )
 
     try:
@@ -622,7 +692,7 @@ def test_second_request_is_rejected_while_first_is_ready() -> None:
         controller.close()
 
 
-def test_executor_plan_swap_waits_for_in_flight_frame() -> None:
+def test_executor_plan_swap_completes_while_old_frame_is_in_flight() -> None:
     entered = Event()
     release = Event()
     processor = BlockingProcessor(entered, release)
@@ -654,9 +724,9 @@ def test_executor_plan_swap_waits_for_in_flight_frame() -> None:
     frame_thread.start()
     assert entered.wait(timeout=1.0)
     commit_thread.start()
-    time.sleep(0.05)
-
-    assert not swap_finished.is_set()
+    assert swap_finished.wait(timeout=1.0)
+    assert not release.is_set()
+    assert executor.active_plan.version == 2
     release.set()
     frame_thread.join(timeout=1.0)
     commit_thread.join(timeout=1.0)
@@ -670,18 +740,17 @@ def test_submit_does_not_block_during_frame_execution() -> None:
     registry = _stateless_registry(events)
     compiler = WorkflowCompiler("test")
     initial = _compile_initial(compiler, registry, _source_only_specification())
-    executor = PipelineExecutor(initial.plan)
-    controller = ReconfigurationController(executor, compiler, registry, clock=IncrementingClock())
+    executor = PipelineExecutor(initial.plan, clock=IncrementingClock())
+    controller = ReconfigurationController(executor, compiler, registry)
 
     try:
-        # We need a blocking frame to simulate an in-flight execution.
-        # If we just acquire `_execution_lock`, `submit` should still succeed immediately
-        # because `submit` only acquires `_plan_lock` indirectly via `active_plan_snapshot`.
-        execution_lock = getattr(executor, "_execution_lock")
-        with execution_lock:
+        # Candidate submission only needs a plan snapshot. It must not depend
+        # on the lock that protects processor execution and the workspace pool.
+        frame_execution_lock = getattr(executor, "_frame_execution_lock")
+        with frame_execution_lock:
             # We are currently executing a frame
             controller.submit(_request("nonblocking", 1, _linear_specification()))
-            # If submit blocked on _execution_lock, it would deadlock here.
+            # If submit blocked on the frame-execution lock, it would deadlock here.
             # Thus, the test will hang if it's broken.
     finally:
         controller.close()
@@ -691,8 +760,8 @@ def test_managed_executor_rejects_direct_admit_frame() -> None:
     registry = _stateless_registry(events)
     compiler = WorkflowCompiler("test")
     initial = _compile_initial(compiler, registry, _source_only_specification())
-    executor = PipelineExecutor(initial.plan)
-    controller = ReconfigurationController(executor, compiler, registry, clock=IncrementingClock())
+    executor = PipelineExecutor(initial.plan, clock=IncrementingClock())
+    controller = ReconfigurationController(executor, compiler, registry)
 
     try:
         with pytest.raises(RuntimeError, match="managed by a ReconfigurationController"):
@@ -705,8 +774,8 @@ def test_managed_executor_rejects_direct_commit() -> None:
     registry = _stateless_registry(events)
     compiler = WorkflowCompiler("test")
     initial = _compile_initial(compiler, registry, _source_only_specification())
-    executor = PipelineExecutor(initial.plan)
-    controller = ReconfigurationController(executor, compiler, registry, clock=IncrementingClock())
+    executor = PipelineExecutor(initial.plan, clock=IncrementingClock())
+    controller = ReconfigurationController(executor, compiler, registry)
 
     try:
         with pytest.raises(RuntimeError, match="managed by a ReconfigurationController"):
@@ -719,8 +788,8 @@ def test_retirement_runs_asynchronously_after_commit() -> None:
     registry = _stateless_registry(events)
     compiler = WorkflowCompiler("test")
     initial = _compile_initial(compiler, registry, _linear_specification())
-    executor = PipelineExecutor(initial.plan)
-    controller = ReconfigurationController(executor, compiler, registry, clock=IncrementingClock())
+    executor = PipelineExecutor(initial.plan, clock=IncrementingClock())
+    controller = ReconfigurationController(executor, compiler, registry)
 
     try:
         controller.submit(_request("req1", 1, _source_only_specification()))
@@ -752,13 +821,13 @@ def test_old_token_invalid_after_controller_recreated() -> None:
     registry = _stateless_registry([])
     compiler = WorkflowCompiler("test")
     initial = _compile_initial(compiler, registry, _linear_specification())
-    executor = PipelineExecutor(initial.plan)
+    executor = PipelineExecutor(initial.plan, clock=IncrementingClock())
 
-    controller_a = ReconfigurationController(executor, compiler, registry, clock=IncrementingClock())
+    controller_a = ReconfigurationController(executor, compiler, registry)
     token_a = getattr(controller_a, "_executor_token")
     controller_a.close()
 
-    controller_b = ReconfigurationController(executor, compiler, registry, clock=IncrementingClock())
+    controller_b = ReconfigurationController(executor, compiler, registry)
     try:
         with pytest.raises(RuntimeError, match="invalid executor management token"):
             executor.admit_frame_managed(token_a, 1)
@@ -766,7 +835,7 @@ def test_old_token_invalid_after_controller_recreated() -> None:
         controller_b.close()
 
 
-def test_claim_management_waits_for_unmanaged_frame() -> None:
+def test_claim_management_does_not_invalidate_an_already_admitted_frame() -> None:
     frame_started = Event()
     frame_release = Event()
 
@@ -809,8 +878,8 @@ def test_claim_management_waits_for_unmanaged_frame() -> None:
     t_claim = Thread(target=claim_worker, daemon=True)
     t_claim.start()
 
-    time.sleep(0.05)
-    assert not claim_done.is_set()
+    assert claim_done.wait(timeout=1.0)
+    assert not frame_release.is_set()
 
     frame_release.set()
     t.join()
@@ -824,8 +893,8 @@ def test_invalid_token_cannot_admit_or_commit() -> None:
     registry = _stateless_registry([])
     compiler = WorkflowCompiler("test")
     initial = _compile_initial(compiler, registry, _linear_specification())
-    executor = PipelineExecutor(initial.plan)
-    controller = ReconfigurationController(executor, compiler, registry, clock=IncrementingClock())
+    executor = PipelineExecutor(initial.plan, clock=IncrementingClock())
+    controller = ReconfigurationController(executor, compiler, registry)
 
     try:
         with pytest.raises(RuntimeError, match="invalid executor management token"):
@@ -843,11 +912,11 @@ def test_two_controllers_cannot_claim_same_executor() -> None:
     registry = _stateless_registry([])
     compiler = WorkflowCompiler("test")
     initial = _compile_initial(compiler, registry, _linear_specification())
-    executor = PipelineExecutor(initial.plan)
-    c1 = ReconfigurationController(executor, compiler, registry, clock=IncrementingClock())
+    executor = PipelineExecutor(initial.plan, clock=IncrementingClock())
+    c1 = ReconfigurationController(executor, compiler, registry)
     try:
         with pytest.raises(RuntimeError, match="already managed"):
-            ReconfigurationController(executor, compiler, registry, clock=IncrementingClock())
+            ReconfigurationController(executor, compiler, registry)
     finally:
         c1.close()
 
@@ -874,9 +943,9 @@ def test_close_waits_for_pending_retirement() -> None:
     spec1 = _source_only_specification("source")
     cand1 = compiler.compile(spec1, reg)
     assert isinstance(cand1, CompiledCandidate)
-    executor = PipelineExecutor(cand1.plan)
+    executor = PipelineExecutor(cand1.plan, clock=IncrementingClock())
 
-    controller = ReconfigurationController(executor, compiler, reg, clock=IncrementingClock())
+    controller = ReconfigurationController(executor, compiler, reg)
 
     spec2 = WorkflowSpecification(nodes=(), edges=())
     controller.submit(_request("r1", 1, spec2))
@@ -926,8 +995,8 @@ def test_frame_runs_concurrently_during_blocked_retirement() -> None:
     cand1 = compiler.compile(spec1, reg)
     assert isinstance(cand1, CompiledCandidate)
 
-    executor = PipelineExecutor(cand1.plan)
-    controller = ReconfigurationController(executor, compiler, reg, clock=IncrementingClock())
+    executor = PipelineExecutor(cand1.plan, clock=IncrementingClock())
+    controller = ReconfigurationController(executor, compiler, reg)
 
     try:
         spec2 = _source_only_specification("source")

@@ -158,14 +158,30 @@ def validate_benchmark_csvs(summary_csv_path: str, frame_csv_path: str) -> tuple
         # Denominators and Phase counts
         pre_req_target = parse_int(s.get("pre_request_source_frame_target")) or 60
         pre_req_rec = parse_int(s.get("pre_request_source_frames_received"))
-        post_eff_target = parse_int(s.get("post_effect_source_frame_target")) or 60
+        transition_rec = parse_int(s.get("transition_source_frames_received"))
         post_eff_rec = parse_int(s.get("post_effect_source_frames_received"))
         total_rec = parse_int(s.get("total_measurement_source_frames_received"))
+        window_size = parse_int(s.get("fixed_window_expected_source_frames"))
 
         if pre_req_rec is not None and pre_req_rec != pre_req_target:
             errors.append(f"Rep {rep} Mech {mech}: pre-request received ({pre_req_rec}) != target ({pre_req_target})")
-        if post_eff_rec is not None and post_eff_rec != post_eff_target:
-            errors.append(f"Rep {rep} Mech {mech}: post-effect received ({post_eff_rec}) != target ({post_eff_target})")
+
+        # The window is a fixed count of receiver positions, so its size is the
+        # enforced quantity. How the post-request positions split between
+        # "before the first candidate output" and "after" it is mechanism
+        # dependent and is therefore not a target.
+        if total_rec is not None and window_size is not None and total_rec != window_size:
+            errors.append(
+                f"Rep {rep} Mech {mech}: measured receiver positions ({total_rec}) "
+                f"!= fixed window size ({window_size})"
+            )
+        if None not in (pre_req_rec, transition_rec, post_eff_rec, total_rec):
+            phase_sum = (pre_req_rec or 0) + (transition_rec or 0) + (post_eff_rec or 0)
+            if phase_sum != total_rec:
+                errors.append(
+                    f"Rep {rep} Mech {mech}: phase decomposition ({phase_sum}) "
+                    f"!= measured receiver positions ({total_rec})"
+                )
 
         # Phase source and drop counts reconciliation
         s_before = parse_int(s.get("source_frames_before_request"))
@@ -305,7 +321,11 @@ def validate_benchmark_csvs(summary_csv_path: str, frame_csv_path: str) -> tuple
             "request_trigger_media_frame_index",
             "request_trigger_media_pts_ns",
             "pre_request_source_frame_target",
-            "post_effect_source_frame_target",
+            "post_request_source_frame_target",
+            # Every mechanism in a repetition block must observe the same
+            # window, otherwise the paired comparison is not matched.
+            "fixed_window_expected_source_frames",
+            "total_measurement_source_frames_received",
         )
 
         for s in s_list[1:]:

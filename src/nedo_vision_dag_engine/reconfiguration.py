@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass, replace
 from queue import Queue
 from threading import Condition, Lock, Thread, current_thread
@@ -17,6 +16,7 @@ from nedo_vision_dag_engine.compiler import (
 )
 from nedo_vision_dag_engine.executor import FrameResult, PipelineExecutor
 from nedo_vision_dag_engine.instrumentation import (
+    FrameStatus,
     NanosecondClock,
     ReconfigurationEvent,
     ReconfigurationMeasurement,
@@ -24,6 +24,7 @@ from nedo_vision_dag_engine.instrumentation import (
     RetirementStatus,
     RuntimeInstrumentation,
     StateReuseEvent,
+    emit_runtime_evidence,
 )
 from nedo_vision_dag_engine.lifecycle import (
     CleanupReason,
@@ -84,6 +85,9 @@ _ALLOWED_TRANSITIONS: dict[ReconfigurationStatus, frozenset[ReconfigurationStatu
             ReconfigurationStatus.COMMITTED,
             ReconfigurationStatus.STALE,
             ReconfigurationStatus.ABORTED,
+            # A ready candidate still fails when its pre-publication drain
+            # does not complete within the handoff timeout.
+            ReconfigurationStatus.FAILED,
         }
     ),
     ReconfigurationStatus.COMMITTED: frozenset(),
@@ -167,8 +171,16 @@ class BoundaryCommitResult:
     handoff_wait_ns: int | None = None
 
     def __post_init__(self) -> None:
-        if self.status not in {ReconfigurationStatus.COMMITTED, ReconfigurationStatus.STALE}:
-            raise ValueError("boundary commit result status must be COMMITTED or STALE.")
+        # FAILED covers the candidate whose pre-publication drain timed out:
+        # the boundary was reached, but publication was refused.
+        if self.status not in {
+            ReconfigurationStatus.COMMITTED,
+            ReconfigurationStatus.STALE,
+            ReconfigurationStatus.FAILED,
+        }:
+            raise ValueError(
+                "boundary commit result status must be COMMITTED, STALE, or FAILED."
+            )
 
 
 class ReconfigurationError(Exception):
@@ -211,6 +223,14 @@ type _WorkItem = _CompilationJob | _StopCommand
 class _RetirementStopCommand:
     pass
 
+
+#: Upper bound on the pre-publication drain. The admission gate is closed for
+#: its whole duration, so a processor that never returns would otherwise stall
+#: every frame indefinitely. Exceeding it aborts the request instead.
+HANDOFF_DRAIN_TIMEOUT_SECONDS: float = 30.0
+
+#: Upper bound on the post-publication grace period before retirement stalls.
+RETIREMENT_GRACE_TIMEOUT_SECONDS: float = 30.0
 
 _STOP = _StopCommand()
 _RETIREMENT_STOP = _RetirementStopCommand()
@@ -290,7 +310,6 @@ class ReconfigurationController:
         executor: PipelineExecutor,
         compiler: WorkflowCompiler,
         registry: RegistrySnapshot,
-        clock: NanosecondClock = time.monotonic_ns,
         worker_name: str = "dag-reconfiguration",
     ) -> None:
         if not worker_name:
@@ -301,7 +320,10 @@ class ReconfigurationController:
         self._executor.claim_management(self._executor_token)
         self._compiler = compiler
         self._registry = registry
-        self._clock = clock
+        # The executor owns the sole runtime clock domain. Controller and frame
+        # timestamps must be comparable, so the controller cannot be given an
+        # independent clock.
+        self._clock = executor.clock
         self._state_lock = Lock()
         self._condition = Condition(self._state_lock)
         self._admission_lock = Lock()
@@ -463,6 +485,7 @@ class ReconfigurationController:
             return self._commit_ready_unlocked()
 
     def admit_frame(self, admitted_at_ns: int, frame_id: int | None = None) -> FrameResult:
+        record_completion = False
         with self._admission_lock:
             # ── fast path: no reconfiguration transaction in progress ──
             # _state_lock is acquired here for a brief read of controller
@@ -478,24 +501,59 @@ class ReconfigurationController:
                     and not self._closed
                 )
             if fast_path:
-                return self._executor.admit_frame_managed(
+                admission = self._executor.reserve_frame_managed(
                     token=self._executor_token,
                     admitted_at_ns=admitted_at_ns,
                     frame_id=frame_id,
                 )
+            else:
+                # ── slow path: reconfiguration in progress ──
+                with self._condition:
+                    self._require_open_locked()
+                self._commit_ready_unlocked()
+                admission = self._executor.reserve_frame_managed(
+                    token=self._executor_token,
+                    admitted_at_ns=admitted_at_ns,
+                    frame_id=frame_id,
+                )
+                record_completion = True
+                try:
+                    self._record_frame_admission(admission.plan.version)
+                except BaseException:
+                    self._executor.cancel_reserved_frame_managed(
+                        self._executor_token,
+                        admission,
+                    )
+                    raise
 
-            # ── slow path: reconfiguration in progress ──
-            with self._condition:
-                self._require_open_locked()
-            self._commit_ready_unlocked()
-            result = self._executor.admit_frame_managed(
-                token=self._executor_token,
-                admitted_at_ns=admitted_at_ns,
-                frame_id=frame_id,
-            )
+        result = self._executor.execute_admitted_frame(admission)
+        if record_completion:
             completed_at_ns = self._clock()
             self._record_frame_completion(result, admitted_at_ns, completed_at_ns)
-            return result
+        return result
+
+    def _record_frame_admission(
+        self,
+        plan_version: int,
+    ) -> None:
+        """Record an old-plan admission at its actual linearization boundary."""
+        with self._condition:
+            active_id = self._active_request_id
+            if active_id is None:
+                return
+            record = self._records.get(active_id)
+            if (
+                record is None
+                or record.commit_started_ns is not None
+                or plan_version != record.base_version
+            ):
+                return
+            self._records[active_id] = replace(
+                record,
+                old_plan_frames_admitted_after_request_before_commit=(
+                    record.old_plan_frames_admitted_after_request_before_commit + 1
+                ),
+            )
 
     def record(self, request_id: str) -> ReconfigurationRecord:
         with self._condition:
@@ -887,8 +945,29 @@ class ReconfigurationController:
         handoff_wait_complete_ns: int | None = None
         if handoff_required:
             handoff_wait_start_ns = self._clock()
-            self._executor.wait_for_plan_quiescent(self._executor.active_plan.version)
+            emit_runtime_evidence(
+                "handoff_gate_closed",
+                request_id=request.request_id,
+                plan_id=self._executor.active_plan.version,
+            )
+            drained = self._executor.wait_for_plan_quiescent(
+                self._executor.active_plan.version,
+                timeout=HANDOFF_DRAIN_TIMEOUT_SECONDS,
+            )
             handoff_wait_complete_ns = self._clock()
+            if not drained:
+                return self._abort_undrained_handoff(
+                    request=request,
+                    candidate=candidate,
+                    commit_started_at_ns=commit_started_at_ns,
+                    handoff_wait_start_ns=handoff_wait_start_ns,
+                    handoff_wait_complete_ns=handoff_wait_complete_ns,
+                )
+            emit_runtime_evidence(
+                "handoff_gate_opened",
+                request_id=request.request_id,
+                plan_id=self._executor.active_plan.version,
+            )
 
         with self._condition:
             record = self._record_or_raise_locked(request.request_id)
@@ -1020,6 +1099,57 @@ class ReconfigurationController:
             ),
         )
 
+    def _abort_undrained_handoff(
+        self,
+        request: ReconfigurationRequest,
+        candidate: CompiledCandidate,
+        commit_started_at_ns: int,
+        handoff_wait_start_ns: int,
+        handoff_wait_complete_ns: int,
+    ) -> BoundaryCommitResult:
+        """Abandon a candidate whose preserved state never became exclusive.
+
+        Publishing without an exclusive handoff would let old- and new-plan
+        frames touch the same mutable processor, so the candidate is discarded
+        and the active plan keeps serving, exactly as for a preparation
+        failure.
+        """
+        observed_active_version = self._executor.active_plan.version
+        cleanup_report, cleanup_error = self._discard_candidate(candidate)
+        failed_at_ns = self._clock()
+        reason = _combine_reasons(
+            (
+                "preserved mutable state did not become exclusive within "
+                f"{HANDOFF_DRAIN_TIMEOUT_SECONDS} s; plan version "
+                f"{observed_active_version} still has in-flight frames."
+            ),
+            cleanup_error,
+        )
+        with self._condition:
+            record = self._record_or_raise_locked(request.request_id)
+            failed_record = replace(
+                record,
+                commit_started_ns=commit_started_at_ns,
+                handoff_wait_start_ns=handoff_wait_start_ns,
+                handoff_wait_complete_ns=handoff_wait_complete_ns,
+                status=ReconfigurationStatus.FAILED,
+                failure_reason=reason,
+                candidate_cleanup_report=cleanup_report,
+            )
+            self._finish_terminal_locked(failed_record, failed_at_ns, reason)
+        return BoundaryCommitResult(
+            request_id=request.request_id,
+            status=ReconfigurationStatus.FAILED,
+            observed_active_version=observed_active_version,
+            candidate_version=candidate.plan.version,
+            committed_at_ns=None,
+            state_transition_events=(),
+            retirement_deferred=False,
+            cleanup_report=cleanup_report,
+            handoff_required=True,
+            handoff_wait_ns=handoff_wait_complete_ns - handoff_wait_start_ns,
+        )
+
     def _take_ready_candidate(self) -> _ReadyCandidate | None:
         """Return and remove the first ready candidate, if any.
 
@@ -1051,23 +1181,10 @@ class ReconfigurationController:
         completed_at_ns: int,
     ) -> None:
         with self._condition:
-            active_id = self._active_request_id
-            if active_id is not None:
-                record = self._records.get(active_id)
-                if (
-                    record is not None
-                    and record.commit_started_ns is None
-                    and result.plan_version == record.base_version
-                    and admitted_at_ns >= record.request_received_ns
-                ):
-                    updated_record = replace(
-                        record,
-                        old_plan_frames_admitted_after_request_before_commit=record.old_plan_frames_admitted_after_request_before_commit + 1,
-                    )
-                    self._records[active_id] = updated_record
-
             request_id = self._committed_request_by_plan_version.get(result.plan_version)
             if request_id is None:
+                return
+            if result.status is not FrameStatus.COMPLETED:
                 return
             record = self._records[request_id]
             if record.first_new_frame_admitted_ns is not None:
@@ -1115,6 +1232,18 @@ class ReconfigurationController:
                 ),
             ),
         )
+        self._executor.update_plan_lifecycle(
+            deferred.previous_plan.version,
+            PlanLifecycleState.RETIREMENT_FAILED,
+        )
+        emit_runtime_evidence(
+            "retirement_failed",
+            request_id=deferred.request_id,
+            plan_id=deferred.previous_plan.version,
+            outcome="failed",
+            error_type=type(error).__name__,
+            error_message=str(error),
+        )
         with self._condition:
             record = self._records.get(deferred.request_id)
             if record is not None:
@@ -1134,6 +1263,11 @@ class ReconfigurationController:
 
     def _process_pending_retirement(self, deferred: _PendingRetirement) -> None:
         retirement_started_at_ns = self._clock()
+        emit_runtime_evidence(
+            "retirement_started",
+            request_id=deferred.request_id,
+            plan_id=deferred.previous_plan.version,
+        )
 
         # Idempotent guard: skip if this plan version was already cleaned.
         if deferred.previous_plan.version in self._cleaned_plans:
@@ -1155,10 +1289,12 @@ class ReconfigurationController:
         grace_period_start_ns = self._clock()
         quiescent = self._executor.wait_for_plan_quiescent(
             deferred.previous_plan.version,
-            timeout=30.0,
+            timeout=RETIREMENT_GRACE_TIMEOUT_SECONDS,
         )
         grace_period_complete_ns = self._clock()
-        last_old_frame_completed_ns = grace_period_complete_ns
+        last_old_frame_completed_ns = self._executor.last_frame_completion_ns(
+            deferred.previous_plan.version
+        )
 
         if not quiescent:
             # Grace period timed out — stall rather than force-cleanup.
@@ -1181,7 +1317,24 @@ class ReconfigurationController:
                     self._records[deferred.request_id] = updated_record
                     self._record_measurement(updated_record)
                     self._condition.notify_all()
+            emit_runtime_evidence(
+                "retirement_failed",
+                request_id=deferred.request_id,
+                plan_id=deferred.previous_plan.version,
+                outcome="stalled",
+                error_message="grace period timed out",
+            )
             return
+
+        self._executor.update_plan_lifecycle(
+            deferred.previous_plan.version,
+            PlanLifecycleState.QUIESCENT,
+        )
+        emit_runtime_evidence(
+            "plan_quiescent",
+            request_id=deferred.request_id,
+            plan_id=deferred.previous_plan.version,
+        )
 
         # ── Cleanup superseded processors ──
         cleanup_start_ns = self._clock()
@@ -1228,15 +1381,18 @@ class ReconfigurationController:
             retirement_report = replace(retirement_report, failures=tuple(failures))
 
         # ── Update plan lifecycle ──
-        self._executor.update_plan_lifecycle(
-            deferred.previous_plan.version,
-            PlanLifecycleState.RETIRED,
-        )
-
         retirement_completed_at_ns = self._clock()
 
         is_success = (retirement_reason is None) and (retirement_report.succeeded)
         ret_status = RetirementStatus.COMPLETED if is_success else RetirementStatus.FAILED
+        self._executor.update_plan_lifecycle(
+            deferred.previous_plan.version,
+            (
+                PlanLifecycleState.RETIRED
+                if is_success
+                else PlanLifecycleState.RETIREMENT_FAILED
+            ),
+        )
 
         with self._condition:
             record = self._records.get(deferred.request_id)
@@ -1257,6 +1413,13 @@ class ReconfigurationController:
                 self._records[deferred.request_id] = updated_record
                 self._record_measurement(updated_record)
                 self._condition.notify_all()
+        emit_runtime_evidence(
+            "retirement_completed" if is_success else "retirement_failed",
+            request_id=deferred.request_id,
+            plan_id=deferred.previous_plan.version,
+            outcome=ret_status.value,
+            error_message=retirement_reason,
+        )
 
     def _record_measurement(self, record: ReconfigurationRecord) -> None:
         candidate_cleanup_failure_count = (

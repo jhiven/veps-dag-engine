@@ -117,7 +117,7 @@ def _valid_summary(rep: int = 1, mech: str = "VEPS") -> dict[str, str]:
         "pre_request_source_frame_target": "60",
         "pre_request_source_frames_received": "60",
         "transition_source_frames_received": "10",
-        "post_effect_source_frame_target": "60",
+        "post_request_source_frame_target": "70",
         "post_effect_source_frames_received": "60",
         "total_measurement_source_frames_received": "130",
         "source_frames_before_request": "60",
@@ -271,8 +271,12 @@ def test_pre_request_invariant() -> None:
         assert any("pre-request received" in e for e in errors)
 
 
-def test_post_effect_invariant() -> None:
-    """post_effect_source_frames_received must equal post_effect_source_frame_target."""
+def test_phase_decomposition_must_cover_the_measured_window() -> None:
+    """The phase counters must account for every measured receiver position.
+
+    The split between transition and post-effect positions is mechanism
+    dependent, so only the decomposition's total is an invariant.
+    """
     with tempfile.TemporaryDirectory() as d:
         s_path = os.path.join(d, "s.csv")
         f_path = os.path.join(d, "f.csv")
@@ -285,18 +289,22 @@ def test_post_effect_invariant() -> None:
 
         ok, errors = validate_benchmark_csvs(s_path, f_path)
         assert not ok
-        assert any("post-effect received" in e for e in errors)
+        assert any("phase decomposition" in e for e in errors)
 
 
-def test_total_measured_frames_can_vary_by_mechanism() -> None:
-    """Different mechanisms can have different total measurement frames (not forced to 180)."""
+def test_mechanisms_must_measure_the_same_window() -> None:
+    """A repetition block is only paired if every mechanism observes one window.
+
+    Under the mechanism-independent protocol the window is a fixed count of
+    receiver positions, so a mechanism that measured a different number of them
+    breaks the pairing and must be reported.
+    """
     with tempfile.TemporaryDirectory() as d:
         s_path = os.path.join(d, "s.csv")
         f_path = os.path.join(d, "f.csv")
         s1 = _valid_summary(rep=1, mech="VEPS")
-        # VEPS: 130 total measured, phase sums = 130
         s2 = _valid_summary(rep=1, mech="Stop")
-        # Stop: 145 total measured (15 transition frames instead of 10)
+        # Stop observed 15 more receiver positions than VEPS.
         s2["total_measurement_source_frames_received"] = "145"
         s2["measurement_end_source_sequence"] = "145"
         s2["source_frames_received"] = "145"
@@ -312,7 +320,6 @@ def test_total_measured_frames_can_vary_by_mechanism() -> None:
         s2["measurement_end_media_frame_index"] = "145"
 
         summary_rows = [s1, s2]
-        # VEPS: 130 frames, Stop: 145 frames (different transition lengths).
         f1 = [_valid_frame(i, mech="VEPS", media_idx=str(i)) for i in range(1, 131)]
         f2 = [_valid_frame(i, mech="Stop", media_idx=str(i)) for i in range(1, 146)]
         frame_rows = f1 + f2
@@ -320,8 +327,36 @@ def test_total_measured_frames_can_vary_by_mechanism() -> None:
         _write_summary_csv(s_path, summary_rows)
         _write_frame_csv(f_path, frame_rows)
 
-        ok, _ = validate_benchmark_csvs(s_path, f_path)
-        assert ok
+        ok, errors = validate_benchmark_csvs(s_path, f_path)
+        assert not ok
+        assert any("total_measurement_source_frames_received" in e for e in errors)
+
+
+def test_matched_mechanisms_measuring_one_window_validate() -> None:
+    """Mechanisms that agree on the window still pass, whatever their phases."""
+    with tempfile.TemporaryDirectory() as d:
+        s_path = os.path.join(d, "s.csv")
+        f_path = os.path.join(d, "f.csv")
+        s1 = _valid_summary(rep=1, mech="VEPS")
+        s2 = _valid_summary(rep=1, mech="Stop")
+        # Same window, but the transition consumed more of it for Stop.
+        s2["transition_source_frames_received"] = "25"
+        s2["post_effect_source_frames_received"] = "45"
+        s2["source_frames_during_candidate_preparation"] = "8"
+        s2["source_frames_between_preparation_and_publication"] = "5"
+        s2["source_frames_between_publication_and_first_candidate_output"] = "12"
+        s2["source_frames_after_first_candidate_output"] = "45"
+
+        summary_rows = [s1, s2]
+        f1 = [_valid_frame(i, mech="VEPS", media_idx=str(i)) for i in range(1, 131)]
+        f2 = [_valid_frame(i, mech="Stop", media_idx=str(i)) for i in range(1, 131)]
+        frame_rows = f1 + f2
+
+        _write_summary_csv(s_path, summary_rows)
+        _write_frame_csv(f_path, frame_rows)
+
+        ok, errors = validate_benchmark_csvs(s_path, f_path)
+        assert ok, errors
 
 
 # ---------------------------------------------------------------------------

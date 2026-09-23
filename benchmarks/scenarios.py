@@ -444,7 +444,7 @@ def make_reconfiguration_base_spec(with_tracker: bool = False) -> WorkflowSpecif
             ),
             outputs=(
                 Pin(
-                    name="value",
+                    name="tracks",
                     payload_type=ConcreteType(object),
                     cardinality=PinCardinality.SINGLE,
                     requirement=PinRequirement.REQUIRED,
@@ -468,7 +468,12 @@ def make_reconfiguration_base_spec(with_tracker: bool = False) -> WorkflowSpecif
     )
     edges = (
         Edge("n0", "value", "tracker" if with_tracker else "n1", "value"),
-        Edge("tracker" if with_tracker else "n1", "value", "n2", "value"),
+        Edge(
+            "tracker" if with_tracker else "n1",
+            "tracks" if with_tracker else "value",
+            "n2",
+            "value",
+        ),
         Edge("n2", "value", "n3", "value"),
         Edge("n3", "value", "n4", "value"),
         Edge("n4", "value", "n5", "value"),
@@ -537,7 +542,7 @@ def apply_reconfiguration_edit(
             inputs=(),
             outputs=(
                 Pin(
-                    name="value",
+                    name="tracks",
                     payload_type=ConcreteType(object),
                     cardinality=PinCardinality.SINGLE,
                     requirement=PinRequirement.REQUIRED,
@@ -549,7 +554,7 @@ def apply_reconfiguration_edit(
         edges_list = []
         for e in base_spec.edges:
             if e.source_node_id == "n1":
-                edges_list.append(Edge("tracker", "value", e.destination_node_id, e.destination_pin))
+                edges_list.append(Edge("tracker", "tracks", e.destination_node_id, e.destination_pin))
             elif e.destination_node_id == "n1":
                 continue
             elif e.source_node_id == "n5" and e.destination_node_id == "n8":
