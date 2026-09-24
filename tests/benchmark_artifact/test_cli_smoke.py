@@ -28,6 +28,10 @@ def test_cli_smoke_run_and_verify() -> None:
 
         assert len(reconfig_rows) > 0
         assert len(stress_rows) > 0
+        for row in stress_rows:
+            assert row.calibrated_service_time_ns is not None
+            assert row.configured_inter_arrival_ns is not None
+            assert row.target_load_ratio == 0.9
 
         for r in reconfig_rows + stress_rows:
             assert r.admission_stop_ns is not None

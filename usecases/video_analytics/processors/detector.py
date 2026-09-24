@@ -24,6 +24,15 @@ __all__ = [
 ]
 
 
+class SourceFrameUnavailable(RuntimeError):
+    """The live source had no decoded frame within its short read wait.
+
+    This is a transient condition of a live stream, not end of input: the
+    caller may admit another frame. A decoder that has exited raises from the
+    source instead.
+    """
+
+
 class DetectorProcessor(Processor):
     """Processor wrapper around a DetectorBackend instance."""
 
@@ -71,7 +80,7 @@ class DetectorProcessor(Processor):
         if frame_packet is None and self.source is not None:
             frame_packet = self.source.read()
             if frame_packet is None:
-                raise StopIteration("End of video stream reached")
+                raise SourceFrameUnavailable("live source returned no frame within its read wait")
 
         if frame_packet is None:
             dummy_bgr = np.zeros((480, 640, 3), dtype=np.uint8)

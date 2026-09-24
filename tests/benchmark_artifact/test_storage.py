@@ -111,6 +111,9 @@ def test_reconfiguration_storage_roundtrip() -> None:
         total_synchronous_ns=90,
         instrumented_phase_sum_ns=360,
         unattributed_request_time_ns=5,
+        calibrated_service_time_ns=900,
+        configured_inter_arrival_ns=1000,
+        target_load_ratio=0.9,
     )
 
     append_reconfiguration_rows(path, [row])

@@ -56,6 +56,9 @@ class FileVideoSource(FrameSource):
         self._measurement_source_frames_received: int = 0
         self._measurement_start_timestamp_ns: int | None = None
         self._measurement_end_timestamp_ns: int | None = None
+        self._request_boundary_timestamp_ns: int | None = None
+        self._request_boundary_receiver_position: int | None = None
+        self._fixed_endpoint_observer: Callable[[], None] | None = None
         self._lock: threading.Lock = threading.Lock()
 
         # Phase-normalized measurement state
@@ -79,6 +82,22 @@ class FileVideoSource(FrameSource):
             self._measurement_source_frames_received = 0
             self._measurement_start_timestamp_ns = time.monotonic_ns()
             self._measurement_end_timestamp_ns = None
+            self._request_boundary_timestamp_ns = None
+            self._request_boundary_receiver_position = None
+
+    def set_fixed_endpoint_observer(self, observer: Callable[[], None] | None) -> None:
+        with self._lock:
+            self._fixed_endpoint_observer = observer
+
+    @property
+    def request_boundary_timestamp_ns(self) -> int | None:
+        with self._lock:
+            return self._request_boundary_timestamp_ns
+
+    @property
+    def request_boundary_receiver_position(self) -> int | None:
+        with self._lock:
+            return self._request_boundary_receiver_position
 
     def mark_first_candidate_output_completed(self) -> None:
         with self._lock:
@@ -327,10 +346,15 @@ class FileVideoSource(FrameSource):
                     self._post_effect_source_frames_received += 1
 
                 self._measurement_source_frames_received += 1
+                if self._measurement_source_frames_received == self._pre_request_target:
+                    self._request_boundary_timestamp_ns = time.monotonic_ns()
+                    self._request_boundary_receiver_position = self._measurement_source_frames_received
                 if self._measurement_source_frames_received >= self._measurement_source_frame_target:
                     self._measurement_stopped = True
                     self._inside_measurement_window = False
                     self._measurement_end_timestamp_ns = time.monotonic_ns()
+                    if self._fixed_endpoint_observer is not None:
+                        self._fixed_endpoint_observer()
 
         if self._is_synthetic or self._vframes is None:
             if self._current_frame_id >= 1000:
@@ -422,6 +446,9 @@ class RTSPVideoSource(FrameSource):
         self._measurement_source_frames_received: int = 0
         self._measurement_start_timestamp_ns: int | None = None
         self._measurement_end_timestamp_ns: int | None = None
+        self._request_boundary_timestamp_ns: int | None = None
+        self._request_boundary_receiver_position: int | None = None
+        self._fixed_endpoint_observer: Callable[[], None] | None = None
         self._measurement_start_media_frame_index: int | None = None
 
         # Phase-normalized measurement state
@@ -467,8 +494,24 @@ class RTSPVideoSource(FrameSource):
                 time.monotonic_ns() if start_media_frame_index is None else None
             )
             self._measurement_end_timestamp_ns = None
+            self._request_boundary_timestamp_ns = None
+            self._request_boundary_receiver_position = None
             if self._ingress is not None:
                 self._ingress.queue.clear_and_cancel_all()
+
+    def set_fixed_endpoint_observer(self, observer: Callable[[], None] | None) -> None:
+        with self._lock:
+            self._fixed_endpoint_observer = observer
+
+    @property
+    def request_boundary_timestamp_ns(self) -> int | None:
+        with self._lock:
+            return self._request_boundary_timestamp_ns
+
+    @property
+    def request_boundary_receiver_position(self) -> int | None:
+        with self._lock:
+            return self._request_boundary_receiver_position
 
     def mark_first_candidate_output_completed(self) -> None:
         with self._lock:
@@ -608,10 +651,15 @@ class RTSPVideoSource(FrameSource):
                             self._post_effect_source_frames_received += 1
 
                         self._measurement_source_frames_received += 1
+                        if self._measurement_source_frames_received == self._pre_request_target:
+                            self._request_boundary_timestamp_ns = time.monotonic_ns()
+                            self._request_boundary_receiver_position = self._measurement_source_frames_received
                         if self._measurement_source_frames_received >= self._measurement_source_frame_target:
                             self._measurement_stopped = True
                             self._inside_measurement_window = False
                             self._measurement_end_timestamp_ns = time.monotonic_ns()
+                            if self._fixed_endpoint_observer is not None:
+                                self._fixed_endpoint_observer()
 
                     self._current_frame_id = fid
 

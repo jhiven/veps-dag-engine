@@ -25,6 +25,7 @@ from nedo_vision_dag_engine.instrumentation import (
     RuntimeInstrumentation,
     StateReuseEvent,
     emit_runtime_evidence,
+    runtime_evidence_sink,
 )
 from nedo_vision_dag_engine.lifecycle import (
     CleanupReason,
@@ -284,6 +285,7 @@ class ReconfigurationController:
         "_abort_requested_ids",
         "_active_request_id",
         "_admission_lock",
+        "_auto_commit_on_admission",
         "_cleaned_plans",
         "_closed",
         "_clock",
@@ -301,6 +303,7 @@ class ReconfigurationController:
         "_retirement_queue",
         "_retirement_worker",
         "_state_lock",
+        "_stalled_plans",
         "_work_queue",
         "_worker",
     )
@@ -311,6 +314,7 @@ class ReconfigurationController:
         compiler: WorkflowCompiler,
         registry: RegistrySnapshot,
         worker_name: str = "dag-reconfiguration",
+        auto_commit_on_admission: bool = True,
     ) -> None:
         if not worker_name:
             raise ValueError("worker_name must be non-empty.")
@@ -327,6 +331,7 @@ class ReconfigurationController:
         self._state_lock = Lock()
         self._condition = Condition(self._state_lock)
         self._admission_lock = Lock()
+        self._auto_commit_on_admission = auto_commit_on_admission
         self._compiler_lock = Lock()
         self._work_queue: Queue[_WorkItem] = Queue()
         self._retirement_queue: Queue[_RetirementWorkItem] = Queue()
@@ -338,6 +343,9 @@ class ReconfigurationController:
         self._active_request_id: str | None = None
         self._effect_pending_request_id: str | None = None
         self._cleaned_plans: set[int] = set()
+        # A timed-out older lease can outlive a later publication. Keep its
+        # processor identities protected until that lease actually drains.
+        self._stalled_plans: dict[int, ExecutionPlan] = {}
         self._closed = False
         self._worker = Thread(target=self._worker_main, name=worker_name, daemon=True)
         self._worker.start()
@@ -485,6 +493,9 @@ class ReconfigurationController:
             return self._commit_ready_unlocked()
 
     def admit_frame(self, admitted_at_ns: int, frame_id: int | None = None) -> FrameResult:
+        sink = runtime_evidence_sink()
+        if sink is not None:
+            sink("frame_admission_attempted", {"frame_id": frame_id})
         record_completion = False
         with self._admission_lock:
             # ── fast path: no reconfiguration transaction in progress ──
@@ -510,7 +521,8 @@ class ReconfigurationController:
                 # ── slow path: reconfiguration in progress ──
                 with self._condition:
                     self._require_open_locked()
-                self._commit_ready_unlocked()
+                if self._auto_commit_on_admission:
+                    self._commit_ready_unlocked()
                 admission = self._executor.reserve_frame_managed(
                     token=self._executor_token,
                     admitted_at_ns=admitted_at_ns,
@@ -964,7 +976,7 @@ class ReconfigurationController:
                     handoff_wait_complete_ns=handoff_wait_complete_ns,
                 )
             emit_runtime_evidence(
-                "handoff_gate_opened",
+                "handoff_drain_completed",
                 request_id=request.request_id,
                 plan_id=self._executor.active_plan.version,
             )
@@ -1297,6 +1309,20 @@ class ReconfigurationController:
         )
 
         if not quiescent:
+            self._stalled_plans[deferred.previous_plan.version] = deferred.previous_plan
+        protected_ids = {
+            id(step.processor_ref)
+            for version, plan in tuple(self._stalled_plans.items())
+            if version != deferred.previous_plan.version
+            and not self._executor.wait_for_plan_quiescent(version, timeout=0)
+            for step in plan.steps
+        }
+        superseded_ids = {
+            id(step.processor_ref) for step in deferred.previous_plan.steps
+        } - {id(step.processor_ref) for step in deferred.active_plan.steps}
+        blocked_by_older_lease = bool(protected_ids & superseded_ids)
+
+        if not quiescent or blocked_by_older_lease:
             # Grace period timed out — stall rather than force-cleanup.
             stalled_at_ns = self._clock()
             with self._condition:
@@ -1312,6 +1338,8 @@ class ReconfigurationController:
                         retirement_failure_reason=(
                             "grace period timed out waiting for plan version "
                             f"{deferred.previous_plan.version} to become quiescent"
+                            if not quiescent else
+                            "superseded processor remains leased by an older stalled plan"
                         ),
                     )
                     self._records[deferred.request_id] = updated_record
@@ -1322,7 +1350,10 @@ class ReconfigurationController:
                 request_id=deferred.request_id,
                 plan_id=deferred.previous_plan.version,
                 outcome="stalled",
-                error_message="grace period timed out",
+                error_message=(
+                    "grace period timed out" if not quiescent else
+                    "superseded processor remains leased by an older stalled plan"
+                ),
             )
             return
 

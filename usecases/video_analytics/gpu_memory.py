@@ -14,10 +14,13 @@ __all__ = [
 class PyTorchCUDAMemorySampler(CUDAMemorySamplerProtocol):
     """Production PyTorch CUDA memory allocator metric sampler."""
 
-    def __init__(self, device: str = "cuda:0") -> None:
+    def __init__(self, device: str = "cuda:0", strict: bool = False) -> None:
         self._device_str: str = device
         self._is_cuda: bool = device.startswith("cuda")
         self._initialized: bool = False
+        # Publication runs must not report a silently stale or missing peak:
+        # in strict mode every allocator failure propagates to the caller.
+        self._strict: bool = strict
 
     def initialize(self) -> None:
         """Initialize CUDA device and verify availability."""
@@ -30,8 +33,12 @@ class PyTorchCUDAMemorySampler(CUDAMemorySamplerProtocol):
             if torch.cuda.is_available():
                 torch.cuda.init()
                 self._initialized = True
+            elif self._strict:
+                raise RuntimeError(f"CUDA is unavailable for memory sampling on {self._device_str}")
         except Exception:
             self._initialized = False
+            if self._strict:
+                raise
 
     def reset_peak_stats(self) -> None:
         """Reset PyTorch CUDA peak memory tracking statistics."""
@@ -43,7 +50,8 @@ class PyTorchCUDAMemorySampler(CUDAMemorySamplerProtocol):
 
             torch.cuda.reset_peak_memory_stats(self._device_str)
         except Exception:
-            pass
+            if self._strict:
+                raise
 
     def synchronize(self) -> None:
         """Synchronize CUDA stream before taking a memory snapshot."""
@@ -55,10 +63,11 @@ class PyTorchCUDAMemorySampler(CUDAMemorySamplerProtocol):
 
             torch.cuda.synchronize(self._device_str)
         except Exception:
-            pass
+            if self._strict:
+                raise
 
     def sample(self) -> CUDAMemorySnapshot:
-        """Capture snapshot of PyTorch CUDA memory allocator metrics."""
+        """Read allocator counters without synchronizing the serving stream."""
         if not self._is_cuda or not self._initialized:
             return CUDAMemorySnapshot(
                 allocated_bytes=None,
@@ -70,7 +79,6 @@ class PyTorchCUDAMemorySampler(CUDAMemorySamplerProtocol):
         try:
             import torch
 
-            self.synchronize()
             allocated: int = torch.cuda.memory_allocated(self._device_str)
             reserved: int = torch.cuda.memory_reserved(self._device_str)
             peak_allocated: int = torch.cuda.max_memory_allocated(self._device_str)
@@ -83,6 +91,8 @@ class PyTorchCUDAMemorySampler(CUDAMemorySamplerProtocol):
                 peak_reserved_bytes=peak_reserved,
             )
         except Exception:
+            if self._strict:
+                raise
             return CUDAMemorySnapshot(
                 allocated_bytes=None,
                 reserved_bytes=None,
@@ -119,7 +129,6 @@ class FakeCUDAMemorySampler(CUDAMemorySamplerProtocol):
 
     def sample(self) -> CUDAMemorySnapshot:
         self.sample_call_count += 1
-        self.synchronize()
         if not self._is_cuda:
             return CUDAMemorySnapshot(
                 allocated_bytes=None,

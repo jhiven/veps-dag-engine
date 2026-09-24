@@ -37,6 +37,21 @@ def test_realworld_video_runner_smoke() -> None:
         assert mechs == {"Stop", "Pause", "VEPS"}
         assert all(s.tracker_reset_count_before == 0 for s in samples)
         assert all(s.tracker_reset_count_after == 0 for s in samples)
+        assert all(s.request_trigger_receiver_position == 5 for s in samples)
+        assert all(
+            s.request_timestamp_ns is not None
+            and s.candidate_prep_start_ns is not None
+            and s.request_timestamp_ns <= s.candidate_prep_start_ns
+            for s in samples
+        )
+        assert all(
+            s.measurement_end_timestamp_ns is not None
+            and s.gpu_cutoff_sample_timestamp_ns is not None
+            and s.gpu_post_window_sync_timestamp_ns is not None
+            and s.measurement_end_timestamp_ns <= s.gpu_cutoff_sample_timestamp_ns
+            < s.gpu_post_window_sync_timestamp_ns
+            for s in samples
+        )
 
         for repetition in (1, 2):
             matched = [s for s in samples if s.repetition == repetition]

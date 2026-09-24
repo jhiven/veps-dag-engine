@@ -58,13 +58,13 @@ class NoOpRuntimeInstrumentation(RuntimeInstrumentation):
         return _DUMMY_ENVELOPE
 
 
-def _get_execution_order(repetition: int) -> tuple[str, str, str]:
-    orders = (
+def _get_execution_order(repetition: int, seed: int = 42, scenario_id: str = "steady_state") -> tuple[str, ...]:
+    from benchmarks.ordering import balanced_order
+
+    return balanced_order(
         ("hard_coded", "static_compiled", "versioned_compiled"),
-        ("versioned_compiled", "static_compiled", "hard_coded"),
-        ("static_compiled", "hard_coded", "versioned_compiled"),
+        seed, scenario_id, repetition,
     )
-    return orders[(repetition - 1) % len(orders)]
 
 
 def _calibrate_adaptive_operations(
@@ -146,7 +146,7 @@ def run_steady_state_suite(
             scenario_id = f"steady_state_{topology}_{workload_id}"
 
             for rep in range(1, repetition_count + 1):
-                order = _get_execution_order(rep)
+                order = _get_execution_order(rep, seed, scenario_id)
 
                 registry = create_workload_registry(iters)
                 compiler = WorkflowCompiler("0.1.0")
@@ -163,24 +163,27 @@ def run_steady_state_suite(
                     if impl == "hard_coded":
                         processors = [step.processor_ref for step in plan.steps]
                         procs_typed = [p for p in processors if isinstance(p, WorkloadProcessor)]
+                        linear_processors = tuple(procs_typed)
+                        branch_processors = {
+                            step.node_id: processor
+                            for step, processor in zip(plan.steps, procs_typed)
+                        }
 
                         # Centralized Warmup
                         for f in range(warmup_ops):
                             ctx = FrameContext(frame_id=f, plan_version=1, admitted_at_ns=0)
                             if topology == "linear_5":
-                                execute_hard_coded_linear_5(tuple(procs_typed), ctx)
+                                execute_hard_coded_linear_5(linear_processors, ctx)
                             else:
-                                procs_map = {step.node_id: p for step, p in zip(plan.steps, procs_typed)}
-                                execute_hard_coded_branch_merge_9(procs_map, ctx)
+                                execute_hard_coded_branch_merge_9(branch_processors, ctx)
 
                         t0 = time.perf_counter_ns()
                         for f in range(ops_per_rep):
                             ctx = FrameContext(frame_id=warmup_ops + f, plan_version=1, admitted_at_ns=0)
                             if topology == "linear_5":
-                                execute_hard_coded_linear_5(tuple(procs_typed), ctx)
+                                execute_hard_coded_linear_5(linear_processors, ctx)
                             else:
-                                procs_map = {step.node_id: p for step, p in zip(plan.steps, procs_typed)}
-                                execute_hard_coded_branch_merge_9(procs_map, ctx)
+                                execute_hard_coded_branch_merge_9(branch_processors, ctx)
                         t1 = time.perf_counter_ns()
 
                     elif impl == "static_compiled":

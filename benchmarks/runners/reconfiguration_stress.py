@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import gc
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from queue import Full, Queue
 from threading import Event, Lock, Thread
 
@@ -41,6 +41,7 @@ from benchmarks.model import (
     compute_critical_path_decomposition,
     validate_reconfiguration_sample,
 )
+from benchmarks.ordering import balanced_order
 from benchmarks.scenarios import (
     apply_reconfiguration_edit,
     create_reconfiguration_stress_registry,
@@ -249,9 +250,8 @@ def _run_stress_repetition(
                     except Exception:
                         continue
                     if not admission_gate.try_enter():
-                        accounting.classify(fid, "intentional_queue_cancellation")
-                        with drop_lock:
-                            intentional_cancellation_count += 1
+                        # Dequeued after the boundary closed, so admission refused it.
+                        accounting.classify(fid, "admission_rejection")
                         continue
                     try:
                         t_adm = time.perf_counter_ns()
@@ -493,9 +493,8 @@ def _run_stress_repetition(
                     except Exception:
                         continue
                     if not admission_gate.try_enter():
-                        accounting.classify(fid, "intentional_queue_cancellation")
-                        with drop_lock:
-                            intentional_cancellation_count += 1
+                        # Dequeued after the boundary closed, so admission refused it.
+                        accounting.classify(fid, "admission_rejection")
                         continue
                     try:
                         t_adm = time.perf_counter_ns()
@@ -1006,10 +1005,6 @@ def run_reconfiguration_stress_suite(
     service_time_ns = _measure_steady_state_service_time_ns(registry_cal, base_spec_cal)
     inter_arrival_s = (service_time_ns / target_load) / 1e9
 
-    # print(f"Stress calibration: service_time={service_time_ns:.0f} ns, "
-    #       f"target_load={target_load}, inter_arrival={inter_arrival_s*1e6:.1f} µs, "
-    #       f"queue_capacity={queue_capacity}")
-
     for delay_ms in staging_delays_ms:
         delay_s = delay_ms / 1000.0
         registry = create_reconfiguration_stress_registry(staging_delay_s=delay_s, extra_tracker=False)
@@ -1019,8 +1014,7 @@ def run_reconfiguration_stress_suite(
         scenario_id = f"stress_delay{int(delay_ms)}ms_size{graph_size}_q{queue_capacity}_load{int(target_load*100)}"
 
         for rep in range(1, repetition_count + 1):
-            rot_idx = (rep - 1) % len(baselines)
-            rep_baselines = baselines[rot_idx:] + baselines[:rot_idx]
+            rep_baselines = balanced_order(baselines, seed, scenario_id, rep)
 
             for baseline in rep_baselines:
                 gc.collect()
@@ -1037,6 +1031,12 @@ def run_reconfiguration_stress_suite(
                     inter_arrival_s=inter_arrival_s,
                     queue_capacity=queue_capacity,
                     staging_delay_s=delay_s,
+                )
+                row = replace(
+                    row,
+                    calibrated_service_time_ns=round(service_time_ns),
+                    configured_inter_arrival_ns=round(inter_arrival_s * 1e9),
+                    target_load_ratio=target_load,
                 )
                 all_rows.append(row)
                 append_reconfiguration_rows(output_csv_path, [row])

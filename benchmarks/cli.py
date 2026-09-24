@@ -21,7 +21,16 @@ from benchmarks.metadata import (
     write_failure_json,
     write_run_json,
 )
-from benchmarks.provenance import collect_provenance, missing_required_provenance
+from benchmarks.provenance import (
+    collect_provenance,
+    native_extension_runtime_state,
+    install_native_warning_recorder,
+    missing_required_provenance,
+)
+
+# Capture real import-time native-extension warnings before benchmark runners
+# can import the GPU production dependency stack.
+install_native_warning_recorder()
 from benchmarks.reporting.ablation import generate_ablation_summary_files
 from benchmarks.reporting.figures import generate_all_figures
 from benchmarks.reporting.interference import generate_interference_summary_file
@@ -32,7 +41,6 @@ from benchmarks.reporting.validation import validate_experiment_artifacts, write
 from benchmarks.runners.ablation import run_ablation_suite
 from benchmarks.runners.conformance import run_conformance_suite
 from benchmarks.runners.interference import run_interference_suite
-from benchmarks.runners.realworld_video import run_realworld_video_suite
 from benchmarks.runners.reconfiguration import run_reconfiguration_suite
 from benchmarks.runners.reconfiguration_stress import run_reconfiguration_stress_suite
 from benchmarks.runners.steady_state import run_steady_state_suite
@@ -142,7 +150,6 @@ def run_benchmarks(
     run_id = f"run_{now.strftime('%Y-%m-%dT%H-%M-%S')}_{seed}"
 
     run_dir = os.path.join(output_dir, run_id)
-    os.makedirs(run_dir, exist_ok=True)
 
     suite_list = [s.strip() for s in suite.split(",") if s.strip()]
     if "all" in suite_list:
@@ -174,6 +181,10 @@ def run_benchmarks(
 
     # Validations for realworld-video suite
     if "realworld-video" in selected_suites:
+        # The read-only validation/report subcommands must not import the GPU
+        # inference stack. A GPU run still imports it before provenance capture.
+        from benchmarks.runners.realworld_video import run_realworld_video_suite
+
         if queue_capacity <= 0:
             raise ValueError(f"Queue capacity must be positive, got {queue_capacity}")
         if not rtsp_base_url.startswith("rtsp://"):
@@ -183,6 +194,8 @@ def run_benchmarks(
                 raise FileNotFoundError(f"Source video file not found: {source_video}")
             if not shutil.which("ffmpeg"):
                 raise RuntimeError("ffmpeg executable not found in PATH for RTSP publication benchmark.")
+
+    os.makedirs(run_dir, exist_ok=True)
 
     available_cpus = tuple(sorted(os.sched_getaffinity(0))) if hasattr(os, "sched_getaffinity") else tuple(range(os.cpu_count() or 1))
     requested_cpu_count = 1 if selected_suites == ("steady-state",) else min(2, len(available_cpus))
@@ -332,6 +345,16 @@ def run_benchmarks(
 
     row_counts: dict[str, int] = {}
     sha256_dict: dict[str, str] = {}
+    gil_checks: list[dict[str, Any]] = []
+    provenance["gil_checks_after_suites"] = gil_checks
+
+    def check_gil_after_suite(suite_name: str) -> None:
+        probe = getattr(sys, "_is_gil_enabled", None)
+        enabled = probe() if callable(probe) else None
+        gil_checks.append({"suite": suite_name, "gil_enabled": enabled})
+        write_run_json(run_json_path, run_meta)
+        if profile == "publication" and enabled is not False:
+            raise RuntimeError(f"the GIL became enabled during {suite_name}")
 
     try:
         if "steady-state" in selected_suites:
@@ -344,6 +367,7 @@ def run_benchmarks(
                 calibrated_iterations=calibrated_iters,
                 seed=seed,
             )
+            check_gil_after_suite("steady-state")
             row_counts["steady-state-samples.csv"] = _count_csv_data_rows(steady_csv)
             sha256_dict["steady-state-samples.csv"] = _calculate_file_sha256(steady_csv)
 
@@ -356,6 +380,7 @@ def run_benchmarks(
                 repetition_count=repetition_count,
                 seed=seed,
             )
+            check_gil_after_suite("reconfiguration")
             row_counts["reconfiguration-samples.csv"] = _count_csv_data_rows(reconfig_csv)
             sha256_dict["reconfiguration-samples.csv"] = _calculate_file_sha256(reconfig_csv)
 
@@ -368,6 +393,7 @@ def run_benchmarks(
                 repetition_count=repetition_count,
                 seed=seed,
             )
+            check_gil_after_suite("reconfiguration-stress")
             row_counts["reconfiguration-stress-samples.csv"] = _count_csv_data_rows(stress_csv)
             sha256_dict["reconfiguration-stress-samples.csv"] = _calculate_file_sha256(stress_csv)
 
@@ -379,6 +405,7 @@ def run_benchmarks(
                 profile=profile,
                 seeds=conformance_seeds,
             )
+            check_gil_after_suite("conformance")
             for name in sorted(os.listdir(conformance_dir)):
                 if not name.endswith(".jsonl"):
                     continue
@@ -393,7 +420,9 @@ def run_benchmarks(
                 output_dir=run_dir,
                 run_id=run_id,
                 repetitions=repetition_count,
+                random_seed=seed,
             )
+            check_gil_after_suite("ablation")
             row_counts["ablation-samples.csv"] = _count_csv_data_rows(ablation_csv)
             sha256_dict["ablation-samples.csv"] = _calculate_file_sha256(ablation_csv)
 
@@ -404,6 +433,7 @@ def run_benchmarks(
                 output_csv_path=interference_csv,
                 repetition_count=repetition_count,
             )
+            check_gil_after_suite("interference")
             row_counts["interference-samples.csv"] = _count_csv_data_rows(interference_csv)
             sha256_dict["interference-samples.csv"] = _calculate_file_sha256(interference_csv)
             interference_frame_csv = os.path.join(run_dir, "interference-frame-samples.csv")
@@ -411,6 +441,7 @@ def run_benchmarks(
             sha256_dict["interference-frame-samples.csv"] = _calculate_file_sha256(interference_frame_csv)
 
         if "realworld-video" in selected_suites:
+            from benchmarks.runners.realworld_video import run_realworld_video_suite
             from usecases.video_analytics.contracts import ExecutionMode
 
             rw_video_csv = os.path.join(run_dir, "realworld-video-samples.csv")
@@ -437,6 +468,13 @@ def run_benchmarks(
                 random_seed=seed,
                 execution_mode=ExecutionMode.SMOKE if profile == "smoke" else ExecutionMode.PUBLICATION,
             )
+            check_gil_after_suite("realworld-video")
+            gil_after_gpu_suite = gil_checks[-1]["gil_enabled"]
+            provenance["gil_enabled_after_gpu_suite"] = gil_after_gpu_suite
+            # Detector construction can import extensions after the initial
+            # provenance snapshot; record what the GPU suite actually loaded.
+            provenance["native_extensions_after_gpu_suite"] = native_extension_runtime_state()
+            write_run_json(run_json_path, run_meta)
             row_counts["realworld-video-samples.csv"] = _count_csv_data_rows(rw_video_csv)
             sha256_dict["realworld-video-samples.csv"] = _calculate_file_sha256(rw_video_csv)
             rw_video_frame_csv = os.path.join(run_dir, "realworld-video-frame-samples.csv")

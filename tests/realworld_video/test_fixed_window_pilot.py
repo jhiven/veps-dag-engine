@@ -245,7 +245,7 @@ def test_rows_outside_the_window_are_ignored() -> None:
 
 
 def test_a_boundary_without_enough_baseline_positions_is_refused() -> None:
-    with pytest.raises(ValueError, match="baseline receiver positions"):
+    with pytest.raises(ValueError, match="fixed receiver boundary"):
         compute_fixed_window_metrics(
             frame_rows=_all_completed(),
             request_trigger_receiver_position=BASELINE - 1,
@@ -260,14 +260,8 @@ def test_a_negative_cutoff_is_refused() -> None:
         _metrics(_all_completed(), cutoff_ns=-1)
 
 
-def test_a_trigger_one_position_late_leaves_the_last_position_unobservable() -> None:
-    """Pins the off-by-one that cost 8 of 30 GPU repetitions.
-
-    The source produces exactly `WINDOW` measured positions, numbered from zero.
-    Anchoring the window on a polled counter that had already advanced past the
-    boundary shifts it one position beyond the last frame that will ever exist,
-    so that position can never be observed and the accounting cannot reconcile.
-    """
+def test_a_trigger_one_position_late_fails_the_fixed_boundary_protocol() -> None:
+    """A late request cannot silently shift the mechanism-independent window."""
     rows = _all_completed()
 
     on_boundary = _metrics(rows)
@@ -275,14 +269,11 @@ def test_a_trigger_one_position_late_leaves_the_last_position_unobservable() -> 
     assert on_boundary["fixed_window_accounting_residual"] == 0
     assert on_boundary["fixed_window_accounting_valid"] is True
 
-    one_late = compute_fixed_window_metrics(
-        frame_rows=rows,
-        request_trigger_receiver_position=TRIGGER + 1,
-        cutoff_deadline_ns=CUTOFF_NS,
-        baseline_frame_count=BASELINE,
-        transition_frame_count=TRANSITION,
-    )
-    assert one_late["fixed_window_start_media_frame_index"] == 1
-    assert one_late["fixed_window_receiver_observed_frames"] == WINDOW - 1
-    assert one_late["fixed_window_accounting_residual"] == 1
-    assert one_late["fixed_window_accounting_valid"] is False
+    with pytest.raises(ValueError, match="fixed receiver boundary"):
+        compute_fixed_window_metrics(
+            frame_rows=rows,
+            request_trigger_receiver_position=TRIGGER + 1,
+            cutoff_deadline_ns=CUTOFF_NS,
+            baseline_frame_count=BASELINE,
+            transition_frame_count=TRANSITION,
+        )

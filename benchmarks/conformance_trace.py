@@ -13,6 +13,16 @@ from typing import Any, cast
 from nedo_vision_dag_engine.instrumentation import JsonValue
 
 SCHEMA_VERSION = "2.0.0"
+_REQUEST_EDGES: dict[str, frozenset[str]] = {
+    "request_received": frozenset({"request_validated", "request_stale", "request_aborted", "request_failed"}),
+    "request_validated": frozenset({"request_prepared", "request_rejected", "request_failed", "request_aborted"}),
+    "request_prepared": frozenset({"request_ready", "request_rejected", "request_failed", "request_aborted"}),
+    "request_ready": frozenset({"request_committed", "request_stale", "request_failed", "request_aborted"}),
+}
+_REQUEST_KINDS = frozenset(_REQUEST_EDGES) | frozenset({
+    "request_committed", "request_rejected", "request_failed",
+    "request_aborted", "request_stale",
+})
 
 __all__ = [
     "SCHEMA_VERSION",
@@ -81,31 +91,57 @@ class ReplayReport:
 def replay_trace(path: str) -> ReplayReport:
     """Derive counts and ordering invariants exclusively from a JSONL trace."""
     errors: list[str] = []
-    events: list[dict[str, Any]] = []
-    with open(path, "r", encoding="utf-8") as file:
-        for line_number, line in enumerate(file, 1):
-            try:
-                raw: Any = json.loads(line)
-            except Exception as error:
-                errors.append(f"line {line_number}: invalid JSON: {error}")
-                continue
-            if not isinstance(raw, dict):
-                errors.append(f"line {line_number}: event must be a JSON object")
-                continue
-            events.append(cast(dict[str, Any], raw))
-
-    campaign_id = str(events[0].get("campaign_id", "")) if events else ""
-    seed = int(events[0].get("seed", -1)) if events else -1
+    campaign_id = ""
+    seed = -1
+    run_id = ""
+    event_count = 0
+    # Randomized traces are much larger than controlled schedules. Retain
+    # only their derived state, not hundreds of megabytes of JSON objects.
+    schedule_events: list[dict[str, Any]] = []
     previous_timestamp = -1
     counts: dict[str, int] = {}
     offered: dict[int, int] = {}
     admitted: dict[int, int] = {}
     terminal: dict[int, str] = {}
+    terminal_index: dict[int, int] = {}
+    frame_plans: dict[int, int] = {}
     leases: set[tuple[int, int]] = set()
     node_entries: set[tuple[int, str, str]] = set()
+    plan_processors: dict[int, set[str]] = {}
+    # Each plan's declared node bindings, from staging, reuse and reset events.
+    # A node execution must use the instance its frame's leased plan binds.
+    plan_bindings: dict[int, dict[str, set[str]]] = {}
+    candidate_processors: dict[int, set[str]] = {}
+    cleanup_attempts: set[str] = set()
+    cleanup_terminals: set[str] = set()
+    request_received: set[str] = set()
+    request_terminal: set[str] = set()
+    request_state: dict[str, str] = {}
     campaign_completed = False
+    campaign_started_count = 0
+    campaign_completed_count = 0
+    declared_frames: int | None = None
+    declared_requests: int | None = None
 
-    for index, event in enumerate(events, 1):
+    with open(path, "r", encoding="utf-8") as file:
+      for index, line in enumerate(file, 1):
+        event_count = index
+        try:
+            raw: Any = json.loads(line)
+        except Exception as error:
+            errors.append(f"line {index}: invalid JSON: {error}")
+            continue
+        if not isinstance(raw, dict):
+            errors.append(f"line {index}: event must be a JSON object")
+            continue
+        event = cast(dict[str, Any], raw)
+        if index == 1:
+            campaign_id = str(event.get("campaign_id", ""))
+            run_id = str(event.get("run_id", ""))
+            seed_raw = event.get("seed")
+            seed = seed_raw if isinstance(seed_raw, int) else -1
+        if campaign_id != "randomized_consistency":
+            schedule_events.append(event)
         if event.get("schema_version") != SCHEMA_VERSION:
             errors.append(f"event {index}: unsupported schema_version")
         if event.get("event_sequence") != index:
@@ -115,15 +151,74 @@ def replay_trace(path: str) -> ReplayReport:
             errors.append(f"event {index}: non-monotonic timestamp")
         else:
             previous_timestamp = timestamp
-        if event.get("campaign_id") != campaign_id or event.get("seed") != seed:
-            errors.append(f"event {index}: campaign/seed envelope changed")
+        if (event.get("campaign_id") != campaign_id or event.get("seed") != seed
+                or event.get("run_id") != run_id):
+            errors.append(f"event {index}: run/campaign/seed envelope changed")
 
         kind = str(event.get("event_kind", ""))
         counts[kind] = counts.get(kind, 0) + 1
+        if kind == "campaign_started":
+            campaign_started_count += 1
+            if index != 1:
+                errors.append("campaign_started is not the first event")
+            frame_target = event.get("target_frames")
+            request_target = event.get("target_requests")
+            if isinstance(frame_target, int):
+                declared_frames = frame_target
+            if isinstance(request_target, int):
+                declared_requests = request_target
         frame_raw = event.get("frame_id")
         frame_id = frame_raw if isinstance(frame_raw, int) else None
         plan_raw = event.get("plan_id")
         plan_id = plan_raw if isinstance(plan_raw, int) else None
+        request_id = event.get("request_id")
+        if kind in _REQUEST_KINDS and isinstance(request_id, str):
+            prior = request_state.get(request_id)
+            if kind == "request_received":
+                if prior is not None:
+                    errors.append(f"request {request_id}: duplicate receipt")
+            elif prior is None or kind not in _REQUEST_EDGES.get(prior, frozenset()):
+                errors.append(f"request {request_id}: malformed transition {prior!r} -> {kind!r}")
+            request_state[request_id] = kind
+        if kind == "request_received" and isinstance(request_id, str):
+            if request_id in request_received:
+                errors.append(f"request {request_id}: duplicate receipt")
+            request_received.add(request_id)
+        elif kind in {"request_committed", "request_rejected", "request_failed",
+                      "request_aborted", "request_stale"} and isinstance(request_id, str):
+            if request_id not in request_received:
+                errors.append(f"request {request_id}: terminal outcome without receipt")
+            if request_id in request_terminal:
+                errors.append(f"request {request_id}: duplicate terminal outcome")
+            request_terminal.add(request_id)
+            if kind != "request_committed":
+                candidate_processors.clear()
+        processor_id = event.get("processor_instance_id")
+        node_raw = event.get("node_id")
+        if (kind in {"processor_staged", "processor_reused", "processor_reset"}
+                and plan_id is not None and isinstance(processor_id, str)
+                and isinstance(node_raw, str)):
+            plan_bindings.setdefault(plan_id, {}).setdefault(node_raw, set()).add(processor_id)
+        if kind in {"processor_staged", "processor_reused"} and plan_id is not None and isinstance(processor_id, str):
+            target = plan_processors if plan_id == 1 else candidate_processors
+            target.setdefault(plan_id, set()).add(processor_id)
+        elif kind == "plan_published" and plan_id is not None:
+            plan_processors[plan_id] = candidate_processors.pop(plan_id, set())
+        elif kind == "processor_cleanup_attempted" and isinstance(processor_id, str):
+            if processor_id in cleanup_attempts:
+                errors.append(f"processor {processor_id}: duplicate cleanup attempt")
+            cleanup_attempts.add(processor_id)
+            for leased_frame, leased_plan in leases:
+                if processor_id in plan_processors.get(leased_plan, set()):
+                    errors.append(
+                        f"processor {processor_id}: cleanup while frame {leased_frame} leases plan {leased_plan}"
+                    )
+        elif kind in {"processor_cleanup_completed", "processor_cleanup_failed"} and isinstance(processor_id, str):
+            if processor_id not in cleanup_attempts:
+                errors.append(f"processor {processor_id}: cleanup terminal without attempt")
+            if processor_id in cleanup_terminals:
+                errors.append(f"processor {processor_id}: duplicate cleanup terminal")
+            cleanup_terminals.add(processor_id)
 
         if kind == "frame_offered" and frame_id is not None:
             if frame_id in offered:
@@ -133,15 +228,25 @@ def replay_trace(path: str) -> ReplayReport:
             if frame_id in admitted:
                 errors.append(f"frame {frame_id}: duplicate admission")
             admitted[frame_id] = index
+            if plan_id is not None:
+                previous_plan = frame_plans.setdefault(frame_id, plan_id)
+                if previous_plan != plan_id:
+                    errors.append(f"frame {frame_id}: admission changed its leased plan")
         elif kind in {"frame_completed", "frame_failed", "frame_cancelled"} and frame_id is not None:
             if frame_id in terminal:
                 errors.append(f"frame {frame_id}: duplicate terminal outcome")
             terminal[frame_id] = kind
+            terminal_index[frame_id] = index
+            if plan_id is not None and frame_plans.get(frame_id) != plan_id:
+                errors.append(f"frame {frame_id}: terminal event changed its plan")
         elif kind == "lease_acquired" and frame_id is not None and plan_id is not None:
             key = (frame_id, plan_id)
             if key in leases:
                 errors.append(f"frame {frame_id}: duplicate lease acquisition")
             leases.add(key)
+            previous_plan = frame_plans.setdefault(frame_id, plan_id)
+            if previous_plan != plan_id:
+                errors.append(f"frame {frame_id}: acquired leases on multiple plans")
         elif kind == "lease_released" and frame_id is not None and plan_id is not None:
             key = (frame_id, plan_id)
             if key not in leases:
@@ -149,6 +254,16 @@ def replay_trace(path: str) -> ReplayReport:
             else:
                 leases.remove(key)
         elif kind == "node_entered" and frame_id is not None:
+            bound = plan_bindings.get(plan_id, {}).get(str(node_raw)) if plan_id is not None else None
+            if not bound or processor_id not in bound:
+                errors.append(
+                    f"frame {frame_id}: node {node_raw!r} executed instance {processor_id!r} "
+                    f"that plan {plan_id} does not bind"
+                )
+            if plan_id is not None and isinstance(processor_id, str):
+                plan_processors.setdefault(plan_id, set()).add(processor_id)
+            if frame_plans.get(frame_id) != plan_id:
+                errors.append(f"frame {frame_id}: node entered under a different plan")
             key = (frame_id, str(event.get("node_id", "")), str(event.get("processor_instance_id", "")))
             if key in node_entries:
                 errors.append(f"frame {frame_id}: duplicate node entry {key[1]!r}")
@@ -160,6 +275,7 @@ def replay_trace(path: str) -> ReplayReport:
             else:
                 node_entries.remove(key)
         elif kind == "campaign_completed":
+            campaign_completed_count += 1
             campaign_completed = True
             if event.get("outcome") != "passed":
                 errors.append("campaign terminal outcome is not passed")
@@ -170,14 +286,119 @@ def replay_trace(path: str) -> ReplayReport:
             errors.append(f"frame {frame_id}: admission is not preceded by an offer")
         if frame_id not in terminal:
             errors.append(f"frame {frame_id}: admitted without terminal outcome")
+        elif terminal_index[frame_id] <= admission_index:
+            errors.append(f"frame {frame_id}: terminal outcome preceded admission")
+    for frame_id, outcome in terminal.items():
+        offer_index = offered.get(frame_id)
+        if offer_index is None or terminal_index[frame_id] <= offer_index:
+            errors.append(f"frame {frame_id}: terminal {outcome} is not preceded by an offer")
+    if set(offered) != set(terminal):
+        errors.append(f"offered frames without terminal outcomes: {sorted(set(offered) - set(terminal))!r}")
     if leases:
         errors.append(f"unreleased leases: {sorted(leases)!r}")
     if node_entries:
         errors.append(f"unclosed node executions: {sorted(node_entries)!r}")
     if not campaign_completed:
         errors.append("campaign_completed event is missing")
+    if campaign_started_count != 1 or campaign_completed_count != 1:
+        errors.append("campaign must have exactly one start and one completion event")
+    if counts.get("plan_published", 0) != counts.get("request_committed", 0):
+        errors.append("publication and committed-request counts differ")
+    if request_received != request_terminal:
+        errors.append(f"requests without terminal outcomes: {sorted(request_received - request_terminal)!r}")
+    if cleanup_attempts != cleanup_terminals:
+        errors.append(f"cleanup attempts without outcomes: {sorted(cleanup_attempts - cleanup_terminals)!r}")
+    if campaign_id == "randomized_consistency":
+        if declared_frames is None or declared_requests is None:
+            errors.append("randomized target counts are not declared")
+        else:
+            if len(offered) != declared_frames or counts.get("frame_completed", 0) != declared_frames:
+                errors.append("randomized frame target was not reached")
+            if len(request_received) != declared_requests:
+                errors.append("randomized request target was not reached")
+    else:
+        errors.extend(_validate_controlled_schedule(campaign_id, schedule_events))
 
-    return ReplayReport(path, campaign_id, seed, len(events), counts, tuple(errors))
+    return ReplayReport(path, campaign_id, seed, event_count, counts, tuple(errors))
+
+
+def _validate_controlled_schedule(campaign_id: str, events: list[dict[str, Any]]) -> list[str]:
+    errors: list[str] = []
+
+    def positions(kind: str, **fields: object) -> list[int]:
+        return [
+            index for index, event in enumerate(events, 1)
+            if event.get("event_kind") == kind
+            and all(event.get(key) == value for key, value in fields.items())
+        ]
+
+    def require_order(label: str, *groups: list[int]) -> None:
+        if any(not group for group in groups) or not all(
+            left[0] < right[0] for left, right in zip(groups, groups[1:])
+        ):
+            errors.append(f"{campaign_id}: required {label} ordering was not exercised")
+
+    if campaign_id == "stateless_publication":
+        require_order(
+            "old lease, publication, lease release, cleanup",
+            positions("lease_acquired", plan_id=1), positions("plan_published", plan_id=2),
+            positions("lease_released", plan_id=1), positions("processor_cleanup_attempted"),
+        )
+    elif campaign_id == "mutable_handoff":
+        require_order(
+            "old lease, gate close, later admission attempt, release, drain, publication, new lease",
+            positions("lease_acquired", plan_id=1), positions("handoff_gate_closed"),
+            positions("frame_admission_attempted", frame_id=2),
+            positions("lease_released", plan_id=1), positions("handoff_drain_completed"),
+            positions("plan_published", plan_id=2), positions("lease_acquired", plan_id=2),
+        )
+    elif campaign_id == "failure_atomicity":
+        for request_id, terminal in (("fail_cycle", "request_rejected"),
+                                     ("fail_type", "request_rejected"),
+                                     ("fail_setup", "request_failed")):
+            if len(positions(terminal, request_id=request_id)) != 1:
+                errors.append(f"{campaign_id}: {request_id} has wrong terminal outcome")
+        if positions("plan_published"):
+            errors.append(f"{campaign_id}: a failed candidate published a plan")
+        if len(positions("processor_cleanup_completed", outcome="staging_rollback")) < 2:
+            errors.append(f"{campaign_id}: staged setup-failure processors were not rolled back")
+        cycle_rejection = next((event for event in events if event.get("request_id") == "fail_cycle"
+                                and event.get("event_kind") == "request_rejected"), None)
+        if cycle_rejection is None or "cycle" not in str(cycle_rejection.get("error_message", "")).lower():
+            errors.append(f"{campaign_id}: cycle request did not fail cycle validation")
+    elif campaign_id == "candidate_failure":
+        require_order(
+            "staged rollback, failed request, valid publication, new frame",
+            positions("processor_staged", node_id="n1", plan_id=2),
+            positions("processor_cleanup_completed", node_id="n1", outcome="staging_rollback"),
+            positions("request_failed", request_id="mem-fail"),
+            positions("request_committed", request_id="mem-fail-2"),
+            positions("frame_completed", plan_id=2),
+        )
+        if len(positions("plan_published")) != 1:
+            errors.append(f"{campaign_id}: expected one valid publication")
+    elif campaign_id == "cleanup_failure":
+        require_order(
+            "publication, cleanup failure, replacement-frame completion",
+            positions("plan_published"), positions("processor_cleanup_failed"),
+            positions("frame_completed", plan_id=2),
+        )
+        if len(positions("processor_cleanup_attempted")) != 1:
+            errors.append(f"{campaign_id}: expected exactly one cleanup attempt")
+    elif campaign_id == "frame_exception":
+        require_order(
+            "frame failure with lease release",
+            positions("lease_acquired"), positions("lease_released"), positions("frame_failed"),
+        )
+    elif campaign_id == "state_policy":
+        if len(positions("processor_reset")) != 1 or len(positions("request_committed")) != 2:
+            errors.append(f"{campaign_id}: preserve/reset policy schedule was not exercised")
+    elif campaign_id == "successive_generation_ownership":
+        if len(positions("plan_published")) != 3 or len(positions("processor_cleanup_completed")) != 2:
+            errors.append(f"{campaign_id}: successive generation ownership schedule was not exercised")
+    elif campaign_id:
+        errors.append(f"unknown controlled campaign {campaign_id!r}")
+    return errors
 
 
 def validate_conformance_directory(

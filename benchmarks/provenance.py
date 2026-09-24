@@ -14,17 +14,45 @@ import hashlib
 import os
 import shutil
 import subprocess
+import sys
+import warnings
+from threading import Lock
 from typing import Any
 
 __all__ = [
     "UNKNOWN",
     "collect_provenance",
     "missing_required_provenance",
+    "install_native_warning_recorder",
+    "native_extension_runtime_state",
 ]
 
 #: Marker for a field that could not be determined. It is never replaced by a
 #: plausible default: unknown provenance must stay visible as unknown.
 UNKNOWN = "unknown"
+_warning_lock = Lock()
+_observed_native_warnings: list[str] = []
+_original_showwarning: Any = None
+
+
+def install_native_warning_recorder() -> None:
+    """Observe import-time native-extension warnings without fabricating text."""
+    global _original_showwarning
+    if _original_showwarning is not None:
+        return
+    _original_showwarning = warnings.showwarning
+
+    def record_warning(
+        message: Warning, category: type[Warning], filename: str,
+        lineno: int, file: Any = None, line: str | None = None,
+    ) -> None:
+        text = str(message)
+        if "tokenizers" in text and "GIL" in text:
+            with _warning_lock:
+                _observed_native_warnings.append(text)
+        _original_showwarning(message, category, filename, lineno, file, line)
+
+    warnings.showwarning = record_warning
 
 
 def _run_version_command(argv: tuple[str, ...]) -> str:
@@ -108,31 +136,96 @@ def _torch_provenance(device: str) -> dict[str, Any]:
     return details
 
 
-#: Native extensions that do not declare free-threading support. Importing one
-#: asks CPython to re-enable the GIL; an explicit ``-Xgil=0`` overrides that, and
-#: the run's recorded ``gil_enabled`` is what proves which way it went.
+#: Native extensions audited for free-threading support. Whether each declares
+#: it is measured by ``_probe_free_threading_declaration``. Importing an
+#: undeclared one asks CPython to re-enable the GIL; ``-Xgil=0`` overrides that,
+#: and the run's recorded GIL checks prove which way it went.
 _UNDECLARED_FREE_THREADING_MODULES: tuple[str, ...] = ("tokenizers",)
 
 
+_FREE_THREADING_PROBE = """
+import json, sys, warnings
+warnings.simplefilter("always")
+with warnings.catch_warnings(record=True) as caught:
+    warnings.simplefilter("always")
+    import importlib
+    importlib.import_module(sys.argv[1])
+probe = getattr(sys, "_is_gil_enabled", None)
+print(json.dumps({
+    "gil_enabled_after_import": probe() if callable(probe) else None,
+    "warnings": [str(w.message) for w in caught if issubclass(w.category, RuntimeWarning)],
+}))
+"""
+
+
+def _probe_free_threading_declaration(module_name: str) -> dict[str, Any]:
+    """Import a native module in a child interpreter without a GIL override.
+
+    CPython re-enables the GIL, and warns, only for an extension that does not
+    declare free-threading support. The child's observed GIL state therefore
+    measures the declaration instead of asserting it.
+    """
+    environment = {key: value for key, value in os.environ.items() if key != "PYTHON_GIL"}
+    try:
+        completed = subprocess.run(
+            (sys.executable, "-c", _FREE_THREADING_PROBE, module_name),
+            capture_output=True,
+            text=True,
+            timeout=120,
+            env=environment,
+            check=False,
+        )
+    except Exception as error:
+        return {"probe_error": repr(error)}
+    if completed.returncode != 0:
+        return {"probe_error": completed.stderr.strip()[-2000:]}
+    try:
+        import json
+
+        result: dict[str, Any] = json.loads(completed.stdout.strip().splitlines()[-1])
+    except Exception as error:
+        return {"probe_error": f"unparseable probe output: {error!r}"}
+    gil_after_import = result.get("gil_enabled_after_import")
+    return {
+        "probe_gil_enabled_after_import": gil_after_import,
+        "probe_runtime_warnings": result.get("warnings", []),
+        "declares_free_threading_support": (
+            None if gil_after_import is None else not bool(gil_after_import)
+        ),
+    }
+
+
+def native_extension_runtime_state() -> dict[str, Any]:
+    """Report, for this process, which audited extensions were imported."""
+    return {
+        name: {
+            "imported_in_benchmark_process": any(
+                module == name or module.startswith(f"{name}.") for module in tuple(sys.modules)
+            ),
+            "observed_import_warnings": [
+                text for text in tuple(_observed_native_warnings) if f"'{name}." in text or f"'{name}'" in text
+            ],
+        }
+        for name in _UNDECLARED_FREE_THREADING_MODULES
+    }
+
+
 def _native_extension_provenance() -> dict[str, Any]:
-    """Disclose imported extensions that do not declare free-threading safety."""
+    """Disclose audited extensions using measured, not asserted, evidence."""
     from importlib import metadata
 
+    runtime_state = native_extension_runtime_state()
     disclosures: dict[str, Any] = {}
     for name in _UNDECLARED_FREE_THREADING_MODULES:
         try:
             version = metadata.version(name)
         except Exception:
             version = UNKNOWN
-        disclosures[name] = {
-            "version": version,
-            "declares_free_threading_support": False,
-            "warning": (
-                "The global interpreter lock (GIL) has been enabled to load module "
-                f"'{name}.{name}', which has not declared that it can run safely "
-                "without the GIL."
-            ),
-        }
+        entry: dict[str, Any] = {"version": version}
+        if version != UNKNOWN:
+            entry.update(_probe_free_threading_declaration(name))
+        entry.update(runtime_state[name])
+        disclosures[name] = entry
     return disclosures
 
 
@@ -173,6 +266,10 @@ def collect_provenance(
         "rtsp_base_url": rtsp_base_url,
     }
     provenance.update(_torch_provenance(device))
+    gil_probe = getattr(sys, "_is_gil_enabled", None)
+    provenance["gil_enabled_after_imports"] = gil_probe() if callable(gil_probe) else UNKNOWN
+    provenance["gil_xoption"] = getattr(sys, "_xoptions", {}).get("gil", UNKNOWN)
+    provenance["python_gil_environment"] = os.environ.get("PYTHON_GIL", UNKNOWN)
     provenance["undeclared_free_threading_extensions"] = _native_extension_provenance()
 
     if "realworld-video" in selected_suites:

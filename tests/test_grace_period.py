@@ -927,6 +927,104 @@ def test_grace_period_stall_when_frame_never_completes() -> None:
     assert quiescent  # Frame completed, now quiescent
 
 
+def test_stalled_older_lease_protects_shared_processor_across_generations() -> None:
+    """P2 retirement cannot clean an instance still leased by stalled P1."""
+    entered = Event()
+    release = Event()
+    cleanup_count = 0
+    worker_errors: list[BaseException] = []
+
+    class BlockingSource:
+        descriptor = SOURCE_DESCRIPTOR
+
+        def setup(self, context: SetupContext) -> None:
+            pass
+
+        def process(self, inputs: object, context: FrameContext) -> object:
+            entered.set()
+            if not release.wait(5.0):
+                raise TimeoutError("blocked frame was not released")
+            return ValueOutput(1)
+
+        def healthcheck(self) -> None:
+            pass
+
+        def cleanup(self) -> None:
+            nonlocal cleanup_count
+            cleanup_count += 1
+
+    builder = RegistryBuilder()
+    builder.register(RegisteredProcessorType(SOURCE_DESCRIPTOR, BlockingSource))
+    builder.register(
+        RegisteredProcessorType(
+            PASS_DESCRIPTOR,
+            lambda: RecordingProcessor(PASS_DESCRIPTOR, [], "old-consumer"),
+        )
+    )
+    registry = builder.snapshot()
+    compiler = WorkflowCompiler("test")
+    initial = compiler.compile(_linear_specification(), registry)
+    assert isinstance(initial, CompiledCandidate)
+    executor = PipelineExecutor(initial.plan)
+    controller = ReconfigurationController(executor, compiler, registry)
+    manager_token: object = getattr(controller, "_executor_token")
+    # This admitted reservation remains leased after the executing old frame
+    # finishes, which lets P2 serve its first frame while P1 stays unquiescent.
+    old_reservation = executor.reserve_frame_managed(manager_token, 1, 99)
+
+    def run_old_frame() -> None:
+        try:
+            controller.admit_frame(1, 1)
+        except BaseException as error:
+            worker_errors.append(error)
+
+    frame_thread = Thread(target=run_old_frame, daemon=True)
+    try:
+        frame_thread.start()
+        assert entered.wait(5.0)
+        with patch.object(reconfiguration, "RETIREMENT_GRACE_TIMEOUT_SECONDS", 0.05):
+            first = ReconfigurationRequest(
+                "remove-consumer", 1, _source_only_specification(), StateDirective(), 2
+            )
+            controller.submit(first)
+            assert controller.wait_for_status(
+                first.request_id, frozenset({ReconfigurationStatus.READY}), 5.0
+            ) is not None
+            controller.commit_ready()
+            first_retirement = controller.wait_for_retirement(first.request_id, 5.0)
+            assert first_retirement is not None
+            assert first_retirement.retirement_status is RetirementStatus.STALLED
+
+            release.set()
+            frame_thread.join(5.0)
+            assert not frame_thread.is_alive()
+            controller.admit_frame(3, 2)
+
+            replacement_spec = WorkflowSpecification(
+                nodes=(_source_node(node_id="replacement"),), edges=()
+            )
+            second = ReconfigurationRequest(
+                "remove-shared-source", 2, replacement_spec, StateDirective(), 3
+            )
+            controller.submit(second)
+            assert controller.wait_for_status(
+                second.request_id, frozenset({ReconfigurationStatus.READY}), 5.0
+            ) is not None
+            controller.commit_ready()
+            second_retirement = controller.wait_for_retirement(second.request_id, 5.0)
+            assert second_retirement is not None
+            assert second_retirement.retirement_status is RetirementStatus.STALLED
+            assert cleanup_count == 0
+    finally:
+        release.set()
+        frame_thread.join(5.0)
+        executor.cancel_reserved_frame_managed(manager_token, old_reservation)
+        controller.close()
+    assert not frame_thread.is_alive()
+    assert not worker_errors
+    assert cleanup_count == 0
+
+
 # ======================================================================
 # Conformance scenarios (reviewer P0.4 minimum)
 # ======================================================================

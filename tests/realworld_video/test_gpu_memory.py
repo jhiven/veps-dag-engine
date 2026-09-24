@@ -18,14 +18,14 @@ def test_gpu_warmup_before_baseline_sampling() -> None:
     assert baseline.reserved_bytes == 200_000_000
 
 
-def test_cuda_synchronization_before_every_memory_snapshot() -> None:
-    """Test 16: CUDA synchronization occurs before every memory snapshot."""
+def test_memory_snapshots_do_not_synchronize_the_serving_stream() -> None:
+    """Allocator reads must not insert a CUDA barrier into frame service."""
     sampler = FakeCUDAMemorySampler(is_cuda=True)
     sampler.initialize()
     sampler.sample()
     sampler.sample()
     sampler.sample()
-    assert sampler.synchronize_call_count == 3
+    assert sampler.synchronize_call_count == 0
 
 
 def test_post_retirement_memory_sampled_while_candidate_alive() -> None:

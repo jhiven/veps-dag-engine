@@ -6,13 +6,14 @@ import csv
 import hashlib
 import json
 import os
-import random
 import subprocess
+import sys
 import time
 from dataclasses import dataclass, replace
 from typing import Literal, cast, Any
 
 import numpy as np
+from benchmarks.ordering import balanced_order
 
 from usecases.video_analytics.application import VideoAnalyticsApplication
 from usecases.video_analytics.backends.bytetrack import FakeTrackerBackend
@@ -41,6 +42,7 @@ from usecases.video_analytics.contracts import (
 from usecases.video_analytics.gpu_memory import FakeCUDAMemorySampler, PyTorchCUDAMemorySampler
 from usecases.video_analytics.lifecycle import cleanup_repetition_resources
 from usecases.video_analytics.metrics import calculate_flow_metrics
+from usecases.video_analytics.processors.detector import SourceFrameUnavailable
 from usecases.video_analytics.publisher import FFmpegRTSPPublisher, FakeRTSPPublisher
 from usecases.video_analytics.sink import NullSink
 from usecases.video_analytics.source import FileVideoSource, RTSPVideoSource
@@ -179,6 +181,11 @@ REALWORLD_VIDEO_HEADERS = (
     "fixed_window_accounting_valid",
     "fixed_window_ingress_drop_rate",
     "fixed_window_end_to_end_frame_loss_rate",
+    "request_trigger_receiver_position",
+    "gpu_cutoff_sample_timestamp_ns",
+    "gpu_post_window_sync_timestamp_ns",
+    "empty_source_reads",
+    "request_handled_receiver_position",
 )
 
 REALWORLD_VIDEO_FRAME_HEADERS = (
@@ -324,6 +331,11 @@ class RealworldVideoSampleRow:
     fixed_window_accounting_valid: bool = False
     fixed_window_ingress_drop_rate: float = 0.0
     fixed_window_end_to_end_frame_loss_rate: float = 0.0
+    request_trigger_receiver_position: int | None = None
+    gpu_cutoff_sample_timestamp_ns: int | None = None
+    gpu_post_window_sync_timestamp_ns: int | None = None
+    empty_source_reads: int = 0
+    request_handled_receiver_position: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -352,6 +364,12 @@ class RealworldVideoFrameSampleRow:
     drop_decision_timestamp_ns: int | None
     media_frame_index: int | None
     receiver_position: int | None = None
+
+
+def _is_source_frame_unavailable(result: Any) -> bool:
+    """Return whether a frame failed only because the live source was empty."""
+    error = getattr(result, "error", None)
+    return isinstance(error, str) and error.startswith(f"{SourceFrameUnavailable.__name__}(")
 
 
 def _calculate_file_hash(path: str) -> str:
@@ -408,11 +426,15 @@ def compute_fixed_window_metrics(
     """
     if cutoff_deadline_ns < 0:
         raise ValueError("cutoff_deadline_ns must be non-negative")
-    window_start = request_trigger_receiver_position - baseline_frame_count
-    window_end = request_trigger_receiver_position + transition_frame_count
     expected_frames = baseline_frame_count + transition_frame_count
-    if window_start < 0:
-        raise ValueError("request boundary does not have enough baseline receiver positions")
+    window_start = 0
+    window_end = expected_frames
+    if request_trigger_receiver_position != baseline_frame_count:
+        raise ValueError(
+            "request was not issued at the fixed receiver boundary: "
+            f"observed position {request_trigger_receiver_position}, "
+            f"required {baseline_frame_count}"
+        )
 
     # Build a map of receiver position → list of rows.  Sender/media identity
     # is deliberately not inferred through FFmpeg/RTSP.
@@ -580,6 +602,11 @@ def run_realworld_video_suite(
     from usecases.video_analytics.lifecycle import CoexistenceTracker
     import threading
 
+    def require_disabled_gil(stage: str) -> None:
+        probe = getattr(sys, "_is_gil_enabled", None)
+        if not callable(probe) or probe():
+            raise RuntimeError(f"publication GIL is enabled after {stage}")
+
     if mode is ExecutionMode.PUBLICATION:
         if use_fake_backends:
             raise ValueError("Publication mode rejects use_fake_backends=True")
@@ -603,6 +630,7 @@ def run_realworld_video_suite(
 
         print("Caching model weight state_dicts into CPU RAM memory cache...")
         preload_rtdetr_models_to_ram([initial_model, candidate_model])
+        require_disabled_gil("production dependency and model-cache imports")
         print(
             "RAM model cache initialized. Each sub-run will construct a fresh candidate backend from RAM cache."
         )
@@ -613,7 +641,6 @@ def run_realworld_video_suite(
 
     source_hash = _calculate_file_hash(video_path)
     mechanisms = ["VEPS", "Pause", "Stop"]
-    rng = random.Random(random_seed)
 
     sample_rows: list[RealworldVideoSampleRow] = []
     frame_rows: list[RealworldVideoFrameSampleRow] = []
@@ -694,8 +721,7 @@ def run_realworld_video_suite(
 
     try:
         for rep in range(1, repetition_count + 1):
-            mech_order = list(mechanisms)
-            rng.shuffle(mech_order)
+            mech_order = balanced_order(tuple(mechanisms), random_seed, "realworld-video", rep)
 
             for pos, mech in enumerate(mech_order, start=1):
                 local_files = mode is ExecutionMode.PUBLICATION
@@ -748,7 +774,10 @@ def run_realworld_video_suite(
 
                 memory_sampler: CUDAMemorySamplerProtocol
                 if device.startswith("cuda"):
-                    memory_sampler = PyTorchCUDAMemorySampler(device=device)
+                    memory_sampler = PyTorchCUDAMemorySampler(
+                        device=device,
+                        strict=mode is ExecutionMode.PUBLICATION and not use_fake_backends,
+                    )
                     memory_sampler.initialize()
                 else:
                     memory_sampler = FakeCUDAMemorySampler(is_cuda=False)
@@ -885,6 +914,8 @@ def run_realworld_video_suite(
 
                 try:
                     meta = app.open()
+                    if mode is ExecutionMode.PUBLICATION:
+                        require_disabled_gil("initial backend construction")
                     if app.tracker_backend is not None:
                         trk_inst_before = app.tracker_backend.instance_id
                         reset_before = app.tracker_backend.reset_count
@@ -926,6 +957,7 @@ def run_realworld_video_suite(
                     _request_trigger_media_frame_index: int | None = None
                     _request_trigger_media_pts_ns: int | None = None
                     _request_trigger_receiver_position: int | None = None
+                    _request_handled_receiver_position: int | None = None
                     _measurement_start_source_sequence: int | None = None
 
                     # 4. Start phase-normalized measurement window.
@@ -937,6 +969,26 @@ def run_realworld_video_suite(
                         if source_video_frame_count is not None
                         else None
                     )
+                    gpu_cutoff_snap = CUDAMemorySnapshot(None, None, None, None)
+                    gpu_cutoff_sample_timestamp_ns: int | None = None
+                    gpu_cutoff_error: BaseException | None = None
+
+                    def observe_fixed_endpoint() -> None:
+                        nonlocal gpu_cutoff_snap, gpu_cutoff_sample_timestamp_ns, gpu_cutoff_error
+                        # Runs on the ingress thread, whose decoder swallows
+                        # exceptions; keep the failure for the serving thread.
+                        try:
+                            gpu_cutoff_snap = memory_sampler.sample()
+                        except BaseException as error:
+                            gpu_cutoff_error = error
+                            return
+                        gpu_cutoff_sample_timestamp_ns = time.monotonic_ns()
+
+                    getattr(source_obj, "set_fixed_endpoint_observer")(observe_fixed_endpoint)
+                    if hasattr(source_obj, "_pre_request_target"):
+                        source_obj._pre_request_target = reconfiguration_trigger_frame_offset  # type: ignore[attr-defined]
+                    if hasattr(source_obj, "_post_effect_target"):
+                        source_obj._post_effect_target = reconfiguration_trigger_frame_offset  # type: ignore[attr-defined]
                     if isinstance(source_obj, RTSPVideoSource):
                         source_obj.start_measurement_window(
                             measurement_source_frames,
@@ -946,12 +998,6 @@ def run_realworld_video_suite(
                         getattr(source_obj, "start_measurement_window")(
                             measurement_source_frames
                         )
-                    # Configure phase targets so the source uses the correct
-                    # pre-request / post-effect frame counts for this run.
-                    if hasattr(source_obj, "_pre_request_target"):
-                        source_obj._pre_request_target = reconfiguration_trigger_frame_offset  # type: ignore[attr-defined]
-                    if hasattr(source_obj, "_post_effect_target"):
-                        source_obj._post_effect_target = reconfiguration_trigger_frame_offset  # type: ignore[attr-defined]
                     measurement_start_timestamp_ns = getattr(source_obj, "measurement_start_timestamp_ns", None)
 
                     # Telemetry snapshots & states
@@ -972,6 +1018,8 @@ def run_realworld_video_suite(
                     active_detector_instance_count_after_retirement = 1
 
                     measured_admitted = 0
+                    # Transient empty live-source reads are retried, not hidden.
+                    empty_source_reads = 0
                     swap_requested = False
                     t_req_swap = None
                     t_prep_start = None
@@ -996,30 +1044,36 @@ def run_realworld_video_suite(
 
                         if not swap_requested and getattr(source_obj, "measurement_source_frames_received") >= reconfiguration_trigger_frame_offset:
                             swap_requested = True
-                            # The boundary is defined by the source's phase
-                            # accounting, which caps the pre-request phase at
-                            # exactly this many positions. Reading the polled
-                            # counter instead would record 61 whenever the
-                            # ingress thread advanced between the check and the
-                            # read, shifting the window one position past the
-                            # last frame the source will ever produce.
-                            _request_trigger_receiver_position = (
-                                reconfiguration_trigger_frame_offset
+                            # The receiver records this boundary when it
+                            # actually sees the target position. Polling may
+                            # handle that signal later, but must not redefine
+                            # the request position or timestamp.
+                            _request_trigger_receiver_position = getattr(
+                                source_obj, "request_boundary_receiver_position"
+                            )
+                            t_req_swap = getattr(source_obj, "request_boundary_timestamp_ns")
+                            if _request_trigger_receiver_position is None or t_req_swap is None:
+                                raise RuntimeError("receiver did not record the request boundary")
+                            t_prep_start = time.monotonic_ns()
+                            # Where the receiver was when the serving thread
+                            # acted on the boundary: the polling delay in positions.
+                            _request_handled_receiver_position = getattr(
+                                source_obj, "measurement_source_frames_received"
                             )
 
                             # Before-prep snapshot
                             gpu_before_snap = memory_sampler.sample()
+                            memory_sampler.reset_peak_stats()
 
                             # Initialize candidate if not already
                             if cand_backend is None:
                                 from usecases.video_analytics.backends.rtdetr import RTDETRDetectorBackend
                                 cand_backend = RTDETRDetectorBackend(cfg.candidate_detector)
+                                if mode is ExecutionMode.PUBLICATION:
+                                    require_disabled_gil("candidate backend construction")
                                 setattr(app, "_candidate_detector_backend", cand_backend)
 
                             if typed_mech == "Stop":
-                                t_req_swap = time.monotonic_ns()
-                                t_prep_start = time.monotonic_ns()
-                                
                                 # Warm up the candidate detector instance
                                 dummy_bgr = np.zeros((480, 640, 3), dtype=np.uint8)
                                 sample_packet = FramePacket(
@@ -1030,7 +1084,6 @@ def run_realworld_video_suite(
                                     height=480,
                                 )
                                 cand_backend.prepare(sample_packet)
-                                t_prep_end = time.monotonic_ns()
 
                                 # Coexistence snapshot
                                 gpu_coexist_snap = memory_sampler.sample()
@@ -1040,8 +1093,6 @@ def run_realworld_video_suite(
                                 app_executor: Any = getattr(app, "_executor")
                                 app_controller: Any = getattr(app, "_controller")
                                 old_plan = app_executor.active_plan
-                                app_controller.close()
-                                CoexistenceTracker.plan_retired(old_plan.version)
 
                                 candidate_spec = build_video_analytics_specification(
                                     detector_config=cfg.candidate_detector,
@@ -1068,6 +1119,12 @@ def run_realworld_video_suite(
                                     raise RuntimeError(f"Stop-rebuild compilation failed: {cand_res.reason}")
 
                                 compiled_plan = cand_res.plan
+                                t_prep_end = time.monotonic_ns()
+                                # Teardown of the old controller belongs to Stop's
+                                # blocking transition, not to candidate preparation,
+                                # so it happens after the preparation interval ends.
+                                app_controller.close()
+                                CoexistenceTracker.plan_retired(old_plan.version)
                                 CoexistenceTracker.plan_created(compiled_plan.version)
 
                                 setattr(app, "_current_plan_version", compiled_plan.version)
@@ -1125,8 +1182,7 @@ def run_realworld_video_suite(
                                 app_executor: Any = getattr(app, "_executor")
                                 app_controller.update_registry(candidate_registry)
 
-                                t_req = time.monotonic_ns()
-                                t_req_swap = t_req
+                                t_req = t_req_swap
 
                                 req_id = f"swap_{typed_mech.lower()}_{t_req}"
                                 reconfig_req = ReconfigurationRequest(
@@ -1162,16 +1218,21 @@ def run_realworld_video_suite(
                                         if getattr(source_obj, "measurement_source_frames_received") >= measurement_source_frames:
                                             break
 
+                                        if mode is ExecutionMode.SMOKE:
+                                            time.sleep(0.001)
                                         now_ns = time.monotonic_ns()
                                         res = app_controller.admit_frame(
                                             admitted_at_ns=now_ns,
                                             frame_id=warmup_admitted + measured_admitted + 1,
                                         )
-                                        if res.status is not FrameStatus.COMPLETED:
-                                            print(f"DEBUG VEPS: frame_id={warmup_admitted + measured_admitted + 1} failed: status={res.status}, error={res.error}")
-                                            break
                                         measured_admitted += 1
-                                        time.sleep(0.001)
+                                        if _is_source_frame_unavailable(res):
+                                            empty_source_reads += 1
+                                            continue
+                                        if res.status is not FrameStatus.COMPLETED:
+                                            raise RuntimeError(
+                                                f"VEPS frame failed during preparation: {res.error!r}"
+                                            )
 
                                 rec_ready: Any = app_controller.wait_for_status(
                                     req_id,
@@ -1181,7 +1242,8 @@ def run_realworld_video_suite(
                                 if rec_ready is None or rec_ready.status not in (ReconfigurationStatus.READY, ReconfigurationStatus.COMMITTED):
                                     raise RuntimeError(f"{typed_mech} candidate preparation failed")
 
-                                t_prep_start = rec_ready.preparation_started_ns or t_req
+                                # Include application-level backend construction
+                                # and graph setup, not only controller compilation.
                                 t_prep_end = rec_ready.preparation_completed_ns or rec_ready.ready_ns or t_prep_start
 
                                 CoexistenceTracker.plan_created(rec_ready.candidate_version or 2)
@@ -1236,6 +1298,8 @@ def run_realworld_video_suite(
                             peak_live_detector_instance_count = max(peak_live_detector_instance_count, CoexistenceTracker.get_peak_detector_count())
                             continue
 
+                        if mode is ExecutionMode.SMOKE:
+                            time.sleep(0.001)
                         now_ns = time.monotonic_ns()
                         app_controller: Any = getattr(app, "_controller")
                         res = app_controller.admit_frame(
@@ -1243,10 +1307,21 @@ def run_realworld_video_suite(
                             frame_id=warmup_admitted + measured_admitted + 1,
                         )
                         measured_admitted += 1
+                        if _is_source_frame_unavailable(res):
+                            empty_source_reads += 1
+                            continue
+                        if res.status is not FrameStatus.COMPLETED:
+                            raise RuntimeError(
+                                f"{mech} frame failed inside the fixed window: {res.error!r}"
+                            )
 
                     # The fixed receiver endpoint has now been captured by the
                     # source.  Retirement observation and synchronized memory
                     # sampling happen strictly outside the serving window.
+                    if gpu_cutoff_error is not None:
+                        raise RuntimeError("fixed-endpoint allocator sample failed") from gpu_cutoff_error
+                    if gpu_cutoff_sample_timestamp_ns is None:
+                        raise RuntimeError("fixed-endpoint allocator observer did not run")
                     if pending_veps_request_id is not None:
                         app_controller_after_window: Any = getattr(app, "_controller")
                         ret_rec = app_controller_after_window.wait_for_retirement(
@@ -1262,6 +1337,7 @@ def run_realworld_video_suite(
                             CoexistenceTracker.get_live_detector_count()
                         )
 
+                    gpu_post_window_sync_timestamp_ns = time.monotonic_ns()
                     memory_sampler.synchronize()
                     gpu_ret_snap = memory_sampler.sample()
 
@@ -1355,18 +1431,10 @@ def run_realworld_video_suite(
                         _measurement_end_media_frame_index = measured_frames_sorted[-1].media_frame_index
                         _measurement_end_media_pts_ns = measured_frames_sorted[-1].media_pts_ns
                         _measurement_start_source_sequence = 1
-                        # The request occurs after the baseline frames and before
-                        # the following frame. Anchor the fixed window to that
-                        # boundary, rather than to the last baseline frame.
-                        if _measurement_start_media_frame_index is not None:
-                            _request_trigger_media_frame_index = (
-                                _measurement_start_media_frame_index
-                                + reconfiguration_trigger_frame_offset
-                            )
-                            _request_trigger_media_pts_ns = int(round(
-                                (_request_trigger_media_frame_index - 1)
-                                * (1e9 / meta.fps)
-                            ))
+                        # No sender-origin identity crosses FFmpeg/RTSP, so a
+                        # request media index or PTS cannot be reconstructed
+                        # from the receiver boundary. The observed receiver
+                        # position and timestamp are recorded separately.
                     # ------------------------------------------------------------------
 
                     # Find last old-plan output occurring before first candidate output
@@ -1453,21 +1521,14 @@ def run_realworld_video_suite(
                     drop_rate_pub_first = _rate(d_between_pub_first, s_pub_first)
                     drop_rate_after = _rate(d_after, s_after)
 
-                    # GPU transition maximum (peak across all sampled checkpoints).
-                    _gpu_alloc_vals = [
-                        gpu_before_snap.allocated_bytes,
-                        gpu_coexist_snap.allocated_bytes,
-                        gpu_pub_snap.allocated_bytes,
-                        gpu_ret_snap.allocated_bytes,
-                    ]
-                    _gpu_resv_vals = [
-                        gpu_before_snap.reserved_bytes,
-                        gpu_coexist_snap.reserved_bytes,
-                        gpu_pub_snap.reserved_bytes,
-                        gpu_ret_snap.reserved_bytes,
-                    ]
-                    gpu_trans_max_alloc = max((v for v in _gpu_alloc_vals if v is not None), default=None)
-                    gpu_trans_max_resv = max((v for v in _gpu_resv_vals if v is not None), default=None)
+                    # These are allocator high-water marks since the request,
+                    # frozen before any post-window synchronization or drain.
+                    gpu_trans_max_alloc = gpu_cutoff_snap.peak_allocated_bytes
+                    gpu_trans_max_resv = gpu_cutoff_snap.peak_reserved_bytes
+                    if device.startswith("cuda") and (
+                        gpu_trans_max_alloc is None or gpu_trans_max_resv is None
+                    ):
+                        raise RuntimeError("CUDA allocator peaks were unavailable at the fixed cutoff")
 
                     sample_row = RealworldVideoSampleRow(
                         run_id=run_id,
@@ -1565,6 +1626,11 @@ def run_realworld_video_suite(
                         drop_rate_after_first_candidate_output=drop_rate_after,
                         gpu_memory_transition_max_allocated_bytes=gpu_trans_max_alloc,
                         gpu_memory_transition_max_reserved_bytes=gpu_trans_max_resv,
+                        request_trigger_receiver_position=_request_trigger_receiver_position,
+                        gpu_cutoff_sample_timestamp_ns=gpu_cutoff_sample_timestamp_ns,
+                        gpu_post_window_sync_timestamp_ns=gpu_post_window_sync_timestamp_ns,
+                        empty_source_reads=empty_source_reads,
+                        request_handled_receiver_position=_request_handled_receiver_position,
                     )
                     measured_by_ingress = sorted(
                         (row for row in rep_frame_rows if row.inside_measurement_window),
@@ -1753,6 +1819,11 @@ def run_realworld_video_suite(
                     r.fixed_window_accounting_valid,
                     f"{r.fixed_window_ingress_drop_rate:.6f}",
                     f"{r.fixed_window_end_to_end_frame_loss_rate:.6f}",
+                    r.request_trigger_receiver_position if r.request_trigger_receiver_position is not None else "",
+                    r.gpu_cutoff_sample_timestamp_ns if r.gpu_cutoff_sample_timestamp_ns is not None else "",
+                    r.gpu_post_window_sync_timestamp_ns if r.gpu_post_window_sync_timestamp_ns is not None else "",
+                    r.empty_source_reads,
+                    r.request_handled_receiver_position if r.request_handled_receiver_position is not None else "",
                 ])
 
         with open(frame_csv_path, "w", newline="", encoding="utf-8") as f:

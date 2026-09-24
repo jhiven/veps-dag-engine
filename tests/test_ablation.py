@@ -223,7 +223,7 @@ def test_synchronous_work_accounting_and_residual() -> None:
                 publication_ns=100,
                 synchronous_retirement_ns=200,
                 total_synchronous_ns=800,
-                synchronous_accounting_residual_ns=50,  # Invalid! Residual must be 0
+                synchronous_accounting_residual_ns=50,  # Invalid: declared residual differs from measured minus phases.
                 synchronous_accounting_valid=False,
             )
         )

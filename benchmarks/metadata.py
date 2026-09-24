@@ -118,7 +118,7 @@ class RunMetadata:
             registry_snapshot_identifiers=registry_snapshot_identifiers,
             compiler_version=compiler_version,
             equivalence_margins={"relative_margin": 0.01},
-            scenario_ordering_policy="counterbalanced_seeded_random",
+            scenario_ordering_policy="position_balanced_sha256_seeded",
             workload_calibration=workload_calibration,
             provenance={} if provenance is None else provenance,
         )

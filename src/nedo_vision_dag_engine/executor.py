@@ -275,11 +275,14 @@ class PipelineExecutor:
         with self._in_flight_lock:
             self._plan_inflight[plan_version] = self._plan_inflight.get(plan_version, 0) + 1
 
-    def _decrement_inflight(self, plan_version: int, completed_at_ns: int | None) -> None:
+    def _decrement_inflight(
+        self, plan_version: int, completed_at_ns: int | None, frame_id: int
+    ) -> None:
         """Decrement the in-flight counter and signal waiters if it reaches zero.
 
-        Acquires ``_in_flight_lock`` internally.  Safe to call while holding
-        ``_admission_lock``.
+        Record the release while holding ``_in_flight_lock`` and before waking
+        grace-period waiters. Otherwise a retirement thread can emit cleanup
+        before the release event even though the lease was already removed.
         """
         with self._in_flight_lock:
             if completed_at_ns is not None:
@@ -295,10 +298,23 @@ class PipelineExecutor:
             if new_count == 0:
                 del self._plan_inflight[plan_version]
                 event = self._plan_quiescent_events.pop(plan_version, None)
-                if event is not None:
-                    event.set()
             else:
                 self._plan_inflight[plan_version] = new_count
+                event = None
+            try:
+                evidence = runtime_evidence_sink()
+                if evidence is not None:
+                    evidence(
+                        "lease_released",
+                        {
+                            "frame_id": frame_id,
+                            "plan_id": plan_version,
+                            "outcome": "released",
+                        },
+                    )
+            finally:
+                if event is not None:
+                    event.set()
 
     def last_frame_completion_ns(self, plan_version: int) -> int | None:
         """Return the latest observed lease-release boundary for a plan."""
@@ -559,17 +575,7 @@ class PipelineExecutor:
             completed_at_ns = self._clock()
             return completed_at_ns
         finally:
-            self._decrement_inflight(plan_version, completed_at_ns)
-            evidence = runtime_evidence_sink()
-            if evidence is not None:
-                evidence(
-                    "lease_released",
-                    {
-                        "frame_id": frame_id,
-                        "plan_id": plan_version,
-                        "outcome": "released",
-                    },
-                )
+            self._decrement_inflight(plan_version, completed_at_ns, frame_id)
 
     def snapshot_active_plan(self) -> ExecutionPlan:
         """Centralized accessor for taking a thread-safe snapshot of the active plan.

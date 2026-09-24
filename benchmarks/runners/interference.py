@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import gc
 import os
-import random
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -25,6 +24,7 @@ from benchmarks.model import (
     InterferenceFrameSampleRow,
     InterferenceSampleRow,
 )
+from benchmarks.ordering import balanced_order
 from benchmarks.scenarios import (
     create_reconfiguration_registry,
     make_reconfiguration_base_spec,
@@ -537,12 +537,10 @@ def run_interference_suite(
         for cat in categories:
             combos.append((cat, target_ns))
 
-    rng = random.Random(random_seed)
     all_rows: list[InterferenceSampleRow] = []
 
     for rep in range(1, repetition_count + 1):
-        rep_combos = list(combos)
-        rng.shuffle(rep_combos)
+        rep_combos = balanced_order(tuple(combos), random_seed, "interference", rep)
 
         for pos, (cat, target_ns) in enumerate(rep_combos, start=1):
             scenario_id = f"interference_{cat}_{target_ns // 1000000}ms"

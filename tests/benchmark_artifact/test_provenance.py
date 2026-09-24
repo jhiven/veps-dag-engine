@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import sys
 import tempfile
 from typing import Any
 
@@ -82,3 +83,17 @@ def test_unresolved_model_checkpoints_block_publication() -> None:
     missing = missing_required_provenance(provenance, ("realworld-video",), "cpu")
     assert "models.PekingU/rtdetr_r18vd.revision" in missing
     assert "models.PekingU/rtdetr_r18vd.config_sha256" in missing
+
+
+def test_native_warning_and_gil_provenance_are_observations() -> None:
+    provenance = _provenance_for("missing.mp4")
+    tokenizers = provenance["undeclared_free_threading_extensions"]["tokenizers"]
+    assert tokenizers["version"] != UNKNOWN
+    # Measured by a child interpreter without a GIL override, not asserted.
+    assert tokenizers["probe_gil_enabled_after_import"] is True
+    assert tokenizers["declares_free_threading_support"] is False
+    assert any("tokenizers" in text for text in tokenizers["probe_runtime_warnings"])
+    assert isinstance(tokenizers["observed_import_warnings"], list)
+    assert isinstance(tokenizers["imported_in_benchmark_process"], bool)
+    assert "warning" not in tokenizers  # No fabricated interpreter message.
+    assert provenance["gil_enabled_after_imports"] is getattr(sys, "_is_gil_enabled")()

@@ -4,14 +4,14 @@ This section specifies the system model, implementation contracts, compilation p
 
 ### A. Implementation Scope and Execution Assumptions
 
-The reference implementation targets a single video-analytics pipeline executed by one logical pipeline executor on one device. A pipeline processes frames sequentially, with at most one admitted frame executing inside a given pipeline at any instant. Input acquisition may continue through a bounded source queue, but a new frame is admitted to the DAG only after the preceding frame has completed.
+The reference implementation targets a single video-analytics pipeline executed by one logical pipeline executor on one device. Frame bodies are serialized, but multiple admitted frames may hold reservations while waiting to execute. Input acquisition may continue through a bounded source queue. Admission selects one immutable plan and acquires its lease before frame-body execution.
 
 The initial implementation supports:
 - typed directed acyclic workflows;
 - static compilation into immutable execution plans;
 - structural runtime reconfiguration through node addition, removal, replacement, and edge rewiring;
 - background preparation of candidate plans;
-- activation of a candidate plan between two frame executions;
+- atomic publication at the admission boundary, including publication while a leased stateless old-plan frame is still executing;
 - preservation of unchanged compatible processor instances;
 - explicit reset or rejection for unsupported stateful changes;
 - failure-atomic candidate preparation.
@@ -254,8 +254,11 @@ Therefore, candidate preparation must distinguish:
 
 #### 6) Commit boundary
 
-The initial implementation admits at most one frame at a time within a pipeline.
-A plan transition occurs only after frame $f_k$ has completed and before frame $f_{k+1}$ is admitted.
+Admission selects an immutable plan and acquires its frame lease under the
+admission lock. Frame bodies are serialized under a separate execution lock,
+so publication of a stateless successor may complete while an old-plan frame
+still executes. Preserving a mutable processor instead requires a bounded
+pre-publication drain of old-plan leases.
 For a preserved tracker:
 Plaintext
 
@@ -542,7 +545,7 @@ class ExecutionPlan:
 
 Published structural metadata shall never be modified in place.
 
-Processor objects referenced by a plan may contain state, but their identity and structural binding to the plan shall remain fixed. Because the reference executor admits one frame at a time and commits only between frames, preserved stateful instances are never concurrently invoked by two plan versions.
+Processor objects referenced by a plan may contain state, but their identity and structural binding to the plan shall remain fixed. Before publishing a plan that preserves mutable state, the controller closes admission and drains all old-plan leases. Because frame bodies are already serialized, this handoff guarantees old-before-new access order: no new-plan frame reaches the shared mutable instance before every old-plan frame has released its lease.
 
 ### G. Static Frame Execution
 
@@ -555,33 +558,15 @@ Input:
 frame $f$
 
 current execution plan $P$
-1. plan ← $P$
-2. workspace ← acquire_workspace(plan)
-3. clear workspace using MISSING
-4. create FrameContext(frame_id, plan.version, timestamps)
-5. for step in plan.steps do
-    
-6. ```
-    if readiness_rule(step, workspace) is false then
-    ```
-    
-7. ```
-        workspace[step.output_index] ← MISSING
-    ```
-    
-8. ```
-        continue
-    ```
-    
-9. ```
-    inputs ← construct_inputs(step.input_bindings, workspace)
-    ```
-    
-10. output ← step.processor_ref.process(inputs, FrameContext)
-11. workspace[step.output_index] ← output
-12. emit configured sink outputs
-13. release_workspace(workspace)
-14. return FrameResult(frame_id, plan.version)
+
+1. Enter the admission critical section, select $P$, increment its lease count, and create a one-shot reservation bound to $P$.
+2. Leave the admission critical section. Consume the reservation under the admission coordinator before frame-body execution.
+3. Enter the serialized frame-execution section, which publication does not hold.
+4. Acquire and clear the plan-specific workspace with `MISSING`; create `FrameContext` with the selected plan version.
+5. For each step in $P$, evaluate its readiness rule. Write `MISSING` when it is not ready; otherwise construct inputs and invoke that step's processor.
+6. Record the output and emit configured sink outputs without rereading the global active-plan pointer.
+7. In `finally`, release the workspace and the lease exactly once, including when execution, instrumentation, or cleanup raises. Signal grace-period waiters.
+8. Return `FrameResult`. If the reservation cannot reach execution, cancel it explicitly instead of abandoning its lease.
 
 The executor shall not read a global active-plan reference inside the node loop.
 
@@ -932,11 +917,11 @@ A candidate becomes READY only if every required processor and resource has been
 
 **4) Boundary commit**
 
-The executor checks for a ready candidate only after the current frame has completed and before admitting the next frame.
+The controller may publish a ready candidate while a stateless old-plan frame remains executing. Publication is ordered with admission, not with frame-body execution. When a compatible mutable instance is preserved, publication first gates admission and waits for all old-plan leases to drain.
 
 **Algorithm 2: Commit a candidate plan**
-1. finish execution of frame $f_k$ under $P_v$
-2. obtain next READY candidate $C$
+1. obtain next READY candidate $C$ under the admission coordinator
+2. if $C$ preserves mutable state, gate admission and drain old-plan leases
 3. if $C$.base_version ≠ active_plan.version then
 4. ```
     mark $C$ as STALE
@@ -953,8 +938,9 @@ The executor checks for a ready candidate only after the current frame has compl
 8. active_plan ← $C$.plan
 9. record commit timestamp
 10. mark $C$ as COMMITTED
-11. retire resources in old_plan that are not reused
-12. admit frame $f_{k+1}$ under the new active plan
+11. queue retirement of old-plan resources not reused by the new plan
+12. release the admission gate and admit later frames under the new plan
+13. wait for all leases that may reference each superseded processor before cleanup
 
 The plan-switch assignment is the linearization point of the reconfiguration.
 
@@ -977,7 +963,7 @@ Thus, exactly one execution-plan version determines the complete processing of e
 Assume that:
 - published plan metadata is immutable;
 - at most one frame is executing in a pipeline;
-- plan activation occurs only after one frame has completed and before the next frame is admitted;
+- admission and publication are ordered by one coordinator, and admission acquires a lease on the selected plan;
 - the executor uses one local plan reference throughout frame execution;
 - reconfiguration requests are serialized.
 
@@ -985,13 +971,7 @@ Then every admitted frame is processed under exactly one execution-plan version.
 
 **Proof sketch**
 
-Consider the sequence of admitted frames
-
-$$f_1,f_2,\ldots,f_k.$$
-
-For the base case, $f_1$ is admitted after the executor selects one active plan $P_v$. The executor does not change or reread the active-plan reference during the frame, so every event associated with $f_1$ uses $P_v$.
-
-Assume that every frame up to $f_i$ is processed under exactly one plan. After $f_i$ completes, the executor may either retain the current plan or commit one ready candidate. The commit occurs before $f_{i+1}$ is admitted. Therefore, $f_{i+1}$ observes either the previous plan or the committed candidate, but not both. Because no subsequent plan lookup occurs during its execution, all events of $f_{i+1}$ use the selected plan. By induction, the property holds for every admitted frame.
+Consider any admitted frame $f$. Its admission linearizes either before or after a publication, so it selects exactly one immutable plan $P_v$ while acquiring that plan's lease. The frame body uses only that selected plan and never rereads the active-plan pointer. Publication may occur during execution, but the old plan and any processor reachable through its lease remain alive until the lease is released. Therefore every execution event of $f$ is determined by $P_v$. Applying the same argument independently to each admitted frame establishes the property without requiring completion order to match caller-supplied frame identifiers.
 
 The proposition establishes a safety property. It does not guarantee that every submitted candidate will eventually compile or commit.
 
@@ -1270,4 +1250,4 @@ Dashboard integration, database persistence, external message brokers, model dis
 
 The complete artifact shall include the runtime source code, immutable workflow specifications, processor implementations used in evaluation, invalid-workflow corpus, structural-edit sequences, benchmark scripts, raw timing traces, environment manifests, and scripts that regenerate all reported results. The artifact shall distinguish representative video-analytics workloads from synthetic graph-scaling workloads. Synthetic workloads shall be labeled as stress tests and shall not be presented as representative production pipelines.
 
-Under the stated single-executor and one-frame-in-flight assumptions, an independent implementation conforming to this specification should reproduce the same structural-validation behavior, frame-boundary activation semantics, frame-plan consistency property, and failure-atomic candidate preparation, even if lower-level implementation details differ.
+Under the stated single-executor and serialized-frame-body assumptions, an independent implementation conforming to this specification should reproduce the same structural-validation behavior, frame-boundary activation semantics, frame-plan consistency property, and failure-atomic candidate preparation, even if lower-level implementation details differ.

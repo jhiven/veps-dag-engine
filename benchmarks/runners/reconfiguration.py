@@ -21,6 +21,7 @@ from benchmarks.model import (
     compute_critical_path_decomposition,
     validate_reconfiguration_sample,
 )
+from benchmarks.ordering import balanced_order
 from benchmarks.scenarios import (
     apply_reconfiguration_edit,
     create_reconfiguration_registry,
@@ -116,9 +117,7 @@ def run_reconfiguration_suite(
         scenario_id = f"reconfig_{edit_type}_size{graph_size}"
 
         for rep in range(1, repetition_count + 1):
-            # Counterbalanced baseline ordering per repetition
-            rot_idx = (rep - 1) % len(baselines)
-            rep_baselines = baselines[rot_idx:] + baselines[:rot_idx]
+            rep_baselines = balanced_order(baselines, seed, scenario_id, rep)
 
             for baseline in rep_baselines:
                 gc.collect()
@@ -146,9 +145,7 @@ def run_reconfiguration_suite(
         sens_scenario_id = f"graph_size_sensitivity_{sz}"
 
         for rep in range(1, repetition_count + 1):
-            # Counterbalanced baseline ordering per repetition
-            rot_idx = (rep - 1) % len(baselines)
-            rep_sens_baselines = baselines[rot_idx:] + baselines[:rot_idx]
+            rep_sens_baselines = balanced_order(baselines, seed, sens_scenario_id, rep)
 
             for baseline in rep_sens_baselines:
                 gc.collect()
@@ -248,9 +245,8 @@ def _run_reconfig_repetition(
                     except Exception:
                         continue
                     if not admission_gate.try_enter():
-                        accounting.classify(fid, "intentional_queue_cancellation")
-                        with drop_lock:
-                            intentional_cancellation_count += 1
+                        # Dequeued after the boundary closed, so admission refused it.
+                        accounting.classify(fid, "admission_rejection")
                         continue
                     try:
                         t_adm = time.perf_counter_ns()
@@ -508,9 +504,8 @@ def _run_reconfig_repetition(
                     except Exception:
                         continue
                     if not admission_gate.try_enter():
-                        accounting.classify(fid, "intentional_queue_cancellation")
-                        with drop_lock:
-                            intentional_cancellation_count += 1
+                        # Dequeued after the boundary closed, so admission refused it.
+                        accounting.classify(fid, "admission_rejection")
                         continue
                     try:
                         t_adm = time.perf_counter_ns()

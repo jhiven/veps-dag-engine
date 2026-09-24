@@ -102,6 +102,9 @@ class ReconfigurationSampleRow:
     frames_admission_rejected: int = 0
     frames_still_queued_or_in_flight: int = 0
     frame_accounting_residual: int = 0
+    calibrated_service_time_ns: int | None = None
+    configured_inter_arrival_ns: int | None = None
+    target_load_ratio: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -193,6 +196,19 @@ def compute_critical_path_decomposition(
 
 
 def validate_reconfiguration_sample(row: ReconfigurationSampleRow, tolerance_ns: int = 10_000_000) -> None:
+    calibration = (
+        row.calibrated_service_time_ns,
+        row.configured_inter_arrival_ns,
+        row.target_load_ratio,
+    )
+    if any(value is not None for value in calibration):
+        service_ns, arrival_ns, target_load = calibration
+        if service_ns is None or arrival_ns is None or target_load is None:
+            raise ValueError("stress calibration fields must occur together")
+        if service_ns <= 0 or arrival_ns <= 0 or not 0 < target_load <= 1:
+            raise ValueError("invalid stress calibration")
+        if abs(service_ns - target_load * arrival_ns) > 1:
+            raise ValueError("stress calibration load ratio is inconsistent")
     if row.frames_offered:
         accounted = (
             row.frames_completed
@@ -398,6 +414,8 @@ def validate_ablation_sample(row: AblationSampleRow) -> None:
     else:  # variant_d
         expected_sync = row.publication_ns
 
+    # The gate interval includes the wait for in-flight frames to drain.
+    expected_sync += row.boundary_wait_ns or 0
     residual = row.total_synchronous_ns - expected_sync
     if row.synchronous_accounting_residual_ns != residual:
         raise ValueError(
@@ -643,6 +661,9 @@ RECONFIGURATION_HEADERS: tuple[str, ...] = (
     "frames_admission_rejected",
     "frames_still_queued_or_in_flight",
     "frame_accounting_residual",
+    "calibrated_service_time_ns",
+    "configured_inter_arrival_ns",
+    "target_load_ratio",
 )
 
 ABLATION_HEADERS: tuple[str, ...] = (

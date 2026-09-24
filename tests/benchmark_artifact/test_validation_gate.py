@@ -10,7 +10,8 @@ import tempfile
 
 import pytest
 
-from benchmarks.conformance_trace import SCHEMA_VERSION, ConformanceTrace
+from benchmarks.conformance_trace import SCHEMA_VERSION
+from benchmarks.runners.conformance import run_conformance_suite
 from benchmarks.validation_gate import validate_benchmark_directory
 
 REQUIRED_CAMPAIGNS = (
@@ -33,25 +34,9 @@ def _write_metadata(run_dir: str, selected_suites: list[str]) -> None:
         json.dump({"run_id": "run_test", "status": "COMPLETED"}, file)
 
 
-def _write_passing_trace(directory: str, campaign_id: str, seed: int) -> None:
-    path = os.path.join(directory, f"{campaign_id}-seed-{seed}.jsonl")
-    with ConformanceTrace(path, "run_test", campaign_id, seed) as trace:
-        trace.emit("campaign_started", {"outcome": "running"})
-        trace.emit("frame_offered", {"frame_id": 1})
-        trace.emit("frame_admitted", {"frame_id": 1, "plan_id": 1})
-        trace.emit("lease_acquired", {"frame_id": 1, "plan_id": 1})
-        trace.emit("lease_released", {"frame_id": 1, "plan_id": 1})
-        trace.emit("frame_completed", {"frame_id": 1, "plan_id": 1})
-        trace.emit("campaign_completed", {"outcome": "passed"})
-
-
 def _write_full_conformance(run_dir: str) -> str:
     directory = os.path.join(run_dir, "conformance")
-    os.makedirs(directory, exist_ok=True)
-    for seed in RANDOMIZED_SEEDS:
-        _write_passing_trace(directory, "randomized_consistency", seed)
-    for campaign_id in REQUIRED_CAMPAIGNS:
-        _write_passing_trace(directory, campaign_id, RANDOMIZED_SEEDS[0])
+    run_conformance_suite("run_test", directory, "smoke", RANDOMIZED_SEEDS)
     return directory
 
 
@@ -151,8 +136,12 @@ def test_validate_gate_subcommand_is_reachable(passing: bool) -> None:
         if not passing:
             os.remove(os.path.join(directory, "mutable_handoff-seed-42.jsonl"))
 
+        # Match the parent's explicit free-threaded mode. A child Python
+        # process does not inherit the parent's -Xgil=0 interpreter option.
+        gil_probe = getattr(sys, "_is_gil_enabled", None)
+        interpreter_options = ["-Xgil=0"] if callable(gil_probe) and not gil_probe() else []
         completed = subprocess.run(
-            [sys.executable, "-m", "benchmarks.cli", "validate-gate", run_dir],
+            [sys.executable, *interpreter_options, "-m", "benchmarks.cli", "validate-gate", run_dir],
             capture_output=True,
             text=True,
             cwd=os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),

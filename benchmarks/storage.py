@@ -213,6 +213,9 @@ def append_reconfiguration_rows(
             str(row.frames_admission_rejected),
             str(row.frames_still_queued_or_in_flight),
             str(row.frame_accounting_residual),
+            _format_optional_int(row.calibrated_service_time_ns),
+            _format_optional_int(row.configured_inter_arrival_ns),
+            "" if row.target_load_ratio is None else str(row.target_load_ratio),
         ]
         for row in rows
     ]
@@ -292,6 +295,9 @@ def read_reconfiguration_rows(path: str) -> tuple[ReconfigurationSampleRow, ...]
                     frames_admission_rejected=int(d.get("frames_admission_rejected", 0)),
                     frames_still_queued_or_in_flight=int(d.get("frames_still_queued_or_in_flight", 0)),
                     frame_accounting_residual=int(d.get("frame_accounting_residual", 0)),
+                    calibrated_service_time_ns=_parse_optional_int(d.get("calibrated_service_time_ns")),
+                    configured_inter_arrival_ns=_parse_optional_int(d.get("configured_inter_arrival_ns")),
+                    target_load_ratio=(float(d["target_load_ratio"]) if d.get("target_load_ratio") else None),
                 )
             )
     return tuple(rows)

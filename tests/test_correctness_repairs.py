@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+from threading import Event, Thread
 
 from nedo_vision_dag_engine.compiler import (
     CompilationFailure,
@@ -11,6 +12,7 @@ from nedo_vision_dag_engine.compiler import (
     WorkflowCompiler,
 )
 from nedo_vision_dag_engine.executor import PipelineExecutor
+from nedo_vision_dag_engine.instrumentation import install_runtime_evidence_sink
 from nedo_vision_dag_engine.registry import RegisteredProcessorType, RegistryBuilder
 from tests.support.processors import LifecycleLog
 from tests.support.registries import compile_initial, stateless_registry, tracker_registry
@@ -81,6 +83,59 @@ def test_clock_failure_during_cancellation_still_releases_lease() -> None:
         executor.cancel_reserved_frame_managed(token, admission)
     assert executor.wait_for_plan_quiescent(initial.plan.version, timeout=0.0)
     executor.release_management(token)
+
+
+def test_lease_release_evidence_precedes_quiescence_notification() -> None:
+    """Retirement must not outrun the trace event for its final old lease."""
+    compiler = WorkflowCompiler("test")
+    registry = stateless_registry(LifecycleLog())
+    plan = compile_initial(compiler, registry, source_only()).plan
+    executor = PipelineExecutor(plan)
+    token = object()
+    executor.claim_management(token)
+    admission = executor.reserve_frame_managed(token, 1, 1)
+    release_event_entered = Event()
+    allow_release_event = Event()
+    waiter_finished = Event()
+    errors: list[BaseException] = []
+
+    def sink(kind: str, _fields: object) -> None:
+        if kind == "lease_released":
+            release_event_entered.set()
+            if not allow_release_event.wait(2.0):
+                raise TimeoutError("release evidence barrier timed out")
+
+    def cancel() -> None:
+        try:
+            executor.cancel_reserved_frame_managed(token, admission)
+        except BaseException as error:
+            errors.append(error)
+
+    def wait_for_quiescence() -> None:
+        try:
+            assert executor.wait_for_plan_quiescent(plan.version, timeout=2.0)
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            waiter_finished.set()
+
+    previous = install_runtime_evidence_sink(sink)
+    cancel_thread = Thread(target=cancel)
+    waiter_thread = Thread(target=wait_for_quiescence)
+    try:
+        cancel_thread.start()
+        assert release_event_entered.wait(2.0)
+        waiter_thread.start()
+        assert not waiter_finished.wait(0.05)
+    finally:
+        allow_release_event.set()
+        cancel_thread.join(2.0)
+        waiter_thread.join(2.0)
+        install_runtime_evidence_sink(previous)
+        executor.release_management(token)
+    assert not cancel_thread.is_alive() and not waiter_thread.is_alive()
+    assert waiter_finished.is_set()
+    assert not errors
 
 
 @pytest.mark.parametrize(

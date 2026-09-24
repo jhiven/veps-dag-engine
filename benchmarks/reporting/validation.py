@@ -8,7 +8,7 @@ from collections import defaultdict
 from dataclasses import asdict, dataclass
 from typing import Sequence
 
-from benchmarks.model import AblationSampleRow, InterferenceSampleRow
+from benchmarks.model import AblationSampleRow, InterferenceSampleRow, validate_ablation_sample
 from benchmarks.reporting.ablation import calculate_ablation_summaries
 from benchmarks.reporting.interference import calculate_interference_contrasts
 
@@ -54,7 +54,13 @@ def validate_experiment_artifacts(
         block_map[r.block_id].add(r.variant)
         block_rep_map[r.block_id].add(r.repetition)
 
-        if r.synchronous_accounting_valid and r.synchronous_accounting_residual_ns == 0:
+        # The synchronized interval is measured from gate close to gate open.
+        # Phase timestamps do not cover scheduler gaps and controller
+        # bookkeeping, so a nonnegative, explicitly recorded residual is
+        # expected. Recompute it from the raw row instead of requiring a
+        # constructed zero.
+        validate_ablation_sample(r)
+        if r.synchronous_accounting_valid and r.synchronous_accounting_residual_ns >= 0:
             ablation_accounting_valid_count += 1
         else:
             raise ValueError(

@@ -7,9 +7,8 @@ import time
 import os
 from threading import Event, Lock, Thread
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
-from benchmarks.model import ConformanceResultRow
 from benchmarks.conformance_trace import ConformanceTrace
 from benchmarks.scenarios import (
     PassOutput,
@@ -22,6 +21,7 @@ from nedo_vision_dag_engine.instrumentation import (
     FrameStatus,
     RetirementStatus,
     install_runtime_evidence_sink,
+    runtime_evidence_sink,
 )
 from nedo_vision_dag_engine.plan import ExecutionPlan
 from nedo_vision_dag_engine.processor import (
@@ -69,9 +69,8 @@ def run_conformance_suite(
     output_directory: str,
     profile: str,
     seeds: tuple[int, ...] = (42, 314159, 271828, 161803, 20260922),
-) -> tuple[ConformanceResultRow, ...]:
+) -> None:
     os.makedirs(output_directory, exist_ok=True)
-    all_rows: list[ConformanceResultRow] = []
 
     def run_traced(
         campaign_id: str,
@@ -81,18 +80,21 @@ def run_conformance_suite(
         path = os.path.join(output_directory, f"{campaign_id}-seed-{seed}.jsonl")
         with ConformanceTrace(path, run_id, campaign_id, seed) as trace:
             previous = install_runtime_evidence_sink(trace.emit)
-            trace.emit("campaign_started", {"outcome": "running"})
+            start_fields: dict[str, str | int] = {"outcome": "running"}
+            if campaign_id == "randomized_consistency":
+                start_fields["target_frames"] = 500 if profile == "smoke" else 100000
+                start_fields["target_requests"] = 20 if profile == "smoke" else 1000
+            trace.emit("campaign_started", start_fields)
             try:
                 if not callable(campaign):
                     raise TypeError("campaign must be callable")
-                row = campaign()
-                if not isinstance(row, ConformanceResultRow):
-                    raise TypeError("campaign returned an invalid result")
-                outcome = "passed" if row.terminal_status == "PASS" else "failed"
+                passed = campaign()
+                if not isinstance(passed, bool):
+                    raise TypeError("campaign did not return an oracle outcome")
+                outcome = "passed" if passed else "failed"
                 trace.emit("campaign_completed", {"outcome": outcome})
                 if outcome != "passed":
                     raise RuntimeError(f"conformance campaign {campaign_id!r} failed")
-                all_rows.append(row)
             except BaseException as error:
                 trace.emit(
                     "campaign_failed",
@@ -127,10 +129,10 @@ def run_conformance_suite(
     for campaign_id, campaign in deterministic_campaigns:
         run_traced(campaign_id, primary_seed, campaign)
 
-    return tuple(all_rows)
+    return None
 
 
-def _run_successive_generation_ownership_campaign(run_id: str) -> ConformanceResultRow:
+def _run_successive_generation_ownership_campaign(run_id: str) -> bool:
     """Preserve twice, remove once, while first-generation cleanup is blocked."""
     from nedo_vision_dag_engine.processor import Processor
     from tests.support.processors import (
@@ -294,32 +296,7 @@ def _run_successive_generation_ownership_campaign(run_id: str) -> ConformanceRes
 
     frame_events = executor.instrumentation.frame_events()
     completed = sum(1 for event in frame_events if event.status is FrameStatus.COMPLETED)
-    return ConformanceResultRow(
-        run_id=run_id,
-        campaign_id="successive_generation_ownership",
-        scenario_id="conformance_successive_generation_ownership",
-        scenario_type="ownership",
-        frames_submitted=len(frame_events),
-        frames_completed=completed,
-        reconfigurations_requested=3,
-        reconfigurations_committed=3,
-        reconfigurations_rejected=0,
-        reconfigurations_failed=0,
-        mixed_plan_frames=0,
-        missing_frames=0,
-        duplicate_frames=0,
-        retired_plan_executions=0,
-        invalid_routing_events=0,
-        state_continuity_failures=violations,
-        unexpected_state_resets=0,
-        active_plan_changed_after_failed_candidate=0,
-        candidate_resource_leaks=0,
-        processor_instance_leaks=0,
-        grace_period_safety_violations=0,
-        stateful_handoff_ordering_failures=0,
-        resource_lifetime_violations=violations,
-        terminal_status="PASS" if violations == 0 else "FAIL",
-    )
+    return violations == 0 and completed == len(frame_events) and completed >= 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -445,7 +422,7 @@ class _ObservingWorkloadProcessor:
 
 def _run_frame_consistency_stress_campaign(
     run_id: str, profile: str, seed: int
-) -> ConformanceResultRow:
+) -> bool:
     target_frames = 500 if profile == "smoke" else 100000
     target_reconfigs = 20 if profile == "smoke" else 1000
 
@@ -630,23 +607,6 @@ def _run_frame_consistency_stress_campaign(
         elif observed_nodes != set(executed_node_ids):
             invalid_routing_events += 1
 
-    # A frame that ran an already-superseded plan after its successor was
-    # published is the lease-protected behavior this campaign is meant to see.
-    commits = tuple(
-        record
-        for record in controller.records()
-        if record.status is ReconfigurationStatus.COMMITTED and record.commit_ns is not None
-    )
-    frame_events = executor.instrumentation.frame_events()
-    retired_plan_executions = sum(
-        1
-        for record in commits
-        for event in frame_events
-        if event.plan_version == record.base_version
-        and record.commit_ns is not None
-        and event.completion_timestamp_ns >= record.commit_ns
-    )
-
     controller.close()
 
     frames_failed = len(frame_results) - frames_completed
@@ -662,35 +622,10 @@ def _run_frame_consistency_stress_campaign(
         else "FAIL"
     )
 
-    return ConformanceResultRow(
-        run_id=run_id,
-        campaign_id="frame_consistency_stress",
-        scenario_id="conformance_stress",
-        scenario_type="stress",
-        frames_submitted=len(frame_results),
-        frames_completed=frames_completed,
-        reconfigurations_requested=reconfigs_requested,
-        reconfigurations_committed=reconfigs_committed,
-        reconfigurations_rejected=reconfigs_rejected,
-        reconfigurations_failed=reconfigs_failed,
-        mixed_plan_frames=mixed_plan_frames,
-        missing_frames=missing_frames,
-        duplicate_frames=duplicate_frame_count,
-        retired_plan_executions=retired_plan_executions,
-        invalid_routing_events=invalid_routing_events,
-        state_continuity_failures=0,
-        unexpected_state_resets=0,
-        active_plan_changed_after_failed_candidate=0,
-        candidate_resource_leaks=0,
-        processor_instance_leaks=0,
-        grace_period_safety_violations=0,
-        stateful_handoff_ordering_failures=0,
-        resource_lifetime_violations=0,
-        terminal_status=status_str,
-    )
+    return status_str == "PASS"
 
 
-def _run_failure_atomicity_campaign(run_id: str, profile: str) -> ConformanceResultRow:
+def _run_failure_atomicity_campaign(run_id: str, profile: str) -> bool:
     log = LifecycleLog()
     base_spec = linear()
     reg = stateless_registry(log)
@@ -702,7 +637,6 @@ def _run_failure_atomicity_campaign(run_id: str, profile: str) -> ConformanceRes
     executor = PipelineExecutor(initial_plan=init_cand.plan)
     controller = ReconfigurationController(executor=executor, compiler=compiler, registry=reg)
     reconfigs_requested = 0
-    reconfigs_committed = 0
     reconfigs_rejected = 0
     reconfigs_failed = 0
     plan_changed_count = 0
@@ -716,9 +650,15 @@ def _run_failure_atomicity_campaign(run_id: str, profile: str) -> ConformanceRes
 
     # 1. Cyclic candidate
     reconfigs_requested += 1
+    # Both endpoints accept an input. A back-edge into the source would test
+    # an invalid pin, not the graph-cycle validator.
+    pass_node = base_spec.nodes[1]
     cycle_spec = WorkflowSpecification(
-        nodes=base_spec.nodes,
-        edges=base_spec.edges + (Edge("pass", "value", "source", "value"),),
+        nodes=(replace(pass_node, node_id="cycle_a"), replace(pass_node, node_id="cycle_b")),
+        edges=(
+            Edge("cycle_a", "value", "cycle_b", "value"),
+            Edge("cycle_b", "value", "cycle_a", "value"),
+        ),
     )
     req1 = ReconfigurationRequest(
         request_id="fail_cycle",
@@ -730,13 +670,9 @@ def _run_failure_atomicity_campaign(run_id: str, profile: str) -> ConformanceRes
     v_before = controller.active_plan.version
     controller.submit(req1)
     rec1 = controller.wait_for_terminal(req1.request_id, timeout_seconds=10.0)
-    st1 = rec1.status if rec1 is not None else controller.record(req1.request_id).status
-    if st1 == ReconfigurationStatus.COMMITTED:
-        reconfigs_committed += 1
-    elif st1 == ReconfigurationStatus.REJECTED:
-        reconfigs_rejected += 1
-    else:
-        reconfigs_failed += 1
+    if rec1 is None or rec1.status is not ReconfigurationStatus.REJECTED:
+        raise RuntimeError("cyclic candidate did not reach REJECTED")
+    reconfigs_rejected += 1
     if controller.active_plan.version != v_before:
         plan_changed_count += 1
     _admit_probe_frames(2)
@@ -773,13 +709,9 @@ def _run_failure_atomicity_campaign(run_id: str, profile: str) -> ConformanceRes
     v_before = controller.active_plan.version
     controller.submit(req2)
     rec2 = controller.wait_for_terminal(req2.request_id, timeout_seconds=10.0)
-    st2 = rec2.status if rec2 is not None else controller.record(req2.request_id).status
-    if st2 == ReconfigurationStatus.COMMITTED:
-        reconfigs_committed += 1
-    elif st2 == ReconfigurationStatus.REJECTED:
-        reconfigs_rejected += 1
-    else:
-        reconfigs_failed += 1
+    if rec2 is None or rec2.status is not ReconfigurationStatus.REJECTED:
+        raise RuntimeError("type-invalid candidate did not reach REJECTED")
+    reconfigs_rejected += 1
     if controller.active_plan.version != v_before:
         plan_changed_count += 1
     _admit_probe_frames(2)
@@ -788,25 +720,31 @@ def _run_failure_atomicity_campaign(run_id: str, profile: str) -> ConformanceRes
     
     # 3. Setup failure
     reconfigs_requested += 1
+    active_ids = {id(step.processor_ref) for step in executor.active_plan.steps}
+    setup_observations_before = len(log.observations())
     fail_reg = stateless_registry(log, pass_failure=InjectedFailurePoint.SETUP)
     fail_controller = ReconfigurationController(executor=executor, compiler=compiler, registry=fail_reg)
     req3 = ReconfigurationRequest(
         request_id="fail_setup",
         base_version=executor.active_plan.version,
-        target_specification=base_spec,
+        target_specification=linear(source_id="staged_source", pass_id="failing_pass"),
         state_directive=StateDirective(),
         submitted_at_ns=time.monotonic_ns(),
     )
     v_before = executor.active_plan.version
     fail_controller.submit(req3)
     rec3 = fail_controller.wait_for_terminal(req3.request_id, timeout_seconds=10.0)
-    st3 = rec3.status if rec3 is not None else fail_controller.record(req3.request_id).status
-    if st3 == ReconfigurationStatus.COMMITTED:
-        reconfigs_committed += 1
-    elif st3 == ReconfigurationStatus.REJECTED:
-        reconfigs_rejected += 1
-    else:
-        reconfigs_failed += 1
+    if rec3 is None or rec3.status is not ReconfigurationStatus.FAILED:
+        raise RuntimeError("setup-failure candidate did not reach FAILED")
+    staged_observations = log.observations()[setup_observations_before:]
+    staged_ids = {obs.instance_id for obs in staged_observations if obs.event == "setup"}
+    if len(staged_ids) != 2 or staged_ids & active_ids:
+        raise RuntimeError("setup-failure request did not stage two fresh processors")
+    if any(log.count_event_for("cleanup", instance_id) != 1 for instance_id in staged_ids):
+        raise RuntimeError("setup-failure rollback did not clean each staged processor exactly once")
+    if any(log.count_event_for("cleanup", instance_id) for instance_id in active_ids):
+        raise RuntimeError("setup-failure rollback cleaned an active processor")
+    reconfigs_failed += 1
     if executor.active_plan.version != v_before:
         plan_changed_count += 1
     for _ in range(2):
@@ -821,35 +759,10 @@ def _run_failure_atomicity_campaign(run_id: str, profile: str) -> ConformanceRes
 
     status_str = "PASS" if (plan_changed_count == 0 and incomplete_frames == 0) else "FAIL"
 
-    return ConformanceResultRow(
-        run_id=run_id,
-        campaign_id="failure_atomicity",
-        scenario_id="conformance_failure_atomicity",
-        scenario_type="failure_atomicity",
-        frames_submitted=len(frame_events),
-        frames_completed=frames_completed,
-        reconfigurations_requested=reconfigs_requested,
-        reconfigurations_committed=reconfigs_committed,
-        reconfigurations_rejected=reconfigs_rejected,
-        reconfigurations_failed=reconfigs_failed,
-        mixed_plan_frames=0,
-        missing_frames=0,
-        duplicate_frames=0,
-        retired_plan_executions=0,
-        invalid_routing_events=0,
-        state_continuity_failures=0,
-        unexpected_state_resets=0,
-        active_plan_changed_after_failed_candidate=plan_changed_count,
-        candidate_resource_leaks=0,
-        processor_instance_leaks=0,
-        grace_period_safety_violations=0,
-        stateful_handoff_ordering_failures=0,
-        resource_lifetime_violations=0,
-        terminal_status=status_str,
-    )
+    return status_str == "PASS"
 
 
-def _run_stateful_conformance_campaign(run_id: str, profile: str) -> ConformanceResultRow:
+def _run_stateful_conformance_campaign(run_id: str, profile: str) -> bool:
     log = LifecycleLog()
     reg = tracker_registry(extra_stateless=True, log=log)
 
@@ -989,32 +902,7 @@ def _run_stateful_conformance_campaign(run_id: str, profile: str) -> Conformance
 
     status_str = "PASS" if (continuity_failures == 0 and unexpected_resets == 0 and processor_instance_leaks == 0) else "FAIL"
 
-    return ConformanceResultRow(
-        run_id=run_id,
-        campaign_id="stateful_conformance",
-        scenario_id="conformance_stateful",
-        scenario_type="stateful",
-        frames_submitted=len(frame_events),
-        frames_completed=frames_completed,
-        reconfigurations_requested=reconfigs_requested,
-        reconfigurations_committed=reconfigs_committed,
-        reconfigurations_rejected=reconfigs_rejected,
-        reconfigurations_failed=0,
-        mixed_plan_frames=0,
-        missing_frames=0,
-        duplicate_frames=0,
-        retired_plan_executions=0,
-        invalid_routing_events=0,
-        state_continuity_failures=continuity_failures,
-        unexpected_state_resets=unexpected_resets,
-        active_plan_changed_after_failed_candidate=0,
-        candidate_resource_leaks=0,
-        processor_instance_leaks=processor_instance_leaks,
-        grace_period_safety_violations=0,
-        stateful_handoff_ordering_failures=0,
-        resource_lifetime_violations=0,
-        terminal_status=status_str,
-    )
+    return status_str == "PASS"
 
 
 # =============================================================================
@@ -1022,7 +910,7 @@ def _run_stateful_conformance_campaign(run_id: str, profile: str) -> Conformance
 # =============================================================================
 
 
-def _run_grace_period_deterministic_campaign(run_id: str) -> ConformanceResultRow:
+def _run_grace_period_deterministic_campaign(run_id: str) -> bool:
     """Scenario A: publish while an old-plan frame is still executing.
 
     An old-plan frame is held inside ``process()``. The campaign then checks
@@ -1175,31 +1063,16 @@ def _run_grace_period_deterministic_campaign(run_id: str) -> ConformanceResultRo
         reconfigurations_committed = (
             1 if record is not None and record.status is ReconfigurationStatus.COMMITTED else 0
         )
+        if frames_completed != 1 or retired_plan_executions != 1 or reconfigurations_committed != 1:
+            violations += 1
     finally:
         frame_release.set()
         controller.close()
 
-    return ConformanceResultRow(
-        run_id=run_id,
-        campaign_id="grace_period_deterministic",
-        scenario_id="conformance_grace_period",
-        scenario_type="grace_period",
-        frames_submitted=frames_submitted, frames_completed=frames_completed,
-        reconfigurations_requested=1, reconfigurations_committed=reconfigurations_committed,
-        reconfigurations_rejected=0, reconfigurations_failed=0,
-        mixed_plan_frames=0, missing_frames=0, duplicate_frames=0,
-        retired_plan_executions=retired_plan_executions, invalid_routing_events=0,
-        state_continuity_failures=0, unexpected_state_resets=0,
-        active_plan_changed_after_failed_candidate=0,
-        candidate_resource_leaks=0, processor_instance_leaks=0,
-        grace_period_safety_violations=violations,
-        stateful_handoff_ordering_failures=0,
-        resource_lifetime_violations=violations,
-        terminal_status="PASS" if violations == 0 else "FAIL",
-    )
+    return violations == 0
 
 
-def _run_stateful_handoff_deterministic_campaign(run_id: str) -> ConformanceResultRow:
+def _run_stateful_handoff_deterministic_campaign(run_id: str) -> bool:
     """Scenario B: attempt the handoff while an old-plan access is held open.
 
     A preserved mutable processor is held inside ``process()`` on the old
@@ -1282,9 +1155,39 @@ def _run_stateful_handoff_deterministic_campaign(run_id: str) -> ConformanceResu
 
     ordering_violations = 0
     frames_submitted = 0
+    thread_errors: list[BaseException] = []
+    thread_error_lock = Lock()
+    gate_closed = Event()
+    later_attempted = Event()
+    outer_sink = runtime_evidence_sink()
+
+    def observe_handoff(kind: str, fields: object) -> None:
+        from typing import cast
+        from collections.abc import Mapping
+        from nedo_vision_dag_engine.instrumentation import JsonValue
+
+        payload = cast(Mapping[str, JsonValue], fields)
+        if outer_sink is not None:
+            outer_sink(kind, payload)
+        if kind == "handoff_gate_closed" and payload.get("request_id") == "sh-det":
+            gate_closed.set()
+        if kind == "frame_admission_attempted" and payload.get("frame_id") == 2:
+            later_attempted.set()
+
+    old_frame: Thread | None = None
+    commit_thread: Thread | None = None
+    new_frame: Thread | None = None
+    previous_sink = install_runtime_evidence_sink(observe_handoff)
     try:
         frames_submitted += 1
-        old_frame = Thread(target=controller.admit_frame, args=(0, 1), daemon=True)
+        def _old() -> None:
+            try:
+                controller.admit_frame(0, 1)
+            except BaseException as error:
+                with thread_error_lock:
+                    thread_errors.append(error)
+
+        old_frame = Thread(target=_old, daemon=True)
         old_frame.start()
         assert old_access_entered.wait(timeout=5.0)
 
@@ -1293,19 +1196,28 @@ def _run_stateful_handoff_deterministic_campaign(run_id: str) -> ConformanceResu
             StateDirective(), submitted_at_ns=0,
         )
         controller.submit(request)
-        controller.wait_for_status("sh-det", frozenset({ReconfigurationStatus.READY}), timeout_seconds=5.0)
+        if controller.wait_for_status(
+            "sh-det", frozenset({ReconfigurationStatus.READY}), timeout_seconds=5.0
+        ) is None:
+            raise TimeoutError("mutable handoff candidate did not become READY")
 
         commit_done = Event()
 
         def _commit() -> None:
-            controller.commit_ready()
-            commit_done.set()
+            try:
+                controller.commit_ready()
+                commit_done.set()
+            except BaseException as error:
+                with thread_error_lock:
+                    thread_errors.append(error)
 
         commit_thread = Thread(target=_commit, daemon=True)
         commit_thread.start()
 
-        # The drain must hold the candidate back while the old access is open.
-        if commit_done.wait(timeout=0.5):
+        # Wait for the actual handoff event, not an elapsed-time guess.
+        if not gate_closed.wait(timeout=5.0):
+            raise TimeoutError("mutable handoff did not close the admission gate")
+        if commit_done.is_set():
             ordering_violations += 1
         if executor.active_plan.version != old_plan_version:
             ordering_violations += 1
@@ -1313,16 +1225,29 @@ def _run_stateful_handoff_deterministic_campaign(run_id: str) -> ConformanceResu
         # A new-plan frame requested during the drain must also wait.
         frames_submitted += 1
         new_frame_results: list[FrameResult] = []
-        new_frame = Thread(
-            target=lambda: new_frame_results.append(controller.admit_frame(0, 2)),
-            daemon=True,
-        )
+        def _new() -> None:
+            try:
+                new_frame_results.append(controller.admit_frame(0, 2))
+            except BaseException as error:
+                with thread_error_lock:
+                    thread_errors.append(error)
+
+        new_frame = Thread(target=_new, daemon=True)
         new_frame.start()
+        if not later_attempted.wait(timeout=5.0):
+            raise TimeoutError("later frame did not attempt admission while gated")
+        if commit_done.is_set() or executor.active_plan.version != old_plan_version:
+            ordering_violations += 1
 
         release_old_access.set()
         old_frame.join(timeout=5.0)
         commit_thread.join(timeout=5.0)
         new_frame.join(timeout=5.0)
+        with thread_error_lock:
+            if thread_errors:
+                raise RuntimeError("mutable handoff thread failed") from thread_errors[0]
+        if old_frame.is_alive() or commit_thread.is_alive() or new_frame.is_alive():
+            raise TimeoutError("mutable handoff thread did not terminate")
 
         if not commit_done.is_set():
             ordering_violations += 1
@@ -1363,31 +1288,20 @@ def _run_stateful_handoff_deterministic_campaign(run_id: str) -> ConformanceResu
         reconfigurations_committed = (
             1 if record is not None and record.status is ReconfigurationStatus.COMMITTED else 0
         )
+        if frames_completed != 2 or retired_plan_executions != 0 or reconfigurations_committed != 1:
+            ordering_violations += 1
     finally:
         release_old_access.set()
+        for thread in (old_frame, commit_thread, new_frame):
+            if thread is not None:
+                thread.join(timeout=5.0)
+        install_runtime_evidence_sink(previous_sink)
         controller.close()
 
-    return ConformanceResultRow(
-        run_id=run_id,
-        campaign_id="stateful_handoff_deterministic",
-        scenario_id="conformance_handoff",
-        scenario_type="stateful_handoff",
-        frames_submitted=frames_submitted, frames_completed=frames_completed,
-        reconfigurations_requested=1, reconfigurations_committed=reconfigurations_committed,
-        reconfigurations_rejected=0, reconfigurations_failed=0,
-        mixed_plan_frames=0, missing_frames=0, duplicate_frames=0,
-        retired_plan_executions=retired_plan_executions, invalid_routing_events=0,
-        state_continuity_failures=0, unexpected_state_resets=0,
-        active_plan_changed_after_failed_candidate=0,
-        candidate_resource_leaks=0, processor_instance_leaks=0,
-        grace_period_safety_violations=0,
-        stateful_handoff_ordering_failures=ordering_violations,
-        resource_lifetime_violations=0,
-        terminal_status="PASS" if ordering_violations == 0 else "FAIL",
-    )
+    return ordering_violations == 0
 
 
-def _run_candidate_memory_failure_campaign(run_id: str) -> ConformanceResultRow:
+def _run_candidate_memory_failure_campaign(run_id: str) -> bool:
     """Scenario C: Inject MemoryError during factory; verify P_old remains active.
 
     Uses explicit checkpoints as required by reviewer:
@@ -1413,6 +1327,9 @@ def _run_candidate_memory_failure_campaign(run_id: str) -> ConformanceResultRow:
     )
     from nedo_vision_dag_engine.type_system import ConcreteType, StatePolicy
 
+    # Keep the staged processor observable after the compiler rolls it back.
+    good_instances: list[_GoodProcessor] = []
+
     # ── Separate metrics ──
     active_plan_changed_by_failed_candidate = 0
     _later_valid_candidate_changed_plan = 0  # expected: 1 (the valid commit)
@@ -1432,10 +1349,16 @@ def _run_candidate_memory_failure_campaign(run_id: str) -> ConformanceResultRow:
 
     class _GoodProcessor:
         descriptor = good_desc
-        def setup(self, context: SetupContext) -> None: pass
+        def __init__(self) -> None:
+            self.setup_count = 0
+            self.cleanup_count = 0
+            good_instances.append(self)
+        def setup(self, context: SetupContext) -> None:
+            self.setup_count += 1
         def process(self, inputs: object, context: FrameContext) -> object: return context.frame_id
         def healthcheck(self) -> None: pass
-        def cleanup(self) -> None: pass
+        def cleanup(self) -> None:
+            self.cleanup_count += 1
 
     def _bad_factory() -> _GoodProcessor:
         raise MemoryError("injected memory error in candidate factory")
@@ -1451,12 +1374,16 @@ def _run_candidate_memory_failure_campaign(run_id: str) -> ConformanceResultRow:
         )),),
         edges=(),
     )
+    good_new_node = Node("n1", "good", to_processor_configuration({}), (), (
+        Pin("out", ConcreteType(int), PinCardinality.SINGLE, PinRequirement.REQUIRED),
+    ))
     bad_spec = WorkflowSpecification(
-        nodes=(Node("n0", "bad", to_processor_configuration({}), (), (
+        nodes=(spec.nodes[0], good_new_node, Node("n2", "bad", to_processor_configuration({}), (), (
             Pin("out", ConcreteType(int), PinCardinality.SINGLE, PinRequirement.REQUIRED),
-        )),),
+        ))),
         edges=(),
     )
+    valid_spec = WorkflowSpecification(nodes=(spec.nodes[0], good_new_node), edges=())
 
     compiler = WorkflowCompiler("0.1.0")
     cand = compiler.compile(spec, registry)
@@ -1478,16 +1405,8 @@ def _run_candidate_memory_failure_campaign(run_id: str) -> ConformanceResultRow:
         rec = controller.wait_for_terminal("mem-fail", timeout_seconds=10.0)
 
         # ── Checkpoint 3: terminal status reached ──
-        if rec is None:
-            active_plan_changed_by_failed_candidate += 1
-        elif rec.status is ReconfigurationStatus.FAILED:
-            # Expected: factory raised MemoryError → FAILED
-            pass
-        elif rec.status is ReconfigurationStatus.REJECTED:
-            # Also acceptable: could be REJECTED depending on failure kind
-            pass
-        else:
-            active_plan_changed_by_failed_candidate += 1
+        if rec is None or rec.status is not ReconfigurationStatus.FAILED:
+            raise RuntimeError("factory-failure request did not reach FAILED")
 
         # ── Checkpoint 4: immediate assertions after failure ──
         # 4a: active plan version unchanged
@@ -1500,19 +1419,17 @@ def _run_candidate_memory_failure_campaign(run_id: str) -> ConformanceResultRow:
 
         # 4c: no candidate processor remains live (candidate_cleanup_report
         #     should show all staged processors cleaned)
-        if rec is not None and rec.candidate_cleanup_report is not None:
-            if rec.candidate_cleanup_report.succeeded:
-                _candidate_cleanup_ok = 1
-            elif rec.candidate_cleanup_report.failures:
-                candidate_resource_leaks += len(rec.candidate_cleanup_report.failures)
-        else:
-            # No cleanup report → candidate was never staged (factory failed
-            # before staging.register), which is correct for MemoryError
-            # at factory level.
-            _candidate_cleanup_ok = 1  # nothing to clean = success
+        if len(good_instances) != 2:
+            raise RuntimeError("factory failure did not occur after staging a good processor")
+        staged_good = good_instances[1]
+        if staged_good.setup_count != 1 or staged_good.cleanup_count != 1:
+            raise RuntimeError("staged processor was not cleaned exactly once after factory failure")
+        if good_instances[0].cleanup_count != 0:
+            raise RuntimeError("factory-failure rollback cleaned the active processor")
+        _candidate_cleanup_ok = 1
 
         # 4d: no old-plan processor was cleaned
-        if rec is not None and rec.retired_processor_count > 0:
+        if rec.retired_processor_count > 0:
             active_plan_changed_by_failed_candidate += 1
 
         # 4e: existing frames can still execute on old plan
@@ -1525,18 +1442,25 @@ def _run_candidate_memory_failure_campaign(run_id: str) -> ConformanceResultRow:
 
         # ── Checkpoint 5: valid reconfiguration succeeds ──
         request2 = ReconfigurationRequest(
-            "mem-fail-2", controller.active_plan.version, spec,
+            "mem-fail-2", controller.active_plan.version, valid_spec,
             StateDirective(), submitted_at_ns=0,
         )
         controller.submit(request2)
+        ready2 = controller.wait_for_status(
+            "mem-fail-2", frozenset({ReconfigurationStatus.READY}), timeout_seconds=10.0
+        )
+        if ready2 is None:
+            raise RuntimeError("valid follow-up request never became READY")
+        controller.commit_ready()
         rec2 = controller.wait_for_terminal("mem-fail-2", timeout_seconds=10.0)
-        if rec2 is not None and rec2.status is ReconfigurationStatus.COMMITTED:
-            # Expected: valid request commits, changing the active plan
-            if controller.active_plan.version > old_version:
-                _later_valid_candidate_changed_plan = 1
-        else:
-            # Valid request should have committed
-            pass  # already reflected in reconfigs_committed count
+        if rec2 is None or rec2.status is not ReconfigurationStatus.COMMITTED:
+            raise RuntimeError("valid follow-up request did not commit")
+        if controller.active_plan.version <= old_version:
+            raise RuntimeError("valid follow-up request did not publish a new plan")
+        _later_valid_candidate_changed_plan = 1
+        new_result = controller.admit_frame(1, 2)
+        if new_result.status is not FrameStatus.COMPLETED or new_result.plan_version <= old_version:
+            raise RuntimeError("new plan failed to serve the follow-up frame")
     finally:
         controller.close()
 
@@ -1551,34 +1475,13 @@ def _run_candidate_memory_failure_campaign(run_id: str) -> ConformanceResultRow:
         and processor_instance_leaks == 0
         and _old_plan_operational == 1
         and _candidate_cleanup_ok == 1
+        and _later_valid_candidate_changed_plan == 1
     )
 
-    return ConformanceResultRow(
-        run_id=run_id,
-        campaign_id="candidate_memory_failure",
-        scenario_id="conformance_memory_failure",
-        scenario_type="memory_failure",
-        frames_submitted=1, frames_completed=1,
-        reconfigurations_requested=2, reconfigurations_committed=1,
-        reconfigurations_rejected=0, reconfigurations_failed=1,
-        mixed_plan_frames=0, missing_frames=0, duplicate_frames=0,
-        retired_plan_executions=0, invalid_routing_events=0,
-        state_continuity_failures=0, unexpected_state_resets=0,
-        active_plan_changed_after_failed_candidate=active_plan_changed_by_failed_candidate,
-        candidate_resource_leaks=candidate_resource_leaks,
-        processor_instance_leaks=processor_instance_leaks,
-        grace_period_safety_violations=(
-            0 if active_plan_changed_by_failed_candidate == 0 else 1
-        ),
-        stateful_handoff_ordering_failures=0,
-        resource_lifetime_violations=(
-            0 if candidate_resource_leaks == 0 else 1
-        ),
-        terminal_status="PASS" if campaign_passed else "FAIL",
-    )
+    return campaign_passed
 
 
-def _run_cleanup_failure_campaign(run_id: str) -> ConformanceResultRow:
+def _run_cleanup_failure_campaign(run_id: str) -> bool:
     """Scenario D: Inject cleanup failure; verify plan stays committed and
     retirement is FAILED but idempotent."""
     from nedo_vision_dag_engine.compiler import (
@@ -1718,38 +1621,13 @@ def _run_cleanup_failure_campaign(run_id: str) -> ConformanceResultRow:
         )
         if frames_completed != len(frame_events):
             violations += 1
-        commit_ns = rec.commit_ns if rec is not None else None
-        retired_plan_executions = sum(
-            1
-            for event in frame_events
-            if event.plan_version == old_version
-            and commit_ns is not None
-            and event.completion_timestamp_ns >= commit_ns
-        )
     finally:
         controller.close()
 
-    return ConformanceResultRow(
-        run_id=run_id,
-        campaign_id="cleanup_failure",
-        scenario_id="conformance_cleanup_failure",
-        scenario_type="cleanup_failure",
-        frames_submitted=len(frame_events), frames_completed=frames_completed,
-        reconfigurations_requested=1, reconfigurations_committed=1,
-        reconfigurations_rejected=0, reconfigurations_failed=0,
-        mixed_plan_frames=0, missing_frames=0, duplicate_frames=0,
-        retired_plan_executions=retired_plan_executions, invalid_routing_events=0,
-        state_continuity_failures=0, unexpected_state_resets=0,
-        active_plan_changed_after_failed_candidate=0,
-        candidate_resource_leaks=0, processor_instance_leaks=0,
-        grace_period_safety_violations=0,
-        stateful_handoff_ordering_failures=0,
-        resource_lifetime_violations=0,
-        terminal_status="PASS" if violations == 0 else "FAIL",
-    )
+    return violations == 0
 
 
-def _run_frame_exception_lease_release_campaign(run_id: str) -> ConformanceResultRow:
+def _run_frame_exception_lease_release_campaign(run_id: str) -> bool:
     """Scenario E: Frame raises during old-plan execution; verify lease released."""
     from nedo_vision_dag_engine.compiler import (
         CompiledCandidate, WorkflowCompiler,
@@ -1801,21 +1679,4 @@ def _run_frame_exception_lease_release_campaign(run_id: str) -> ConformanceResul
     if not quiescent:
         violations += 1
 
-    return ConformanceResultRow(
-        run_id=run_id,
-        campaign_id="frame_exception_lease_release",
-        scenario_id="conformance_frame_exception",
-        scenario_type="frame_exception",
-        frames_submitted=1, frames_completed=0,
-        reconfigurations_requested=0, reconfigurations_committed=0,
-        reconfigurations_rejected=0, reconfigurations_failed=0,
-        mixed_plan_frames=0, missing_frames=0, duplicate_frames=0,
-        retired_plan_executions=0, invalid_routing_events=0,
-        state_continuity_failures=0, unexpected_state_resets=0,
-        active_plan_changed_after_failed_candidate=0,
-        candidate_resource_leaks=0, processor_instance_leaks=0,
-        grace_period_safety_violations=0,
-        stateful_handoff_ordering_failures=0,
-        resource_lifetime_violations=0,
-        terminal_status="PASS" if violations == 0 else "FAIL",
-    )
+    return violations == 0
